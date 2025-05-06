@@ -491,11 +491,14 @@ class FastModel(FastBaseModel):
         if whisper_language is not None: assert(type(whisper_language) is str)
         if whisper_task is not None: assert(type(whisper_task) is str)
         SUPPORTS_BFLOAT16 = is_bfloat16_supported()
+        print('supports bfloat16 in FastModel.from_pretrained', SUPPORTS_BFLOAT16)
         if dtype is None:
             dtype = torch.float16 if not SUPPORTS_BFLOAT16 else torch.bfloat16
+            print('dtype in FastModel.from_pretrained', dtype)
         elif dtype == torch.bfloat16 and not SUPPORTS_BFLOAT16:
             logger.warning_once("Device does not support bfloat16. Will change to float16.")
             dtype = torch.float16
+            print('dtype in FastModel.from_pretrained bfloat16 not supported', dtype)
         assert(dtype in (torch.float16, torch.bfloat16, torch.float32))
 
         patch_compiled_autograd()
@@ -518,6 +521,7 @@ class FastModel(FastBaseModel):
         old_model_name = model_name
         if not use_exact_model_name:
             model_name = get_model_name(model_name, load_in_4bit)
+            print('model_name in FastModel.from_pretrained since use_exact_model_name is False and after get_model_name', model_name)
 
         # Check versions
         LATEST  = '\nPlease use transformers via `pip install --no-deps git+https://github.com/huggingface/transformers.git`'
@@ -564,9 +568,12 @@ class FastModel(FastBaseModel):
                 trust_remote_code = trust_remote_code,
             )
             is_model = True
+            print('is_model in FastModel.from_pretrained', is_model)
+            print('model_config in FastModel.from_pretrained', model_config)
         except Exception as error:
             autoconfig_error = str(error)
             is_model = False
+            print('is_model in FastModel.from_pretrained in except', is_model)
         try:
             peft_config = PeftConfig.from_pretrained(
                 model_name,
@@ -575,9 +582,12 @@ class FastModel(FastBaseModel):
                 trust_remote_code = trust_remote_code,
             )
             is_peft = True
+            print('is_peft in FastModel.from_pretrained', is_peft)
+            print('peft_config in FastModel.from_pretrained', peft_config)
         except Exception as error:
             peft_error = str(error)
             is_peft = False
+            print('is_peft in FastModel.from_pretrained in except', is_peft)
         pass
 
         # Both config.json and adapter_config.json should not exist!
@@ -631,16 +641,20 @@ class FastModel(FastBaseModel):
 
         # Get base model for PEFT:
         if is_peft:
+            print('inside if is_peft in FastModel.from_pretrained')
             # Check base model again for PEFT
             model_name = peft_config.base_model_name_or_path
+            print('now model_name is set to peft_config.base_model_name_or_path', model_name)
             if not use_exact_model_name:
                 model_name = get_model_name(model_name, load_in_4bit)
+                print('now model_name is set to get_model_name(model_name, load_in_4bit) since use_exact_model_name is False', model_name)
             
             model_config = AutoConfig.from_pretrained(
                 model_name,
                 token = token,
                 trust_remote_code = trust_remote_code,
             )
+            print('now model_config is set to AutoConfig.from_pretrained', model_config)
         pass
 
         if not was_disabled: enable_progress_bars()
@@ -658,7 +672,9 @@ class FastModel(FastBaseModel):
             revision          = revision,
             trust_remote_code = trust_remote_code,
         )
+        print('now model_types is set to get_transformers_model_type', model_types)
         model_types = ["siglip"] + model_types
+        print('we added a siglip to model_types', model_types)
 
         # Set forced float32 env flag
         os.environ["UNSLOTH_FORCE_FLOAT32"] = "0"
@@ -666,16 +682,21 @@ class FastModel(FastBaseModel):
         for model_type_arch in model_types:
             if model_type_arch != "siglip": break
         global FORCE_FLOAT32
+        print('now we are in the for loop to check if FORCE_FLOAT32 is set', FORCE_FLOAT32)
         for disable_name in FORCE_FLOAT32:
+            print('checking disable_name in FORCE_FLOAT32', disable_name)
             if (disable_name.lower() == model_type_arch.lower() or \
                 disable_name.lower() in model_name.lower()) and \
                 ((dtype == torch.float16) or not SUPPORTS_BFLOAT16):
                 os.environ["UNSLOTH_FORCE_FLOAT32"] = "1"
                 dtype = torch.bfloat16 # Change to bfloat16 loading
+                print('now dtype is set to torch.bfloat16', dtype)
+                print('UNSLOTH_FORCE_FLOAT32 is set to 1', os.environ["UNSLOTH_FORCE_FLOAT32"])
                 break
         pass
         # Patch gradient checkpointing
         if use_gradient_checkpointing == "unsloth":
+            print('inside if use_gradient_checkpointing == "unsloth" in FastModel.from_pretrained')
             patch_unsloth_smart_gradient_checkpointing(dtype = dtype)
 
         with redirector:
@@ -726,9 +747,14 @@ class FastModel(FastBaseModel):
         # Check if VLM
         is_vlm = any(x.endswith("ForConditionalGeneration") for x in model_config.architectures)
         is_vlm = is_vlm or hasattr(model_config, "vision_config")
+        print('is_vlm in FastModel.from_pretrained', is_vlm)
         if auto_model is None:
             auto_model = AutoModelForVision2Seq if is_vlm else AutoModelForCausalLM
 
+        print('about to call FastBaseModel.from_pretrained')
+        print('current dtype', dtype)
+        print('_get_dtype(dtype)', _get_dtype(dtype))
+        print('entering FastBaseModel.from_pretrained')
         model, tokenizer = FastBaseModel.from_pretrained(
             model_name        = model_name,
             max_seq_length    = max_seq_length,
@@ -749,7 +775,11 @@ class FastModel(FastBaseModel):
             whisper_task      = whisper_task,            
             *args, **kwargs,
         )
-
+        print('now model and tokenizer are set to FastBaseModel.from_pretrained', type(model), type(tokenizer))
+        print('checking dtypes for bfloat16')
+        for name, param in model.named_parameters():
+            if param.dtype == torch.bfloat16:
+                print(f'{name} is bfloat16')
         if resize_model_vocab is not None:
             model.resize_token_embeddings(resize_model_vocab)
         pass
@@ -763,6 +793,7 @@ class FastModel(FastBaseModel):
         pass
 
         if load_in_4bit:
+            print('inside if load_in_4bit in FastModel.from_pretrained')
             # Fix up bitsandbytes config
             quantization_config = \
             {
@@ -782,6 +813,7 @@ class FastModel(FastBaseModel):
         pass
 
         if is_peft:
+            print('inside if is_peft in FastModel.from_pretrained')
             # From https://github.com/huggingface/peft/issues/184
             # Now add PEFT adapters
             model = PeftModel.from_pretrained(
@@ -792,8 +824,16 @@ class FastModel(FastBaseModel):
                 is_trainable = True,
                 trust_remote_code = trust_remote_code,
             )
+            print('now model is set to PeftModel.from_pretrained', type(model))
+            for name, param in model.named_parameters():
+                if param.dtype == torch.bfloat16:
+                    print(f'{name} is bfloat16')
             # Patch it as well!
+            print('about to call FastBaseModel.post_patch_model')
             model = FastBaseModel.post_patch_model(model, use_gradient_checkpointing)
+            for name, param in model.named_parameters():
+                if param.dtype == torch.bfloat16:
+                    print(f'{name} is bfloat16')
         pass
         return model, tokenizer
     pass

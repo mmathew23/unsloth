@@ -165,7 +165,7 @@ def unsloth_base_fast_generate(
     except: pass
 
     # Mixed precision autocast
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
+    if os.environ.get("UNSLOTH_GEMMA_FLOAT32", "0") == "1":
         autocaster = torch.autocast(device_type = "cuda", dtype = torch.float16)
         dtype = torch.float16
     else:
@@ -298,7 +298,7 @@ class FastBaseModel:
 
         if dtype is None:
             dtype = torch.float16 if not SUPPORTS_BFLOAT16 else torch.bfloat16
-        elif os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
+        elif os.environ.get("UNSLOTH_GEMMA_FLOAT32", "0") == "1":
             if dtype == torch.float16: dtype = torch.bfloat16
         elif dtype == torch.bfloat16 and not SUPPORTS_BFLOAT16:
             logger.warning_once("Device does not support bfloat16. Will change to float16.")
@@ -308,7 +308,7 @@ class FastBaseModel:
 
         bnb_compute_dtype = dtype
         do_forced_float32 = False
-        if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
+        if os.environ.get("UNSLOTH_GEMMA_FLOAT32", "0") == "1":
             print(f"Unsloth: Using float16 precision for {model_type_arch} won't work! Using float32.")
             bnb_compute_dtype = torch.float16
             do_forced_float32 = True

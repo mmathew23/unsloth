@@ -666,7 +666,7 @@ class FastModel(FastBaseModel):
         model_types = ["siglip"] + model_types
 
         # Set forced float32 env flag
-        os.environ["UNSLOTH_FORCE_FLOAT32"] = "0"
+        os.environ["UNSLOTH_GEMMA_FLOAT32"] = "0"
         do_forced_float32 = False
         for model_type_arch in model_types:
             if model_type_arch != "siglip": break
@@ -675,7 +675,7 @@ class FastModel(FastBaseModel):
             if (disable_name.lower() == model_type_arch.lower() or \
                 disable_name.lower() in model_name.lower()) and \
                 ((dtype == torch.float16) or not SUPPORTS_BFLOAT16):
-                os.environ["UNSLOTH_FORCE_FLOAT32"] = "1"
+                os.environ["UNSLOTH_GEMMA_FLOAT32"] = "1"
                 dtype = torch.bfloat16 # Change to bfloat16 loading
                 break
         pass

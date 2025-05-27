@@ -224,21 +224,11 @@ elif DEVICE_TYPE == "xpu":
 
 # Check for unsloth_zoo
 try:
-    unsloth_zoo_version = importlib_version("unsloth_zoo")
-    if Version(unsloth_zoo_version) < Version("2025.4.1"):
-        pass
-        # print(
-        #     "Unsloth: Updating Unsloth-Zoo utilies to the latest version.\n"\
-        #     "To disable this, set `os.environ['UNSLOTH_DISABLE_AUTO_UPDATES'] = '1'`"
-        # )
-        # if os.environ.get("UNSLOTH_DISABLE_AUTO_UPDATES", "0") == "0":
-        #     try:
-        #         os.system("pip install --upgrade --no-cache-dir --no-deps unsloth_zoo")
-        #     except:
-        #         try:
-        #             os.system("pip install --upgrade --no-cache-dir --no-deps --user unsloth_zoo")
-        #         except:
-        #             raise ImportError("Unsloth: Please update unsloth_zoo via `pip install --upgrade --no-cache-dir --no-deps unsloth_zoo`")
+    # force external mode for now
+    os.environ["UNSLOTH_ZOO_MODE"] = "external"
+    import unsloth._zoo_router
+
+    # _zoo_router will install the path finder to unsloth_zoo imports
     import unsloth_zoo
 except:
     raise ImportError("Unsloth: Please install unsloth_zoo via `pip install unsloth_zoo`")

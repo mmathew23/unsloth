@@ -224,12 +224,18 @@ elif DEVICE_TYPE == "xpu":
 
 # Check for unsloth_zoo
 try:
-    # force external mode for now
-    os.environ["UNSLOTH_ZOO_MODE"] = "external"
-    import unsloth._zoo_router
 
-    # _zoo_router will install the path finder to unsloth_zoo imports
-    import unsloth_zoo
+    _local_zoo = importlib.import_module("unsloth.unsloth_zoo")
+    if "unsloth_zoo" in sys.modules:
+        ext_module = sys.modules["unsloth_zoo"]
+        if Path(getattr(ext_module, "__file__", "")).resolve() != Path(_local_zoo.__file__).resolve():
+            warnings.warn(
+                "Unsloth: A different copy of 'unsloth_zoo' was imported before Unsloth. "
+            )
+    else:
+        sys.modules["unsloth_zoo"] = _local_zoo
+    del _local_zoo
+
 except:
     raise ImportError("Unsloth: Please install unsloth_zoo via `pip install unsloth_zoo`")
 pass

@@ -925,7 +925,10 @@ def LlamaModel_fast_forward(
     for idx, decoder_layer in enumerate(self.layers):
 
         if output_hidden_states: all_hidden_states += (hidden_states,)
-        past_key_value = past_key_values[idx] if past_key_values is not None else None
+        if IS_FALCON_H1:
+            past_key_value = past_key_values[idx] if past_key_values is not None and len(past_key_values.key_cache) > 0 else None
+        else:
+            past_key_value = past_key_values[idx] if past_key_values is not None else None
 
         mask = causal_mask
         if IS_GEMMA2:

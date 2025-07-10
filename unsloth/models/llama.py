@@ -710,10 +710,21 @@ def LlamaModel_fast_forward(
         pass
     pass
 
+    # Normalized from Gemma
+    IS_GEMMA   = self.config.model_type.startswith("gemma")
+    IS_GEMMA2  = self.config.model_type.startswith("gemma2")
+    IS_COHERE  = self.config.model_type.startswith("cohere")
+    IS_GRANITE = self.config.model_type.startswith("granite")
+    IS_FALCON_H1 = self.config.model_type.startswith("falcon_h1")
+
     past_key_values_length = 0
 
     if past_key_values is not None:
-        past_key_values_length = past_key_values[0][0].shape[2]
+        if IS_FALCON_H1:
+            # Falcon H1 uses a hybrid cache
+            past_key_values_length = len(past_key_values.key_cache)
+        else:
+            past_key_values_length = past_key_values[0][0].shape[2]
         seq_length_with_past = seq_length_with_past + past_key_values_length
     pass
 
@@ -741,13 +752,6 @@ def LlamaModel_fast_forward(
         inputs_embeds = self.embed_tokens(input_ids)
 
     inputs_embeds = inputs_embeds.to(_get_dtype(self.config.torch_dtype))
-
-    # Normalized from Gemma
-    IS_GEMMA   = self.config.model_type.startswith("gemma")
-    IS_GEMMA2  = self.config.model_type.startswith("gemma2")
-    IS_COHERE  = self.config.model_type.startswith("cohere")
-    IS_GRANITE = self.config.model_type.startswith("granite")
-    IS_FALCON_H1 = self.config.model_type.startswith("falcon_h1")
 
     train_embed_tokens = self.embed_tokens.weight.requires_grad
 

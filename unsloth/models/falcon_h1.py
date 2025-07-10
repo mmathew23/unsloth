@@ -576,7 +576,7 @@ def FalconH1CausalLM_fast_forward(fast_forward_inference):
         causal_mask: Optional[BlockDiagonalCausalMask] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        past_key_values: Optional[FalconHybridMambaAttentionDynamicCache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
@@ -748,7 +748,7 @@ def FalconH1CausalLM_fast_forward(fast_forward_inference):
             attentions=  outputs.attentions,
         )
     pass
-    return _CausalLM_fast_forward
+    return _FalconH1CausalLM_fast_forward
 pass
 
 #Separate prepare_inputs_for_generation for Hybrid FalconH1
@@ -839,7 +839,7 @@ class FastFalconH1Model(FastLlamaModel):
         FalconH1Attention      .forward = FalconH1Attention_fast_forward
         FalconH1DecoderLayer   .forward = FalconH1DecoderLayer_fast_forward
         FalconH1Model          .forward = LlamaModel_fast_forward
-        FalconH1ForCausalLM    .forward = CausalLM_fast_forward(_FalconH1_fast_forward_inference(FalconH1Attention_fast_forward_inference))
+        FalconH1ForCausalLM    .forward = FalconH1CausalLM_fast_forward(_FalconH1_fast_forward_inference(FalconH1Attention_fast_forward_inference))
         PeftModelForCausalLM.forward = PeftModel_fast_forward
         fix_prepare_inputs_for_generation(FalconH1ForCausalLM)
 

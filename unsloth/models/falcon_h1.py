@@ -520,7 +520,7 @@ def _FalconH1_fast_forward_inference(attention_fast_forward_inference=FalconH1At
                 attention_mask = attention_mask,
                 do_prefill = not hasattr(decoder_layer.self_attn, "paged_attention"),
             )
-            attention_hidden_states = attention_hidden_states * decoder_layer.attention_out_multiplier
+            attention_hidden_states = attention_hidden_states * decoder_layer.attn_out_multiplier
             mamba_hidden_states = decoder_layer.mamba(
                 hidden_states=X,
                 cache_params=present_key_value,

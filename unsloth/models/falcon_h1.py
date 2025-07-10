@@ -43,6 +43,7 @@ except:
 from transformers.modeling_attn_mask_utils import (
     _prepare_4d_causal_attention_mask_for_sdpa,
 )
+from transformers.utils import is_torchdynamo_compiling
 # For Pytorch 2.1.1
 try:
     from transformers.models.falcon_h1.modeling_falcon_h1 import (

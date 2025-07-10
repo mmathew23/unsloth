@@ -587,7 +587,7 @@ def FalconH1CausalLM_fast_forward(fast_forward_inference):
         logits_to_keep: Optional[int] = 0,
         *args, **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        if past_key_values is not None:
+        if isinstance(past_key_values, FalconHybridMambaAttentionDynamicCache) and len(past_key_values.key_cache) > 0:
             outputs = fast_forward_inference(
                 self,
                 input_ids,
@@ -605,14 +605,6 @@ def FalconH1CausalLM_fast_forward(fast_forward_inference):
             return_dict = return_dict if return_dict is not None else self.config.use_return_dict
             # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
             self.model._has_no_labels = labels is None
-            past_key_values = FalconHybridMambaAttentionDynamicCache(
-                self.config,
-                input_ids.shape[0],
-                self.dtype,
-                devices=[
-                    self.model.layers[i].mamba.conv1d.weight.device for i in range(self.config.num_hidden_layers)
-                ],
-            )
             outputs = self.model(
                 input_ids = input_ids,
                 causal_mask = causal_mask,
@@ -786,7 +778,15 @@ def _fast_prepare_inputs_for_generation(
             input_ids = input_ids[:, -cache_position.shape[0] :]
         elif input_ids.shape[1] != cache_position.shape[0]:  # Default case (the "else", a no op, is Exception 2)
             input_ids = input_ids[:, cache_position]
-    # else:
+    else:
+        past_key_values = FalconHybridMambaAttentionDynamicCache(
+            self.config,
+            input_ids.shape[0],
+            self.dtype,
+            devices=[
+                self.model.layers[i].mamba.conv1d.weight.device for i in range(self.config.num_hidden_layers)
+            ],
+        )
 
     if attention_mask is not None and position_ids is None:
         # create position_ids on the fly for batch generation

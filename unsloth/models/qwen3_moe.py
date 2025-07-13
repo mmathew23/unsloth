@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import torch
 from .llama import *
 import os
 from ._utils import __version__
@@ -23,6 +24,12 @@ from .qwen3 import (
     Qwen3Attention_fast_forward,
     FastQwen3Model,
 )
+from ..kernels.moe.grouped_gemm.interface import (
+    grouped_gemm,
+)
+from ..kernels.moe.grouped_gemm.reference.moe_ops import (
+    get_routing_indices,
+)
 from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeAttention,
     Qwen3MoeSparseMoeBlock,
@@ -30,6 +37,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeDecoderLayer,
     Qwen3MoeModel,
     Qwen3MoeForCausalLM,
+    Qwen3MoeConfig,
 )
 # For Pytorch 2.1.1
 # TODO: Transformers moved to `attention_interface`. So we might not need these anymore
@@ -81,6 +89,66 @@ def Qwen3MoeSparseMoeBlock_fast_forward(self, X, temp_gate = None, temp_up = Non
         # However `index_add_` only support torch tensors for indexing so we'll use
         # the `top_x` tensor here.
         final_X.index_add_(0, top_x, current_X.to(X.dtype))
+    final_X = final_X.reshape(bsz, seq_len, hd)
+    return final_X, router_logits
+pass
+
+def Qwen3MoeFastMoeBlock_fast_forward(self, X, temp_gate = None, temp_up = None):
+    # adapted from https://github.com/huggingface/transformers/pull/36878/files#diff-0855b77fc27ad9449158a1c74953f909b011c00de7125f7c8e68d0ff209c092aR356-R370
+    
+    bsz, seq_len, hd = X.shape
+    X = X.view(-1, hd)
+
+    router_logits = fast_linear_forward(self.gate_proj, X, out = temp_gate) #pretty much the only change from transformers implementation.
+
+    routing_weights = torch_nn_functional_softmax(router_logits, dim = -1)
+    routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+    routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+    # we cast back to the input dtype
+    routing_weights = routing_weights.to(X.dtype)
+
+    num_tokens = bsz * seq_len
+    
+    # Convert routing to grouped GEMM format
+    token_counts_by_expert, gather_indices = get_routing_indices(selected_experts, self.num_experts)
+    
+    # First grouped GEMM: gate_up projection with input permutation fusion
+    # This replaces the entire expert loop for the first linear layer
+    hidden_states = grouped_gemm(
+        X=X,                              # Input tokens [num_tokens, hidden_size]
+        W=self.gate_up_proj,
+        m_sizes=token_counts_by_expert,   # Tokens per expert
+        gather_indices=gather_indices,    # Routing indices
+        topk=self.top_k,
+        permute_x=True,                   # Fuse input permutation (token->expert order)
+        permute_y=False,                  # Keep in expert order for next operation
+        autotune=True,                    # Auto-optimize kernel parameters
+        is_first_gemm=True
+    )
+    
+    # Apply SwiGLU activation (same as your fast_swiglu_inference)
+    gate_proj, up_proj = hidden_states.chunk(2, dim=-1)
+    hidden_states = torch.nn.functional.silu(gate_proj) * up_proj
+    
+    # Second grouped GEMM: down projection with output permutation fusion
+    hidden_states = grouped_gemm(
+        X=hidden_states,                  # Intermediate activations
+        W=self.down_proj,
+        m_sizes=token_counts_by_expert,   
+        gather_indices=gather_indices,
+        topk=self.top_k,
+        permute_x=False,                  # Already in expert order
+        permute_y=True,                   # Fuse output permutation (expert->token order)
+        autotune=True,
+        is_first_gemm=False
+    )
+    
+    # Apply routing weights and sum across top-k experts
+    final_X = (
+        hidden_states.view(num_tokens, self.top_k, hd) * 
+        routing_weights[..., None]
+    ).sum(dim=1)
+    
     final_X = final_X.reshape(bsz, seq_len, hd)
     return final_X, router_logits
 pass
@@ -158,7 +226,7 @@ def Qwen3MoeDecoderLayer_fast_forward(
 class FastQwen3MoeModel(FastQwen3Model):
 
     @staticmethod
-    def pre_patch():
+    def pre_patch(moe_kernel = "sparse"):
         init_name, function = patch_linear_scaling(
             model_name         = "Qwen3Moe",
             rope_module        = LlamaRotaryEmbedding,
@@ -172,7 +240,10 @@ class FastQwen3MoeModel(FastQwen3Model):
         Qwen3MoeAttention      .forward = Qwen3Attention_fast_forward
         # Qwen3SdpaAttention   .forward = Qwen3Attention_fast_forward
         # Qwen3FlashAttention2 .forward = Qwen3Attention_fast_forward
-        Qwen3MoeSparseMoeBlock .forward = Qwen3MoeSparseMoeBlock_fast_forward
+        if moe_kernel == "sparse":
+            Qwen3MoeSparseMoeBlock .forward = Qwen3MoeSparseMoeBlock_fast_forward
+        else:
+            Qwen3MoeSparseMoeBlock .forward = Qwen3MoeFastMoeBlock_fast_forward
         Qwen3MoeMLP            .forward = fast_swiglu_inference # This is analogous to Dense models' MLP
         Qwen3MoeDecoderLayer   .forward = Qwen3MoeDecoderLayer_fast_forward
         Qwen3MoeModel          .forward = LlamaModel_fast_forward
@@ -206,7 +277,7 @@ class FastQwen3MoeModel(FastQwen3Model):
         trust_remote_code = False,
         **kwargs,
     ):
-        return FastLlamaModel.from_pretrained(
+        model = FastLlamaModel.from_pretrained(
             model_name        = model_name,
             max_seq_length    = max_seq_length,
             dtype             = dtype,
@@ -220,5 +291,76 @@ class FastQwen3MoeModel(FastQwen3Model):
             trust_remote_code = trust_remote_code,
             **kwargs,
         )
+        model.convert_to_fast_moe()
+        return model
+    pass
+
+    @staticmethod
+    def extract_hf_weights(moe_block: Qwen3MoeSparseMoeBlock):
+        config: Qwen3MoeConfig = moe_block.experts[0].config
+        num_experts = config.num_experts
+
+        gate = moe_block.gate.weight.data
+        gate_proj = torch.stack(
+            [moe_block.experts[i].gate_proj.weight.data for i in range(num_experts)],
+            dim=0,
+        )
+        up_proj = torch.stack(
+            [moe_block.experts[i].up_proj.weight.data for i in range(num_experts)],
+            dim=0,
+        )
+        down_proj = torch.stack(
+            [moe_block.experts[i].down_proj.weight.data for i in range(num_experts)],
+            dim=0,
+        )
+        gate_up_proj = torch.cat([gate_proj, up_proj], dim=1)
+
+        # return gate, gate_up_proj, down_proj
+        return {"gate_up_proj": gate_up_proj, "down_proj": down_proj}
+    
+    @staticmethod
+    def reconstruct_expert_weights(gate, gate_up_proj, down_proj, gate_proj_dim):
+        """
+        Reconstructs individual expert weights from the extracted consolidated weights.
+        
+        Args:
+            gate: Gate weight tensor
+            gate_up_proj: Concatenated gate_proj and up_proj weights (num_experts, combined_dim)
+            down_proj: Down projection weights (num_experts, ...)
+            gate_proj_dim: Dimension size of gate_proj to split gate_up_proj correctly
+        
+        Returns:
+            tuple: (gate, list_of_expert_weights)
+            where each expert_weights is a dict with keys: 'gate_proj', 'up_proj', 'down_proj'
+        """
+        num_experts = gate_up_proj.shape[0]
+        
+        # Split gate_up_proj back into gate_proj and up_proj
+        gate_proj_weights = gate_up_proj[:, :gate_proj_dim]  # First part
+        up_proj_weights = gate_up_proj[:, gate_proj_dim:]    # Second part
+        
+        # Create list of expert weight dictionaries
+        expert_weights = []
+        for i in range(num_experts):
+            expert_weights.append({
+                'gate_proj': gate_proj_weights[i],
+                'up_proj': up_proj_weights[i], 
+                'down_proj': down_proj[i]
+            })
+        
+        return expert_weights
+
+    def convert_to_fast_moe(self):
+        for n, m in self.named_modules():
+            if isinstance(m, Qwen3MoeSparseMoeBlock):
+                weight_info = self.extract_hf_weights(m)
+                gate_up_proj = weight_info["gate_up_proj"]
+                down_proj = weight_info["down_proj"]
+                m.gate_up_proj = torch.nn.Parameter(gate_up_proj)
+                m.down_proj = torch.nn.Parameter(down_proj)
+                delattr(m, "experts")
+
+            pass
+        pass
     pass
 pass

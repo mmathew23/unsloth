@@ -86,7 +86,7 @@ def _grouped_gemm_forward_kernel(
     processed_tiles = 0
     m_block_range = tl.arange(0, BLOCK_SIZE_M)
 
-    for expert_idx in tl.range(NUM_EXPERTS, flatten=FLATTEN):
+    for expert_idx in tl.range(NUM_EXPERTS):
         m_start = m_end
         m_size = tl.load(m_sizes_ptr + expert_idx).to(tl.int32)
         m_end = m_start + m_size

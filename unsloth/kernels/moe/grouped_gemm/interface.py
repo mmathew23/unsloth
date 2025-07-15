@@ -151,7 +151,6 @@ def grouped_gemm_forward(
         assert not permute_x, "Cannot use both use_tma_load_x and permute_x"
 
     use_tma = use_tma_load_w or use_tma_load_x or use_tma_store
-    print(autotune, use_tma)
     if not supports_tma() and use_tma:
         warnings.warn("TMA not supported, tma_load will be set to False")
         use_tma_load_w = False

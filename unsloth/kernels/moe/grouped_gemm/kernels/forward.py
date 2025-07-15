@@ -65,22 +65,22 @@ def _grouped_gemm_forward_kernel(
     # When using TMA load, we don't permute_x, so shape should be [TOTAL_TOKENS, K]
     # Also, we are defining a single global descriptor with single block shape
     # Need to check that this does not result in errors when crossing expert boundaries
-    if USE_TMA_LOAD_X:
-        x_desc = tl._experimental_make_tensor_descriptor(
-            x_ptr,
-            shape=[TOTAL_TOKENS, K],
-            strides=[K, 1],
-            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
-        )
+    # if USE_TMA_LOAD_X:
+    #     x_desc = tl._experimental_make_tensor_descriptor(
+    #         x_ptr,
+    #         shape=[TOTAL_TOKENS, K],
+    #         strides=[K, 1],
+    #         block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+    #     )
 
-    if USE_TMA_LOAD_W:
-        expert_stride = N * K
-        w_desc = tl._experimental_make_tensor_descriptor(
-            w_ptr,
-            shape=[NUM_EXPERTS, N, K],
-            strides=[expert_stride, K, 1],
-            block_shape=[1, BLOCK_SIZE_N, BLOCK_SIZE_K],
-        )
+    # if USE_TMA_LOAD_W:
+    #     expert_stride = N * K
+    #     w_desc = tl._experimental_make_tensor_descriptor(
+    #         w_ptr,
+    #         shape=[NUM_EXPERTS, N, K],
+    #         strides=[expert_stride, K, 1],
+    #         block_shape=[1, BLOCK_SIZE_N, BLOCK_SIZE_K],
+    #     )
 
     m_end = 0
     processed_tiles = 0
@@ -99,13 +99,13 @@ def _grouped_gemm_forward_kernel(
             num_tiles_per_expert = num_m_tiles * num_n_tiles
 
             # Need to create tma_store within loop since we need to predicate stores based on m_size
-            if USE_TMA_STORE:
-                y_desc = tl._experimental_make_tensor_descriptor(
-                    y_ptr,  # + m_start * N,
-                    shape=[m_end, N],
-                    strides=[N, 1],
-                    block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
-                )
+            # if USE_TMA_STORE:
+            #     y_desc = tl._experimental_make_tensor_descriptor(
+            #         y_ptr,  # + m_start * N,
+            #         shape=[m_end, N],
+            #         strides=[N, 1],
+            #         block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+            #     )
 
             # Process tiles for this expert
             while (
@@ -157,14 +157,14 @@ def _grouped_gemm_forward_kernel(
                         row_mask = offs_am[:, None] < m_size
                         row_idx = m_start + offs_am[:, None]
                         store_idx = row_idx * N
-                        if not USE_TMA_LOAD_X:
-                            load_idx = row_idx * K
+                        # if not USE_TMA_LOAD_X:
+                        load_idx = row_idx * K
 
                 if PERMUTE_Y:
-                    if not USE_TMA_LOAD_X:
-                        load_idx = (
-                            indices_to_gather[:, None] * K
-                        )  # Load in contiguous order (no permutation on load)
+                    # if not USE_TMA_LOAD_X:
+                    load_idx = (
+                        indices_to_gather[:, None] * K
+                    )  # Load in contiguous order (no permutation on load)
                     # offs_am = off_am + m_block_range
                     # row_mask = offs_am[:, None] < m_size
                     store_idx = (
@@ -182,21 +182,21 @@ def _grouped_gemm_forward_kernel(
 
                 offs_k = tl.arange(0, BLOCK_SIZE_K)
 
-                if not USE_TMA_LOAD_X:
-                    x_ptrs = x_ptr + load_idx + offs_k[None, :]
+                # if not USE_TMA_LOAD_X:
+                x_ptrs = x_ptr + load_idx + offs_k[None, :]
 
-                if not USE_TMA_LOAD_W:
-                    offs_bn = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-                    offs_bn = tl.max_contiguous(
-                        tl.multiple_of(offs_bn % N, BLOCK_SIZE_N), BLOCK_SIZE_N
-                    )
-                    w_ptrs = w_ptr + (n_start + offs_bn[:, None]) * K + offs_k[None, :]
+                # if not USE_TMA_LOAD_W:
+                offs_bn = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+                offs_bn = tl.max_contiguous(
+                    tl.multiple_of(offs_bn % N, BLOCK_SIZE_N), BLOCK_SIZE_N
+                )
+                w_ptrs = w_ptr + (n_start + offs_bn[:, None]) * K + offs_k[None, :]
 
                 for k_offset in range(0, K, BLOCK_SIZE_K):
-                    if not USE_TMA_LOAD_X:
-                        x = tl.load(x_ptrs, mask=row_mask)
-                    else:
-                        x = x_desc.load([m_start + off_am, k_offset])
+                    # if not USE_TMA_LOAD_X:
+                    x = tl.load(x_ptrs, mask=row_mask)
+                    # else:
+                    #     x = x_desc.load([m_start + off_am, k_offset])
 
                     if FUSE_MUL_PRE:
                         # Check for correct broadcasting
@@ -205,21 +205,21 @@ def _grouped_gemm_forward_kernel(
                         )
                         x *= topk_weights.to(x.dtype)
 
-                    if not USE_TMA_LOAD_W:
-                        w = tl.load(w_ptrs, mask=offs_bn[:, None] < N)
-                    else:
-                        w = w_desc.load(
-                            [expert_idx, tile_n_idx * BLOCK_SIZE_N, k_offset]
-                        )
-                        w = tl.reshape(w, (BLOCK_SIZE_N, BLOCK_SIZE_K))
+                    # if not USE_TMA_LOAD_W:
+                    w = tl.load(w_ptrs, mask=offs_bn[:, None] < N)
+                    # else:
+                    #     w = w_desc.load(
+                    #         [expert_idx, tile_n_idx * BLOCK_SIZE_N, k_offset]
+                    #     )
+                    #     w = tl.reshape(w, (BLOCK_SIZE_N, BLOCK_SIZE_K))
 
                     accumulator += tl.dot(x, w.T)
 
-                    if not USE_TMA_LOAD_X:
-                        x_ptrs += BLOCK_SIZE_K
+                    # if not USE_TMA_LOAD_X:
+                    x_ptrs += BLOCK_SIZE_K
 
-                    if not USE_TMA_LOAD_W:
-                        w_ptrs += BLOCK_SIZE_K
+                    # if not USE_TMA_LOAD_W:
+                    w_ptrs += BLOCK_SIZE_K
 
                 y = accumulator.to(output_dtype)
 
@@ -235,16 +235,16 @@ def _grouped_gemm_forward_kernel(
                 offs_bn = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
                 store_mask = row_mask & (offs_bn[None, :] < N)
 
-                if USE_TMA_STORE:
-                    offset_m = tile_m_idx * BLOCK_SIZE_M  # .to(tl.int32)
-                    offset_n = tile_n_idx * BLOCK_SIZE_N  # .to(tl.int32)
-                    y_desc.store([m_start + offset_m, offset_n], y)
-                else:
-                    tl.store(
-                        y_ptr + store_idx + offs_bn[None, :],
-                        y,
-                        mask=store_mask,
-                    )
+                # if USE_TMA_STORE:
+                #     offset_m = tile_m_idx * BLOCK_SIZE_M  # .to(tl.int32)
+                #     offset_n = tile_n_idx * BLOCK_SIZE_N  # .to(tl.int32)
+                #     y_desc.store([m_start + offset_m, offset_n], y)
+                # else:
+                tl.store(
+                    y_ptr + store_idx + offs_bn[None, :],
+                    y,
+                    mask=store_mask,
+                )
                 tidx += NUM_SMS
 
             processed_tiles += num_tiles_per_expert

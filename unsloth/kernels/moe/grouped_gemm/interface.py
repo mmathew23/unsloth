@@ -947,7 +947,8 @@ def grouped_gemm(
 
     X = X.view(-1, X.shape[-1])
     m_sizes = m_sizes.view(-1)
-    gather_indices = gather_indices.view(-1)
+    if gather_indices:
+        gather_indices = gather_indices.view(-1)
 
     return GroupedGemm.apply(
         X,

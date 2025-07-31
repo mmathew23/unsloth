@@ -99,7 +99,7 @@ def get_Qwen3MoeSparseMoeBlock_kernel_forward(autotune = False):
         bsz, seq_len, hd = X.shape
         X = X.view(-1, hd)
 
-        router_logits = fast_linear_forward(self.gate_proj, X, out = temp_gate) #pretty much the only change from transformers implementation.
+        router_logits = fast_linear_forward(self.gate, X, out = temp_gate) #pretty much the only change from transformers implementation.
 
         routing_weights = torch_nn_functional_softmax(router_logits, dim = -1)
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)

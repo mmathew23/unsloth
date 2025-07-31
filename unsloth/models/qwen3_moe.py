@@ -85,6 +85,85 @@ def Qwen3MoeSparseMoeBlock_fast_forward(self, X, temp_gate = None, temp_up = Non
     return final_X, router_logits
 pass
 
+def get_Qwen3MoeSparseMoeBlock_kernel_forward(autotune = False):
+    from unsloth.kernels.moe.grouped_gemm.interface import grouped_gemm
+    from unsloth.kernels.moe.grouped_gemm.kernels.tuning import (
+        KernelConfigForward,
+        KernelConfigBackward_dX,
+        KernelConfigBackward_dW,
+    )
+    def Qwen3MoeSparseMoeBlock_fast_forward_kernel(self, X, temp_gate = None, temp_up = None):
+        # adapted from https://github.com/huggingface/transformers/pull/36878/files#diff-0855b77fc27ad9449158a1c74953f909b011c00de7125f7c8e68d0ff209c092aR356-R370
+        
+        bsz, seq_len, hd = X.shape
+        X = X.view(-1, hd)
+
+        router_logits = fast_linear_forward(self.gate_proj, X, out = temp_gate) #pretty much the only change from transformers implementation.
+
+        routing_weights = torch_nn_functional_softmax(router_logits, dim = -1)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        # we cast back to the input dtype
+        routing_weights = routing_weights.to(X.dtype)
+        final_X = torch.zeros(
+            (bsz * seq_len, hd), dtype=X.dtype, device=X.device
+        )
+        token_counts_by_expert = torch.histc(
+            selected_experts.view(-1),
+            bins=self.num_experts,
+            min=0,
+            max=self.num_experts,
+        )
+        # token_indices_experts_sorted shape (bs*slen*top_k,)
+        gather_indices = torch.argsort(selected_experts.view(-1), stable=True)
+
+        gate_up_proj_out = grouped_gemm(
+            X,
+            self.gate_up_proj,
+            m_sizes = token_counts_by_expert,
+            topk = self.top_k,
+            gather_indices = gather_indices,
+            permute_x = True,
+            permute_y = False,
+            topk_weights=None,
+            fuse_mul_post=False,
+            kernel_config_fwd: KernelConfigForward = None if autotune else KernelConfigForward(),
+            kernel_config_bwd_dX: KernelConfigBackward_dX = None if autotune else KernelConfigBackward_dX(),
+            kernel_config_bwd_dW: KernelConfigBackward_dW = None if autotune else KernelConfigBackward_dW(),
+            autotune = autotune,
+            is_first_gemm = True,
+            # Only for debugging
+            dX_only = False,
+            dW_only = False,
+        )
+        gate, up = torch.chunk(gate_up_proj_out, 2, dim=-1)
+        hidden_states = self.act_fn(gate) * up
+        hidden_states = grouped_gemm(
+            hidden_states,
+            self.down_proj,
+            m_sizes = token_counts_by_expert,
+            topk = self.top_k,
+            gather_indices = gather_indices,
+            permute_x = False,
+            permute_y = True,
+            topk_weights=None,
+            fuse_mul_post=False,
+            kernel_config_fwd: KernelConfigForward = None if autotune else KernelConfigForward(),
+            kernel_config_bwd_dX: KernelConfigBackward_dX = None if autotune else KernelConfigBackward_dX(),
+            kernel_config_bwd_dW: KernelConfigBackward_dW = None if autotune else KernelConfigBackward_dW(),
+            autotune = autotune,
+            is_first_gemm = True,
+            # Only for debugging
+            dX_only = False,
+            dW_only = False,
+        )
+        
+        return temp_up, router_logits
+    pass
+
+    return Qwen3MoeSparseMoeBlock_fast_forward_kernel
+pass
+
 
 def Qwen3MoeDecoderLayer_fast_forward(
     self,
@@ -172,7 +251,10 @@ class FastQwen3MoeModel(FastQwen3Model):
         Qwen3MoeAttention      .forward = Qwen3Attention_fast_forward
         # Qwen3SdpaAttention   .forward = Qwen3Attention_fast_forward
         # Qwen3FlashAttention2 .forward = Qwen3Attention_fast_forward
-        Qwen3MoeSparseMoeBlock .forward = Qwen3MoeSparseMoeBlock_fast_forward
+        if os.environ.get("UNSLOTH_USE_GROUPED_GEMM", "0") == "1":
+            Qwen3MoeSparseMoeBlock .forward = get_Qwen3MoeSparseMoeBlock_kernel_forward(autotune = False)
+        else:
+            Qwen3MoeSparseMoeBlock .forward = Qwen3MoeSparseMoeBlock_fast_forward
         Qwen3MoeMLP            .forward = fast_swiglu_inference # This is analogous to Dense models' MLP
         Qwen3MoeDecoderLayer   .forward = Qwen3MoeDecoderLayer_fast_forward
         Qwen3MoeModel          .forward = LlamaModel_fast_forward
@@ -190,6 +272,26 @@ class FastQwen3MoeModel(FastQwen3Model):
         return
     pass
 
+    @staticmethod
+    def extract_hf_weights(moe_block: Qwen3MoeSparseMoeBlock):
+        config: Qwen3MoeConfig = moe_block.experts[0].config
+        num_experts = config.num_experts
+
+        gate = moe_block.gate.weight.data
+        gate_proj = torch.stack(
+            [moe_block.experts[i].gate_proj.weight.data for i in range(num_experts)],
+            dim=0,
+        )
+        up_proj = torch.stack(
+            [moe_block.experts[i].up_proj.weight.data for i in range(num_experts)],
+            dim=0,
+        )
+        down_proj = torch.stack(
+            [moe_block.experts[i].down_proj.weight.data for i in range(num_experts)],
+            dim=0,
+        )
+        gate_up_proj = torch.cat([gate_proj, up_proj], dim=1)
+        return gate, gate_up_proj, down_proj
 
     @staticmethod
     def from_pretrained(  #TODO: Change after release
@@ -206,7 +308,7 @@ class FastQwen3MoeModel(FastQwen3Model):
         trust_remote_code = False,
         **kwargs,
     ):
-        return FastLlamaModel.from_pretrained(
+        model = FastLlamaModel.from_pretrained(
             model_name        = model_name,
             max_seq_length    = max_seq_length,
             dtype             = dtype,
@@ -220,5 +322,16 @@ class FastQwen3MoeModel(FastQwen3Model):
             trust_remote_code = trust_remote_code,
             **kwargs,
         )
+        if os.environ.get("UNSLOTH_USE_GROUPED_GEMM", "0") == "1":
+            from transformers.models.qwen3_moe.modeling_qwen3_moe import ACT2FN
+            for layer in model.model.layers:
+                block = layer.block_sparse_moe
+                gate, gate_up_proj, down_proj = FastQwen3MoeModel.extract_hf_weights(block)
+                delattr(block, "experts")
+                block.register_parameter("gate_up_proj", torch.nn.Parameter(gate_up_proj))
+                block.register_parameter("down_proj", torch.nn.Parameter(down_proj))
+                block.register_module("act_fn", ACT2FN[config.hidden_act])
+
+        return model
     pass
 pass

@@ -175,16 +175,18 @@ pass
 
 from .swiglu import swiglu_fg_kernel, swiglu_DWf_DW_dfg_kernel
 def apply_lora_mlp_swiglu(self, X, inplace = True):
-    gateW, gateW_quant, gateA, gateB, gateS = get_lora_parameters(self.gate_proj)
-    upW,     upW_quant,   upA,   upB,   upS = get_lora_parameters(self.  up_proj)
-    downW, downW_quant, downA, downB, downS = get_lora_parameters(self.down_proj)
-    out = LoRA_MLP.apply(X,
-                         gateW, gateW_quant, gateA, gateB, gateS,
-                         upW,     upW_quant, upA,   upB,   upS,
-                         downW, downW_quant, downA, downB, downS,
-                         swiglu_fg_kernel, swiglu_DWf_DW_dfg_kernel,
-                         inplace,)
-    return out
+    if hasattr(self, "gate_proj") and hasattr(self, "up_proj") and hasattr(self, "down_proj"):
+        gateW, gateW_quant, gateA, gateB, gateS = get_lora_parameters(self.gate_proj)
+        upW,     upW_quant,   upA,   upB,   upS = get_lora_parameters(self.  up_proj)
+        downW, downW_quant, downA, downB, downS = get_lora_parameters(self.down_proj)
+        out = LoRA_MLP.apply(X,
+                            gateW, gateW_quant, gateA, gateB, gateS,
+                            upW,     upW_quant, upA,   upB,   upS,
+                            downW, downW_quant, downA, downB, downS,
+                            swiglu_fg_kernel, swiglu_DWf_DW_dfg_kernel,
+                            inplace,)
+        return out
+    
 pass
 
 

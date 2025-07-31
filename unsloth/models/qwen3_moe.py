@@ -94,6 +94,7 @@ def get_Qwen3MoeSparseMoeBlock_kernel_forward(autotune = False):
     )
     def Qwen3MoeSparseMoeBlock_fast_forward_kernel(self, X, temp_gate = None, temp_up = None):
         # adapted from https://github.com/huggingface/transformers/pull/36878/files#diff-0855b77fc27ad9449158a1c74953f909b011c00de7125f7c8e68d0ff209c092aR356-R370
+        print("Using grouped gemm1")
         
         bsz, seq_len, hd = X.shape
         X = X.view(-1, hd)
@@ -127,9 +128,9 @@ def get_Qwen3MoeSparseMoeBlock_kernel_forward(autotune = False):
             permute_y = False,
             topk_weights=None,
             fuse_mul_post=False,
-            kernel_config_fwd: KernelConfigForward = None if autotune else KernelConfigForward(),
-            kernel_config_bwd_dX: KernelConfigBackward_dX = None if autotune else KernelConfigBackward_dX(),
-            kernel_config_bwd_dW: KernelConfigBackward_dW = None if autotune else KernelConfigBackward_dW(),
+            kernel_config_fwd = None if autotune else KernelConfigForward(),
+            kernel_config_bwd_dX = None if autotune else KernelConfigBackward_dX(),
+            kernel_config_bwd_dW = None if autotune else KernelConfigBackward_dW(),
             autotune = autotune,
             is_first_gemm = True,
             # Only for debugging
@@ -148,17 +149,23 @@ def get_Qwen3MoeSparseMoeBlock_kernel_forward(autotune = False):
             permute_y = True,
             topk_weights=None,
             fuse_mul_post=False,
-            kernel_config_fwd: KernelConfigForward = None if autotune else KernelConfigForward(),
-            kernel_config_bwd_dX: KernelConfigBackward_dX = None if autotune else KernelConfigBackward_dX(),
-            kernel_config_bwd_dW: KernelConfigBackward_dW = None if autotune else KernelConfigBackward_dW(),
+            kernel_config_fwd = None if autotune else KernelConfigForward(),
+            kernel_config_bwd_dX = None if autotune else KernelConfigBackward_dX(),
+            kernel_config_bwd_dW = None if autotune else KernelConfigBackward_dW(),
             autotune = autotune,
             is_first_gemm = True,
             # Only for debugging
             dX_only = False,
             dW_only = False,
         )
-        
-        return temp_up, router_logits
+        hidden_states = (
+            hidden_states.view(num_tokens, self.top_k, hidden_dim)
+            * routing_weights[..., None]
+        )
+        hidden_states = hidden_states.sum(dim=1)
+
+        hidden_states = hidden_states.view(batch_size, sequence_length, hidden_dim)
+        return hidden_states, router_logits 
     pass
 
     return Qwen3MoeSparseMoeBlock_fast_forward_kernel
@@ -238,6 +245,7 @@ class FastQwen3MoeModel(FastQwen3Model):
 
     @staticmethod
     def pre_patch():
+        print('pre patch called')
         init_name, function = patch_linear_scaling(
             model_name         = "Qwen3Moe",
             rope_module        = LlamaRotaryEmbedding,
@@ -252,6 +260,7 @@ class FastQwen3MoeModel(FastQwen3Model):
         # Qwen3SdpaAttention   .forward = Qwen3Attention_fast_forward
         # Qwen3FlashAttention2 .forward = Qwen3Attention_fast_forward
         if os.environ.get("UNSLOTH_USE_GROUPED_GEMM", "0") == "1":
+            print('patching Qwen3MoeSparseMoeBlock with grouped gemm')
             Qwen3MoeSparseMoeBlock .forward = get_Qwen3MoeSparseMoeBlock_kernel_forward(autotune = False)
         else:
             Qwen3MoeSparseMoeBlock .forward = Qwen3MoeSparseMoeBlock_fast_forward
@@ -268,7 +277,7 @@ class FastQwen3MoeModel(FastQwen3Model):
         # https://github.com/huggingface/transformers/pull/27931
         # https://github.com/huggingface/transformers/blob/v4.37.2/src/transformers/models/llama/modeling_llama.py\
         import transformers.models.qwen3_moe.modeling_qwen3_moe
-        transformers.models.Qwen3Moe.modeling_qwen3_moe.Qwen3MoeRotaryEmbedding = LlamaRotaryEmbedding
+        transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRotaryEmbedding = LlamaRotaryEmbedding
         return
     pass
 
@@ -308,6 +317,7 @@ class FastQwen3MoeModel(FastQwen3Model):
         trust_remote_code = False,
         **kwargs,
     ):
+        FastQwen3MoeModel.pre_patch()
         model = FastLlamaModel.from_pretrained(
             model_name        = model_name,
             max_seq_length    = max_seq_length,
@@ -323,14 +333,17 @@ class FastQwen3MoeModel(FastQwen3Model):
             **kwargs,
         )
         if os.environ.get("UNSLOTH_USE_GROUPED_GEMM", "0") == "1":
+            print("Using grouped gemm")
             from transformers.models.qwen3_moe.modeling_qwen3_moe import ACT2FN
-            for layer in model.model.layers:
-                block = layer.block_sparse_moe
-                gate, gate_up_proj, down_proj = FastQwen3MoeModel.extract_hf_weights(block)
-                delattr(block, "experts")
-                block.register_parameter("gate_up_proj", torch.nn.Parameter(gate_up_proj))
-                block.register_parameter("down_proj", torch.nn.Parameter(down_proj))
-                block.register_module("act_fn", ACT2FN[config.hidden_act])
+            for layer in model[0].model.layers:
+                if isinstance(layer.mlp, Qwen3MoeSparseMoeBlock):
+                    block = layer.mlp
+                    gate, gate_up_proj, down_proj = FastQwen3MoeModel.extract_hf_weights(block)
+                    delattr(block, "experts")
+                    print(gate_up_proj.dtype, down_proj.dtype)
+                    block.register_parameter("gate_up_proj", torch.nn.Parameter(gate_up_proj))
+                    block.register_parameter("down_proj", torch.nn.Parameter(down_proj))
+                    block.register_module("act_fn", ACT2FN['silu'])
 
         return model
     pass

@@ -50,9 +50,10 @@ def Qwen3MoeSparseMoeBlock_fast_forward(self, X, temp_gate = None, temp_up = Non
     # adapted from https://github.com/huggingface/transformers/pull/36878/files#diff-0855b77fc27ad9449158a1c74953f909b011c00de7125f7c8e68d0ff209c092aR356-R370
     
     bsz, seq_len, hd = X.shape
-    X = X.view(-1, hd)
 
-    router_logits = fast_linear_forward(self.gate_proj, X, out = temp_gate) #pretty much the only change from transformers implementation.
+    router_logits = fast_linear_forward(self.gate, X, out = temp_gate) #pretty much the only change from transformers implementation.
+    router_logits = router_logits.view(bsz*seq_len, -1)
+    X = X.view(-1, hd)
 
     routing_weights = torch_nn_functional_softmax(router_logits, dim = -1)
     routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
@@ -94,10 +95,8 @@ def get_Qwen3MoeSparseMoeBlock_kernel_forward(autotune = False):
     )
     def Qwen3MoeSparseMoeBlock_fast_forward_kernel(self, X, temp_gate = None, temp_up = None):
         # adapted from https://github.com/huggingface/transformers/pull/36878/files#diff-0855b77fc27ad9449158a1c74953f909b011c00de7125f7c8e68d0ff209c092aR356-R370
-        print("Using grouped gemm1")
         
         bsz, seq_len, hd = X.shape
-        X = X.view(-1, hd)
 
         router_logits = fast_linear_forward(self.gate, X, out = temp_gate) #pretty much the only change from transformers implementation.
 
@@ -117,7 +116,8 @@ def get_Qwen3MoeSparseMoeBlock_kernel_forward(autotune = False):
         )
         # token_indices_experts_sorted shape (bs*slen*top_k,)
         gather_indices = torch.argsort(selected_experts.view(-1), stable=True)
-
+        X = X.view(-1, hd)
+        # X = X.to(self.gate_up_proj.dtype)
         gate_up_proj_out = grouped_gemm(
             X,
             self.gate_up_proj,
@@ -153,18 +153,18 @@ def get_Qwen3MoeSparseMoeBlock_kernel_forward(autotune = False):
             kernel_config_bwd_dX = None if autotune else KernelConfigBackward_dX(),
             kernel_config_bwd_dW = None if autotune else KernelConfigBackward_dW(),
             autotune = autotune,
-            is_first_gemm = True,
+            is_first_gemm = False,
             # Only for debugging
             dX_only = False,
             dW_only = False,
         )
         hidden_states = (
-            hidden_states.view(num_tokens, self.top_k, hidden_dim)
+            hidden_states.view(bsz, seq_len, self.top_k, hd)
             * routing_weights[..., None]
         )
-        hidden_states = hidden_states.sum(dim=1)
+        hidden_states = hidden_states.sum(dim=2).to(X.dtype)
 
-        hidden_states = hidden_states.view(batch_size, sequence_length, hidden_dim)
+        hidden_states = hidden_states.view(bsz, seq_len, hd)
         return hidden_states, router_logits 
     pass
 
@@ -264,7 +264,7 @@ class FastQwen3MoeModel(FastQwen3Model):
             Qwen3MoeSparseMoeBlock .forward = get_Qwen3MoeSparseMoeBlock_kernel_forward(autotune = False)
         else:
             Qwen3MoeSparseMoeBlock .forward = Qwen3MoeSparseMoeBlock_fast_forward
-        Qwen3MoeMLP            .forward = fast_swiglu_inference # This is analogous to Dense models' MLP
+        # Qwen3MoeMLP            .forward = fast_swiglu_inference # This is analogous to Dense models' MLP
         Qwen3MoeDecoderLayer   .forward = Qwen3MoeDecoderLayer_fast_forward
         Qwen3MoeModel          .forward = LlamaModel_fast_forward
         Qwen3MoeForCausalLM    .forward = CausalLM_fast_forward(LlamaModel_fast_forward_inference)
@@ -317,7 +317,7 @@ class FastQwen3MoeModel(FastQwen3Model):
         trust_remote_code = False,
         **kwargs,
     ):
-        FastQwen3MoeModel.pre_patch()
+        kwargs["model_patcher"] = FastQwen3MoeModel
         model = FastLlamaModel.from_pretrained(
             model_name        = model_name,
             max_seq_length    = max_seq_length,
@@ -327,13 +327,11 @@ class FastQwen3MoeModel(FastQwen3Model):
             device_map        = device_map,
             rope_scaling      = rope_scaling,
             fix_tokenizer     = fix_tokenizer,
-            model_patcher     = FastQwen3Model,
             tokenizer_name    = tokenizer_name,
             trust_remote_code = trust_remote_code,
             **kwargs,
         )
         if os.environ.get("UNSLOTH_USE_GROUPED_GEMM", "0") == "1":
-            print("Using grouped gemm")
             from transformers.models.qwen3_moe.modeling_qwen3_moe import ACT2FN
             for layer in model[0].model.layers:
                 if isinstance(layer.mlp, Qwen3MoeSparseMoeBlock):

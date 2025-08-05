@@ -98,7 +98,7 @@ def get_Qwen3MoeSparseMoeBlock_kernel_forward(autotune = False):
         
         bsz, seq_len, hd = X.shape
 
-        router_logits = fast_linear_forward(self.gate, X, out = temp_gate) #pretty much the only change from transformers implementation.
+        router_logits = fast_linear_forward(self.gate, X, out = temp_gate).view(bsz * seq_len, -1) #pretty much the only change from transformers implementation.
 
         routing_weights = torch_nn_functional_softmax(router_logits, dim = -1)
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
@@ -108,12 +108,14 @@ def get_Qwen3MoeSparseMoeBlock_kernel_forward(autotune = False):
         final_X = torch.zeros(
             (bsz * seq_len, hd), dtype=X.dtype, device=X.device
         )
-        token_counts_by_expert = torch.histc(
-            selected_experts.view(-1),
-            bins=self.num_experts,
-            min=0,
-            max=self.num_experts,
-        )
+        # token_counts_by_expert = torch.histc(
+        #     selected_experts.view(-1),
+        #     bins=self.num_experts,
+        #     min=0,
+        #     max=self.num_experts,
+        # )
+        token_counts_by_expert = torch.bincount(selected_experts.view(-1),
+                                        minlength=self.num_experts).to(torch.int32)
         # token_indices_experts_sorted shape (bs*slen*top_k,)
         gather_indices = torch.argsort(selected_experts.view(-1), stable=True)
         X = X.view(-1, hd)
@@ -159,10 +161,10 @@ def get_Qwen3MoeSparseMoeBlock_kernel_forward(autotune = False):
             dW_only = False,
         )
         hidden_states = (
-            hidden_states.view(bsz, seq_len, self.top_k, hd)
+            hidden_states.view(bsz*seq_len, self.top_k, hd)
             * routing_weights[..., None]
         )
-        hidden_states = hidden_states.sum(dim=2).to(X.dtype)
+        hidden_states = hidden_states.sum(dim=1).to(X.dtype)
 
         hidden_states = hidden_states.view(bsz, seq_len, hd)
         return hidden_states, router_logits 

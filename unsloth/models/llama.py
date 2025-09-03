@@ -1072,6 +1072,9 @@ def _LlamaModel_fast_forward_inference(attention_fast_forward_inference=LlamaAtt
 
         print(type(past_key_values))
         print(f"past_key_values: {len(past_key_values)} {len(past_key_values[0])}")
+        if not isinstance(past_key_values, tuple) and past_key_values[0][0] is None and hasattr(past_key_values, "early_initialization"):
+            past_key_values.early_initialization(bsz, self.config.num_key_value_heads, self.head_dim, X.dtype, torch.device(f"{DEVICE_TYPE}:0"))
+            
         seq_len = past_key_values[0][0].shape[-2]
         if bsz != 1:
             attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(

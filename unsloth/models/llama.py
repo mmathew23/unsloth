@@ -1030,7 +1030,6 @@ def LlamaModel_fast_forward(
     if output_hidden_states: all_hidden_states += (hidden_states,)
     next_cache = next_decoder_cache if use_cache else None
 
-    print(f"next_cache: {type(next_cache)}")
     if not return_dict:
         return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
     return BaseModelOutputWithPast(
@@ -1070,11 +1069,9 @@ def _LlamaModel_fast_forward_inference(attention_fast_forward_inference=LlamaAtt
         temp_mlp = torch.empty((2, bsz, 1, mlp_size), dtype = X.dtype, device = f"{DEVICE_TYPE}:0")
         temp_gates, temp_ups = tuple(temp_mlp[0].to(torch.device(x)) for x in range(DEVICE_COUNT)), tuple(temp_mlp[1].to(torch.device(x)) for x in range(DEVICE_COUNT))
 
-        print(type(past_key_values))
-        print(f"past_key_values: {len(past_key_values)} {len(past_key_values[0])}")
-        if not isinstance(past_key_values, tuple) and past_key_values[0][0] is None and hasattr(past_key_values, "early_initialization"):
-            past_key_values.early_initialization(bsz, self.config.num_key_value_heads, self.head_dim, X.dtype, torch.device(f"{DEVICE_TYPE}:0"))
-            
+        if past_key_values[0][0] is None and hasattr(past_key_values, "early_initialization"):
+            past_key_values.early_initialization(bsz, self.config.num_key_value_heads, self.config.head_dim, X.dtype, torch.device(f"{DEVICE_TYPE}:0"))
+
         seq_len = past_key_values[0][0].shape[-2]
         if bsz != 1:
             attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
@@ -1139,7 +1136,6 @@ def _LlamaModel_fast_forward_inference(attention_fast_forward_inference=LlamaAtt
             variance = variance,
         )
 
-        print(f'next decoder cache: {type(next_decoder_cache)}')
         return BaseModelOutputWithPast(
             last_hidden_state = X,
             past_key_values = next_decoder_cache,

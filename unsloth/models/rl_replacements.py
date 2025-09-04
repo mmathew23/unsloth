@@ -148,6 +148,17 @@ pass
 RL_FUNCTIONS["sft_trainer"].append(sft_trainer_prepare_dataset)
 
 
+def sft_trainer__set_signature_columns_if_needed(function_name, function):
+    if function_name != "_set_signature_columns_if_needed": return function
+    function = function.replace(
+        'self._signature_columns = ["messages"',
+        'self._signature_columns = ["input_ids", "labels", "seq_lengths", "completion_mask", "assistant_masks", "messages"',
+    )
+    return function
+pass
+RL_FUNCTIONS["sft_trainer"].append(sft_trainer__set_signature_columns_if_needed)
+
+
 # Ignore mean_token_accuracy since it needs logits
 # We override it directly with our version
 def sft_trainer_compute_loss(function_name, function):

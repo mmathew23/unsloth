@@ -727,11 +727,10 @@ def _patch_trl_rl_trainers(trainer_file = "grpo_trainer"):
         new_text = 'self._signature_columns = ["input_ids", "attention_mask", "completion_mask","labels"]'
         RLTrainer_source = RLTrainer_source.replace(original_text, new_text)
 
-        # Temporary patch _is_vlm to False
-        # as of 0.22 it only exists in sfttrainer
-        oriignal_is_vlm_text = 'self._is_vlm = True'
-        new_is_vlm_text = 'self._is_vlm = False'
-        RLTrainer_source = RLTrainer_source.replace(oriignal_is_vlm_text, new_is_vlm_text)
+        original_skip_text = 'args.dataset_kwargs is not None and args.dataset_kwargs.get("skip_prepare_dataset", False) or self._is_vlm'
+        new_skip_text =      'args.dataset_kwargs is not None and args.dataset_kwargs.get("skip_prepare_dataset", False)'
+
+        RLTrainer_source = RLTrainer_source.replace(original_skip_text, new_skip_text)
 
 
     # Remove multiple doc strings

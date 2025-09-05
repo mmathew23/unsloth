@@ -561,6 +561,7 @@ class FastBaseModel:
         # Patch generate
         if os.environ.get("UNSLOTH_DISABLE_FAST_GENERATION", "0") == "0":
             if model.generate.__name__ != "unsloth_base_fast_generate":
+                print(f"Unsloth: Patching vision generate for {model.generate.__name__}")
                 model._old_generate = model.generate
                 unsloth_base_fast_generate.__doc__ = model._old_generate.__doc__
                 model.generate = types.MethodType(unsloth_base_fast_generate, model)

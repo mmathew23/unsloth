@@ -2263,6 +2263,7 @@ class FastLlamaModel:
         # Patch generate
         is_classification =  "Classification" in str(type(model))
         if not is_classification and model.generate.__name__ != "unsloth_fast_generate":
+            print(f"Unsloth: Patching llama generate for {model.generate.__name__}")
             model._old_generate = model.generate
             unsloth_fast_generate.__doc__ = model._old_generate.__doc__
             model.generate = types.MethodType(unsloth_fast_generate, model)

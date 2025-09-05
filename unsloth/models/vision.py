@@ -206,6 +206,7 @@ def unsloth_base_fast_generate(
     # Fix generation_config
     # Use hybrid if sliding window seen, otherwise try static
     cache_implementation = getattr(self.config, "cache_implementation", None)
+    print(f'first cache_implementation: {cache_implementation}')
     if getattr(self, "_supports_static_cache", getattr(self, "_can_compile_fullgraph", True)):
         if os.environ.get("UNSLOTH_DISABLE_STATIC_GENERATION", "0") == "0":
             cache_implementation = "static"
@@ -213,6 +214,7 @@ def unsloth_base_fast_generate(
             cache_implementation = None
     else:
         cache_implementation = None
+    print(f'second cache_implementation: {cache_implementation}')
     if cache_implementation is not None:
         swa = getattr(getattr(self.config, "text_config", self.config), "sliding_window", None)
         if (swa == 0 or type(swa) is not int) \
@@ -221,6 +223,7 @@ def unsloth_base_fast_generate(
         else:
             cache_implementation = "hybrid"
 
+    print(f"unsloth_base_fast_generate: cache_implementation is set to {cache_implementation}")
     if "generation_config" in kwargs:
         kwargs["generation_config"].cache_implementation = cache_implementation
         if cache_implementation is not None:

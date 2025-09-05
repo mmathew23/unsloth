@@ -1796,6 +1796,8 @@ def unsloth_fast_generate(
 
     # Mixed precision autocast
     with torch.inference_mode(), torch.autocast(device_type = DEVICE_TYPE, dtype = dtype):
+        if 'cache_implementation' in kwargs:
+            print(f"unsloth_fast_generate: cache_implementation is set to {kwargs['cache_implementation']}")
         output = self._old_generate(*args, **kwargs)
     pass
 

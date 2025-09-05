@@ -327,6 +327,7 @@ class FastLanguageModel(FastLlamaModel):
                     f'Try `pip install --upgrade "transformers>=4.50.3"`\n'\
                     f"to obtain the latest transformers build, then restart this session."\
                 )
+            print(f"Unsloth: Dispatching FastQwen3Model for {model_type}")
             dispatch_model = FastQwen3Model if model_type == "qwen3" else FastQwen3MoeModel
         # elif model_type == "falcon_h1":
         #     dispatch_model = FastFalconH1Model
@@ -344,6 +345,7 @@ class FastLanguageModel(FastLlamaModel):
         # elif model_type == "granite":
         #     dispatch_model = FastGraniteModel
         else:
+            print(f"Unsloth: Dispatching FastModel for {model_type}")
             return FastModel.from_pretrained(
                 model_name                 = model_name,
                 max_seq_length             = max_seq_length,

@@ -867,7 +867,7 @@ def grpo_trainer_fix_batch_size(RLTrainer_source, RLConfig_source):
     return check_batch_size
 
 
-RL_CONFIG_CHANGES["grpo_trainer"].append(grpo_trainer_fix_batch_size)
+# RL_CONFIG_CHANGES["grpo_trainer"].append(grpo_trainer_fix_batch_size)
 
 
 # Add other reward function names

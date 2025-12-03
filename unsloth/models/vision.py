@@ -666,8 +666,8 @@ class FastBaseModel:
                     print(f"{k}: {v}")
                 except Exception as e:
 
-                    print(f"{k}: {type(v)} {e}")
-            kwargs['dtype'] = 'torch.float16'
+                    print(f"{k}: {type(v)} {str(v)} {e}")
+            kwargs['dtype'] = torch.float16
             model = auto_model.from_pretrained(
                 model_name,
                 device_map = device_map,

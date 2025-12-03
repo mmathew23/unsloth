@@ -658,6 +658,7 @@ class FastBaseModel:
         if not fast_inference:
             # Prevent load_in_fp8 from being forwarded into HF internal model loading
             load_in_fp8 = kwargs.pop("load_in_fp8", None)
+            print('kwargs:', kwargs)
             model = auto_model.from_pretrained(
                 model_name,
                 device_map = device_map,
@@ -754,7 +755,7 @@ class FastBaseModel:
                 generate_batches, model.vllm_engine
             )
         for n, p in model.named_parameters():
-            if 'visual' in n:
+            if "visual" in n:
                 print(f"Unsloth: 3 {n} {p.dtype}")
         raise_handler.remove()
 
@@ -835,7 +836,7 @@ class FastBaseModel:
             correct_dtype = correct_dtype,
         )
         for n, p in model.named_parameters():
-            if 'visual' in n:
+            if "visual" in n:
                 print(f"Unsloth: 4 {n} {p.dtype}")
         model, tokenizer = patch_tokenizer(model, tokenizer)
         model = post_patch_loss_function(model)
@@ -893,9 +894,6 @@ class FastBaseModel:
             tokenizer = tokenizer,
             float32_mixed_precision = float32_mixed_precision,
         )
-        for n, p in model.named_parameters():
-            if 'visual' in n:
-                print(f"Unsloth: 5 {n} {p.dtype}")
         # Clear deleted GPU items
         for _ in range(3):
             gc.collect()

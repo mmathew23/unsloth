@@ -472,7 +472,7 @@ class FastBaseModel:
             )
             dtype = torch.float16
         assert dtype in (torch.float16, torch.bfloat16, torch.float32)
-
+        print(f"Unsloth: 1 dtype: {dtype}")
         bnb_compute_dtype = dtype
         do_forced_float32 = False
         if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
@@ -643,7 +643,7 @@ class FastBaseModel:
         torch_dtype = dtype
         if do_forced_float32:
             torch_dtype = torch.bfloat16
-
+        print(f"Unsloth: 2 torch_dtype: {torch_dtype}")
         kwargs = add_dtype_kwargs(torch_dtype, kwargs)
 
         model_config = AutoConfig.from_pretrained(
@@ -753,7 +753,9 @@ class FastBaseModel:
             model.fast_generate_batches = functools.partial(
                 generate_batches, model.vllm_engine
             )
-
+        for n, p in model.named_parameters():
+            if 'visual' in n:
+                print(f"Unsloth: 3 {n} {p.dtype}")
         raise_handler.remove()
 
         # Return old flag
@@ -832,6 +834,9 @@ class FastBaseModel:
             do_forced_float32 = do_forced_float32,
             correct_dtype = correct_dtype,
         )
+        for n, p in model.named_parameters():
+            if 'visual' in n:
+                print(f"Unsloth: 4 {n} {p.dtype}")
         model, tokenizer = patch_tokenizer(model, tokenizer)
         model = post_patch_loss_function(model)
 
@@ -888,6 +893,9 @@ class FastBaseModel:
             tokenizer = tokenizer,
             float32_mixed_precision = float32_mixed_precision,
         )
+        for n, p in model.named_parameters():
+            if 'visual' in n:
+                print(f"Unsloth: 5 {n} {p.dtype}")
         # Clear deleted GPU items
         for _ in range(3):
             gc.collect()

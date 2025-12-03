@@ -658,7 +658,15 @@ class FastBaseModel:
         if not fast_inference:
             # Prevent load_in_fp8 from being forwarded into HF internal model loading
             load_in_fp8 = kwargs.pop("load_in_fp8", None)
-            print('kwargs:', kwargs)
+            # print('kwargs:', kwargs)
+            import json
+            for k, v in kwargs.items():
+                try:
+                    json.dumps(v)
+                    print(f"{k}: {v}")
+                except Exception as e:
+
+                    print(f"{k}: {type(v)} {e}")
             model = auto_model.from_pretrained(
                 model_name,
                 device_map = device_map,

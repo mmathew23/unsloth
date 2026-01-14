@@ -224,6 +224,23 @@ def _fast_prepare_inputs_for_generation(
             bs, cache_length = input_ids.shape
             input_ids = input_ids[:, [-1]]
 
+            # Compute position_ids from attention_mask BEFORE it gets overwritten
+            # This handles left-padded batches where each sequence has different padding
+            if attention_mask is not None:
+                position_ids = attention_mask.long().cumsum(-1) - 1
+                position_ids.masked_fill_(attention_mask == 0, 1)
+                position_ids = position_ids[
+                    :, -1:
+                ]  # Take last position for each sequence
+            else:
+                position_ids = (
+                    torch.arange(
+                        cache_length, cache_length + 1, device = input_ids.device
+                    )
+                    .unsqueeze(0)
+                    .expand(bs, -1)
+                )
+
             # Get to the base model
             base_model = self
             if hasattr(base_model, "base_model_prefix"):
@@ -251,6 +268,7 @@ def _fast_prepare_inputs_for_generation(
                     "batch_size": bs,
                     "config": self.config,
                     "past_key_values": past_key_values,
+                    "position_ids": position_ids,
                 }
                 try:
                     if needs_device_kw(
@@ -270,6 +288,7 @@ def _fast_prepare_inputs_for_generation(
                 )
             else:
                 attention_mask = attention_mask[:, [-1]]
+                kwargs["position_ids"] = position_ids
                 if transformers_version <= Version("4.52.4"):
                     logger.warning_once(
                         f"{self.__class__.__name__} has no `_prepare_4d_causal_attention_mask_with_cache_position` method "
@@ -277,9 +296,6 @@ def _fast_prepare_inputs_for_generation(
                         "writing code, see Llama for an example implementation. If you're a user, please report this "
                         "issue on GitHub."
                     )
-
-    if "cache_position" in kwargs:
-        kwargs["position_ids"] = kwargs["cache_position"]
     return {
         "input_ids": input_ids,
         "attention_mask": attention_mask,

@@ -1098,22 +1098,10 @@ class FastBaseModel:
                 # Use bfloat16 precision for full finetuning
                 float32_mixed_precision = False
 
-        # VLMs can hit DDP "marked ready twice" with re-entrant checkpointing.
+        # Always use non-reentrant checkpointing for better DDP compatibility
+        # and performance. The hooks-based offloading works correctly with DDP.
         # See: https://github.com/unslothai/unsloth/issues/3713.
-        use_reentrant = not is_distributed()
-        if not use_reentrant:
-            # Under DDP, avoid the offloaded/re-entrant checkpoint patch.
-            unpatch_unsloth_gradient_checkpointing()
-            unpatch_unsloth_smart_gradient_checkpointing()
-            # Force native checkpoint to default to non-reentrant for downstream calls.
-            _orig_checkpoint = torch_checkpoint.checkpoint
-
-            def _nonre_checkpoint(function, *args, **kwargs):
-                kwargs["use_reentrant"] = False
-                return _orig_checkpoint(function, *args, **kwargs)
-
-            torch_checkpoint.checkpoint = _nonre_checkpoint
-            hf_modeling_utils.checkpoint = _nonre_checkpoint
+        use_reentrant = False
 
         model = prepare_model_for_training(
             model,

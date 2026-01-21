@@ -1018,7 +1018,7 @@ def patch_regional_compilation():
 def prepare_model_for_kbit_training(
     model: Any,
     use_gradient_checkpointing: Optional = True,
-    use_reentrant: Optional[bool] = True,
+    use_reentrant: Optional[bool] = False,
 ) -> Any:
     return prepare_model_for_training(
         model = model,

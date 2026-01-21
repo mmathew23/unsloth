@@ -980,6 +980,11 @@ def LlamaModel_fast_forward(
     if self.gradient_checkpointing and self.training and not use_cache:
         gradient_checkpointing = True
 
+    # Debug: check gradient checkpointing state
+    import os
+    if os.environ.get("UNSLOTH_DEBUG_GC", "0") == "1":
+        print(f"[DEBUG FORWARD] self.gradient_checkpointing={self.gradient_checkpointing}, self.training={self.training}, use_cache={use_cache} => gradient_checkpointing={gradient_checkpointing}")
+
     # Gemma2 has alternating SWA and global attn
     use_static_mask = True
     dynamic_SWA_mask = None
@@ -1097,6 +1102,9 @@ def LlamaModel_fast_forward(
         if gradient_checkpointing and not isinstance(
             decoder_layer, GradientCheckpointingLayer
         ):
+            # Debug: confirm we're entering this branch
+            if os.environ.get("UNSLOTH_DEBUG_GC", "0") == "1" and idx == 0:
+                print(f"[DEBUG LAYER] Entering checkpoint branch for layer {idx}, checkpoint func: {torch.utils.checkpoint.checkpoint.__name__}")
 
             def create_custom_forward(module):
                 def custom_forward(*inputs):
@@ -1123,6 +1131,17 @@ def LlamaModel_fast_forward(
             hidden_states = layer_outputs[0]
 
         else:
+            # Debug: check layer's checkpointing state
+            if os.environ.get("UNSLOTH_DEBUG_GC", "0") == "1" and idx == 0:
+                gc_func = getattr(decoder_layer, '_gradient_checkpointing_func', None)
+                func_name = gc_func.__name__ if hasattr(gc_func, '__name__') else str(gc_func)
+                func_module = getattr(gc_func, '__module__', 'N/A') if gc_func else 'N/A'
+                # If it's a partial, show the underlying function
+                if hasattr(gc_func, 'func'):
+                    func_name = f"partial({gc_func.func.__name__})"
+                    func_module = getattr(gc_func.func, '__module__', 'N/A')
+                print(f"[DEBUG ELSE BRANCH] layer gc={getattr(decoder_layer, 'gradient_checkpointing', 'N/A')}, training={decoder_layer.training}")
+                print(f"[DEBUG ELSE BRANCH] _gc_func name={func_name}, module={func_module}")
             layer_outputs = decoder_layer(
                 hidden_states,
                 causal_mask = mask,
@@ -2697,6 +2716,15 @@ class FastLlamaModel:
             patch_unsloth_smart_gradient_checkpointing(
                 dtype = model.get_input_embeddings().weight.dtype
             )
+            # Update _gradient_checkpointing_func on all layers to use the patched function
+            # This is needed because transformers stores the reference before we patch
+            import torch.utils.checkpoint
+            _model = model.model if hasattr(model, "model") else model
+            _model = _model.model if hasattr(_model, "model") else _model
+            if hasattr(_model, "layers"):
+                for layer in _model.layers:
+                    if hasattr(layer, "_gradient_checkpointing_func"):
+                        layer._gradient_checkpointing_func = torch.utils.checkpoint.checkpoint
 
         if type(r) is not int:
             raise TypeError(f"Unsloth: Rank of {str(r)} must be an integer.")

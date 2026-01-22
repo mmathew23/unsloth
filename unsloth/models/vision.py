@@ -33,10 +33,10 @@ from ._utils import __version__, importlib_version, _prepare_model_for_qat
 from ._utils import *
 from ..save import patch_saving_functions
 from ..models.loader_utils import is_distributed
-from unsloth_zoo.gradient_checkpointing import (
-    unpatch_unsloth_gradient_checkpointing,
-    unpatch_unsloth_smart_gradient_checkpointing,
-)
+# from unsloth_zoo.gradient_checkpointing import (
+    # unpatch_unsloth_gradient_checkpointing,
+    # unpatch_unsloth_smart_gradient_checkpointing,
+# )
 import torch.utils.checkpoint as torch_checkpoint
 import transformers.modeling_utils as hf_modeling_utils
 from peft import LoraConfig, TaskType, get_peft_model as _get_peft_model

@@ -297,6 +297,115 @@ def build_sdpa_packed_attention_mask(
     return mask.unsqueeze(0).unsqueeze(0)
 
 
+def build_vision_packed_attention_masks(
+    seq_lengths: torch.Tensor,
+    token_type_ids: Optional[torch.Tensor],
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+    sliding_window: Optional[int] = None,
+    mm_tokens_per_image: int = 256,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Build block-diagonal attention masks for packed sequences with vision tokens.
+
+    Creates both full attention and sliding window masks suitable for Gemma3-style
+    vision models that use bidirectional attention for image tokens.
+
+    Args:
+        seq_lengths: Tensor of sequence lengths for each packed sample
+        token_type_ids: Token type IDs (1 for image tokens, 0 for text)
+        dtype: Data type for the mask
+        device: Device to create masks on
+        sliding_window: Sliding window size (None for full attention)
+        mm_tokens_per_image: Number of tokens per image for bidirectional grouping
+
+    Returns:
+        Tuple of (full_attention_mask, sliding_attention_mask)
+    """
+    total_tokens = int(seq_lengths.sum().item())
+
+    # Create base causal mask (block diagonal)
+    full_mask = torch.full(
+        (total_tokens, total_tokens),
+        float("-inf"),
+        dtype=dtype,
+        device=device,
+    )
+
+    # If we have token_type_ids, handle bidirectional attention for images
+    if token_type_ids is not None and token_type_ids.numel() == total_tokens:
+        # Flatten token_type_ids
+        flat_tt = token_type_ids.reshape(-1)
+        is_image = (flat_tt == 1)
+
+        # Find image groups - images can attend to each other bidirectionally
+        # within the same group (determined by mm_tokens_per_image)
+        new_image_start = is_image.clone()
+        new_image_start[1:] = is_image[1:] & ~is_image[:-1]
+        image_group_ids = torch.cumsum(new_image_start.int(), dim=0) - 1
+        image_group_ids = torch.where(
+            is_image, image_group_ids, torch.full_like(flat_tt, -1)
+        )
+
+    offset = 0
+    for length in seq_lengths.tolist():
+        length = int(length)
+        if length <= 0:
+            continue
+
+        # Create causal block for this sequence
+        block = torch.zeros((length, length), dtype=dtype, device=device)
+        upper = torch.triu(
+            torch.ones((length, length), device=device), diagonal=1
+        ).bool()
+        block = block.masked_fill(upper, float("-inf"))
+
+        # Handle bidirectional attention for image tokens within this sequence
+        if token_type_ids is not None and token_type_ids.numel() == total_tokens:
+            seq_is_image = is_image[offset:offset + length]
+            seq_groups = image_group_ids[offset:offset + length]
+
+            # Create bidirectional mask for same image group
+            for i in range(length):
+                if seq_is_image[i]:
+                    group_id = seq_groups[i].item()
+                    if group_id >= 0:
+                        # Allow attending to all tokens in the same image group
+                        same_group = seq_groups == group_id
+                        block[i, same_group] = 0.0
+
+        full_mask[offset:offset + length, offset:offset + length] = block
+        offset += length
+
+    # Create sliding window mask
+    if sliding_window is not None and sliding_window > 0:
+        sliding_mask = full_mask.clone()
+        offset = 0
+        for length in seq_lengths.tolist():
+            length = int(length)
+            if length <= 0:
+                continue
+
+            if length > sliding_window:
+                idx = torch.arange(length, device=device)
+                dist = idx.unsqueeze(0) - idx.unsqueeze(1)
+                window_mask = dist >= sliding_window
+                # Apply sliding window within this block
+                block_slice = sliding_mask[offset:offset + length, offset:offset + length]
+                block_slice[window_mask] = float("-inf")
+
+            offset += length
+    else:
+        sliding_mask = full_mask
+
+    # Expand for batch and head dimensions: (1, 1, total, total)
+    full_mask = full_mask.unsqueeze(0).unsqueeze(0)
+    sliding_mask = sliding_mask.unsqueeze(0).unsqueeze(0)
+
+    return full_mask, sliding_mask
+
+
 def _normalize_packed_lengths(
     seq_lengths: Any,
     *,
@@ -649,13 +758,17 @@ def _convert_padded_to_concatenated(batch: dict) -> dict:
     # Concatenate sequences (remove padding)
     concatenated_ids = []
     concatenated_labels = []
+    concatenated_token_type_ids = []
     has_labels = "labels" in batch
+    has_token_type_ids = "token_type_ids" in batch
 
     for i, length in enumerate(seq_lengths):
         length = int(length)
         concatenated_ids.append(input_ids[i, :length])
         if has_labels:
             concatenated_labels.append(batch["labels"][i, :length])
+        if has_token_type_ids:
+            concatenated_token_type_ids.append(batch["token_type_ids"][i, :length])
 
     # Create concatenated tensors
     new_input_ids = torch.cat(concatenated_ids, dim=0).unsqueeze(0)  # (1, total_tokens)
@@ -665,6 +778,10 @@ def _convert_padded_to_concatenated(batch: dict) -> dict:
     if has_labels:
         new_labels = torch.cat(concatenated_labels, dim=0).unsqueeze(0)
         batch["labels"] = new_labels
+
+    if has_token_type_ids:
+        new_token_type_ids = torch.cat(concatenated_token_type_ids, dim=0).unsqueeze(0)
+        batch["token_type_ids"] = new_token_type_ids
 
     # Create new attention_mask (all 1s for concatenated)
     total_tokens = sum(seq_lengths)
@@ -683,6 +800,41 @@ def _convert_padded_to_concatenated(batch: dict) -> dict:
         f"(1x{total_tokens}), seq_lengths={seq_lengths}"
     )
     return batch
+
+
+class _NJTCollatorWrapper:
+    """
+    Wrapper class for collators that use __slots__ (like UnslothVisionDataCollator).
+
+    This wrapper holds the original collator and delegates to it, then converts
+    the text-related tensors to NJT-compatible format while preserving other
+    tensors like pixel_values.
+    """
+
+    def __init__(self, original_collator, convert_to_concatenated: bool = True, model=None):
+        self._original_collator = original_collator
+        self._unsloth_njt_collator_wrapped = True
+        self._convert_to_concatenated = convert_to_concatenated
+        self._model = model  # Reference to model for storing packed info
+
+    def __call__(self, examples):
+        _log_njt(f"NJT wrapper collator called with {len(examples)} examples")
+        batch = self._original_collator(examples)
+        _log_njt(f"Original collator returned batch with keys: {list(batch.keys())}")
+        # Convert padded to concatenated format for NJT if enabled
+        if self._convert_to_concatenated:
+            batch = _convert_padded_to_concatenated(batch)
+            # Store packed_seq_lengths on the hook target module for the forward hook
+            if self._model is not None and "packed_seq_lengths" in batch:
+                # Find the hook target - where the hook is registered
+                target = getattr(self._model, "_unsloth_njt_hook_target", self._model)
+                target._unsloth_packed_seq_lengths = batch["packed_seq_lengths"]
+                _log_njt(f"Stored packed_seq_lengths on {type(target).__name__}")
+        return batch
+
+    def __getattr__(self, name):
+        # Delegate attribute access to the original collator
+        return getattr(self._original_collator, name)
 
 
 def enable_njt_collator_wrapper(trainer) -> bool:
@@ -705,7 +857,52 @@ def enable_njt_collator_wrapper(trainer) -> bool:
     if getattr(collator, "_unsloth_njt_collator_wrapped", False):
         return False
 
-    # Determine which method to wrap
+    collator_class_name = type(collator).__name__
+
+    # Check if the model supports NJT for vision
+    # This requires patched attention layers that handle packed sequences
+    model = getattr(trainer, "model", None)
+    model_type = None
+    if model is not None:
+        config = getattr(model, "config", None)
+        if config is not None:
+            model_type = getattr(config, "model_type", None)
+
+    # For collators with __slots__ (like UnslothVisionDataCollator),
+    # use a wrapper class instead of modifying the object
+    if "Vision" in collator_class_name or hasattr(type(collator), "__slots__"):
+        is_vision = "Vision" in collator_class_name
+        _log_njt(f"Using wrapper class for collator with __slots__: {collator_class_name}")
+
+        # For vision models, enable NJT conversion and register forward hook
+        # The hook creates block-diagonal attention masks for packed sequences
+        if is_vision and model is not None:
+            # Try to enable vision NJT support via forward hook
+            hook_enabled = enable_vision_njt_support(model)
+            if hook_enabled:
+                _log_njt("Enabling NJT for vision model with forward pre-hook")
+                enable_conversion = True
+            else:
+                _log_njt(
+                    "Wrapped vision collator - NJT conversion disabled. "
+                    "Could not register forward hook for block-diagonal masks."
+                )
+                enable_conversion = False
+        else:
+            enable_conversion = not is_vision
+
+        # Pass model reference to collator wrapper for storing packed info
+        wrapped_collator = _NJTCollatorWrapper(
+            collator,
+            convert_to_concatenated=enable_conversion,
+            model=model if is_vision else None,
+        )
+        trainer.data_collator = wrapped_collator
+        if enable_conversion:
+            _log_njt("Wrapped collator for NJT support (padded -> concatenated)")
+        return True
+
+    # Determine which method to wrap for standard collators
     if hasattr(collator, "torch_call"):
         original_call = collator.torch_call
         call_attr = "torch_call"
@@ -894,4 +1091,174 @@ __all__ = [
     # NJT standalone
     "UnslothNJTDataCollator",
     "get_njt_collator",
+    # Vision NJT support
+    "build_vision_packed_attention_masks",
+    "create_vision_njt_mask_hook",
+    "enable_vision_njt_support",
 ]
+
+
+# =============================================================================
+# Vision Model NJT Support
+# =============================================================================
+# Functions to enable NJT (packed sequences) for vision models like Gemma3-Vision.
+# These models have sliding window attention and bidirectional attention for images.
+
+
+def create_vision_njt_mask_hook(
+    sliding_window: Optional[int] = None,
+    mm_tokens_per_image: int = 256,
+):
+    """
+    Create a forward pre-hook that generates block-diagonal attention masks
+    for packed sequences in vision models.
+
+    This hook should be registered on models that use attention masks like:
+    - Gemma3ForConditionalGeneration
+    - Qwen2VLForConditionalGeneration
+
+    Args:
+        sliding_window: Sliding window size for attention (None for full attention)
+        mm_tokens_per_image: Number of tokens per image for bidirectional grouping
+
+    Returns:
+        A hook function that can be registered with model.register_forward_pre_hook()
+    """
+
+    def _vision_njt_pre_hook(module, args, kwargs):
+        """Pre-forward hook that creates block-diagonal masks for packed sequences."""
+        # Check if this is a packed sequence batch - read from model attribute
+        # The collator stores packed_seq_lengths on the model before forward
+        packed_seq_lengths = getattr(module, "_unsloth_packed_seq_lengths", None)
+
+        if packed_seq_lengths is None:
+            return args, kwargs
+
+        # Get device and dtype from input_ids or inputs_embeds
+        input_ids = kwargs.get("input_ids")
+        inputs_embeds = kwargs.get("inputs_embeds")
+        token_type_ids = kwargs.get("token_type_ids")
+        attention_mask = kwargs.get("attention_mask")
+
+        if input_ids is not None:
+            device = input_ids.device
+            seq_len = input_ids.shape[1]
+            dtype = torch.float32  # Masks use float
+        elif inputs_embeds is not None:
+            device = inputs_embeds.device
+            seq_len = inputs_embeds.shape[1]
+            dtype = inputs_embeds.dtype
+        else:
+            return args, kwargs
+
+        # Check if attention_mask is already a dict (pre-computed)
+        if isinstance(attention_mask, dict):
+            return args, kwargs
+
+        # Verify the packed_seq_lengths matches the actual input
+        total_tokens = int(packed_seq_lengths.sum().item())
+        if total_tokens != seq_len:
+            # Mismatch - packed_seq_lengths is from a different batch (race condition)
+            # This can happen with dataloader prefetching
+            # For single-sequence batches (batch_size=1), just use the actual seq_len
+            if len(packed_seq_lengths) == 1:
+                packed_seq_lengths = torch.tensor([seq_len], dtype=torch.int32)
+            else:
+                # Multiple sequences but mismatch - skip NJT for this batch
+                _log_njt(f"Skipping NJT masks: seq_lengths sum ({total_tokens}) != input seq_len ({seq_len})")
+                return args, kwargs
+
+        # Clear the attribute after use (not before, in case of retry)
+        module._unsloth_packed_seq_lengths = None
+
+        _log_njt(f"Creating block-diagonal masks for packed sequences: {packed_seq_lengths.tolist()}")
+
+        # Create block-diagonal masks
+        seq_lengths = packed_seq_lengths.to(dtype=torch.int64, device=device)
+        full_mask, sliding_mask = build_vision_packed_attention_masks(
+            seq_lengths,
+            token_type_ids,
+            dtype=dtype,
+            device=device,
+            sliding_window=sliding_window,
+            mm_tokens_per_image=mm_tokens_per_image,
+        )
+
+        # Create mask dict that Gemma3 expects
+        mask_dict = {
+            "full_attention": full_mask,
+            "sliding_attention": sliding_mask,
+        }
+
+        # Update kwargs with the pre-computed masks
+        kwargs = dict(kwargs)
+        kwargs["attention_mask"] = mask_dict
+
+        _log_njt(f"Created vision NJT masks: full={full_mask.shape}, sliding={sliding_mask.shape}")
+
+        return args, kwargs
+
+    return _vision_njt_pre_hook
+
+
+def enable_vision_njt_support(
+    model,
+    sliding_window: Optional[int] = None,
+    mm_tokens_per_image: int = 256,
+) -> bool:
+    """
+    Enable NJT support for a vision model by registering a forward pre-hook.
+
+    This allows the model to handle packed sequences with block-diagonal attention masks.
+
+    Args:
+        model: The vision model (e.g., Gemma3ForConditionalGeneration)
+        sliding_window: Sliding window size for attention
+        mm_tokens_per_image: Number of tokens per image
+
+    Returns:
+        True if hook was registered, False otherwise
+    """
+    if not UNSLOTH_USE_NJT:
+        return False
+
+    # Get config for sliding window if not provided
+    if sliding_window is None:
+        config = getattr(model, "config", None)
+        if config is not None:
+            text_config = getattr(config, "text_config", config)
+            sliding_window = getattr(text_config, "sliding_window", None)
+
+    # Get mm_tokens_per_image from config if not provided
+    config = getattr(model, "config", None)
+    if config is not None and mm_tokens_per_image == 256:
+        mm_tokens_per_image = getattr(config, "mm_tokens_per_image", 256)
+
+    # Create and register the hook
+    hook = create_vision_njt_mask_hook(
+        sliding_window=sliding_window,
+        mm_tokens_per_image=mm_tokens_per_image,
+    )
+
+    # Find the right module to hook - for vision models, we need the innermost model
+    # that handles mask creation. This is typically:
+    # - PeftModel.model -> Gemma3ForConditionalGeneration.model -> Gemma3Model
+    # The mask creation happens in Gemma3Model.forward
+    target = model
+    while hasattr(target, "model"):
+        target = target.model
+        # Stop at the innermost model (no .model attribute)
+
+    # Register the hook
+    target.register_forward_pre_hook(hook, with_kwargs=True)
+
+    # Store reference to the hooked target on the outer model
+    # so the collator can find it and store packed_seq_lengths
+    model._unsloth_njt_hook_target = target
+
+    _log_njt(
+        f"Enabled vision NJT support on {type(target).__name__} "
+        f"(sliding_window={sliding_window}, mm_tokens_per_image={mm_tokens_per_image})"
+    )
+
+    return True

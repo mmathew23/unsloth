@@ -19,6 +19,10 @@ from .packing import (
     enable_padding_free_metadata,
     enable_sample_packing,
     mark_allow_overlength,
+    enable_njt_collator_wrapper,
+    UNSLOTH_USE_NJT,
+    UnslothNJTDataCollator,
+    get_njt_collator,
 )
 from .attention_dispatch import (
     AttentionConfig,
@@ -37,6 +41,10 @@ __all__ = [
     "enable_sample_packing",
     "enable_padding_free_metadata",
     "mark_allow_overlength",
+    "enable_njt_collator_wrapper",
+    "UNSLOTH_USE_NJT",
+    "UnslothNJTDataCollator",
+    "get_njt_collator",
     "AttentionConfig",
     "AttentionContext",
     "FLASH_VARLEN",

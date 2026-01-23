@@ -29,6 +29,9 @@ from unsloth.utils import (
     configure_sample_packing,
     enable_padding_free_metadata,
     enable_sample_packing,
+    enable_njt_collator_wrapper,
+    UNSLOTH_USE_NJT,
+    UnslothNJTDataCollator,
 )
 from unsloth_zoo.training_utils import (
     unsloth_train as _unsloth_train,
@@ -289,6 +292,35 @@ def _patch_sft_trainer_auto_packing(trl_module):
         else:
             config_arg = kwargs.get("args")
 
+        # NJT Standalone Mode: When UNSLOTH_USE_NJT=1, use NJT collator instead of packing/padding_free
+        njt_mode_active = False
+        if UNSLOTH_USE_NJT:
+            processing_class = kwargs.get("processing_class") or kwargs.get("tokenizer")
+            data_collator = kwargs.get("data_collator")
+
+            # Only use NJT mode if no custom collator is provided
+            if data_collator is None and processing_class is not None:
+                # Disable packing and padding_free
+                if config_arg is not None:
+                    if hasattr(config_arg, "packing"):
+                        setattr(config_arg, "packing", False)
+                    if hasattr(config_arg, "padding_free"):
+                        setattr(config_arg, "padding_free", False)
+
+                # Get max_seq_length from config
+                max_seq_length = getattr(config_arg, "max_seq_length", 2048)
+                if max_seq_length is None:
+                    max_seq_length = 2048
+
+                # Create NJT collator
+                njt_collator = UnslothNJTDataCollator(
+                    tokenizer=processing_class,
+                    max_seq_length=max_seq_length,
+                )
+                kwargs["data_collator"] = njt_collator
+                njt_mode_active = True
+                logger.info("Unsloth: NJT standalone mode enabled.")
+
         # Check if model type is unsupported for padding_free
         model = kwargs.get("model")
         is_unsupported_model = False
@@ -315,8 +347,10 @@ def _patch_sft_trainer_auto_packing(trl_module):
         data_collator = kwargs.get("data_collator")
 
         # We also disable vision language models for padding free collators
+        # Also blocked when NJT mode is active (we handle things differently)
         blocked = (
-            (data_collator is not None)
+            njt_mode_active
+            or (data_collator is not None and not njt_mode_active)
             or isinstance(processing_class, ProcessorMixin)
             or is_vlm
             or is_unsupported_model
@@ -385,7 +419,12 @@ def _patch_sft_trainer_auto_packing(trl_module):
             setattr(trainer_args, "packing", False)
             setattr(trainer_args, "padding_free", False)
 
-        if (
+        # NJT standalone mode: print message and skip packing/padding_free setup
+        if njt_mode_active:
+            print(
+                "🦥 Unsloth: NJT standalone mode enabled - using native jagged tensors for variable-length training!"
+            )
+        elif (
             not blocked
             and trainer_packing
             and (packing_active or _should_pack(trainer_args))
@@ -402,6 +441,12 @@ def _patch_sft_trainer_auto_packing(trl_module):
                 else "🦥 Unsloth: Padding-free enabled, enabling faster training."
             )
             print(message)
+        elif UNSLOTH_USE_NJT and not njt_mode_active:
+            # NJT support for custom collators: wrap to convert padded -> concatenated
+            # This handles custom collators that bypass padding_free/packing
+            njt_wrapped = enable_njt_collator_wrapper(self)
+            if njt_wrapped:
+                print("🦥 Unsloth: NJT collator wrapper enabled for custom data collator.")
 
     sft_trainer.__init__ = new_init
     sft_trainer._unsloth_auto_packing_wrapped = True

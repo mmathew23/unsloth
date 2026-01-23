@@ -128,7 +128,19 @@ class LoRA_MLP(torch.autograd.Function):
         ) = ctx.custom_saved_tensors
         gateA, gateB, upA, upB, downA, downB, X, e, g = ctx.saved_tensors
 
-        batch, seq_len, hd = X.shape
+        # Handle NJT (Nested Jagged Tensor) inputs
+        is_njt_input = hasattr(dY, "is_nested") and dY.is_nested
+        njt_offsets = None
+        if is_njt_input:
+            njt_offsets = dY.offsets()
+            dY = dY.values()
+            X = X.values()
+            e = e.values()
+            g = g.values()
+            batch, seq_len = 1, dY.shape[0]  # Flatten dimensions for NJT
+            hd = X.shape[-1]
+        else:
+            batch, seq_len, hd = X.shape
         dY = dY.view(-1, dY.shape[-1])
         X = X.view(-1, X.shape[-1])
         e = e.view(-1, e.shape[-1])
@@ -206,8 +218,16 @@ class LoRA_MLP(torch.autograd.Function):
         # gateW, gateW_quant, gateA, gateB, gateS,
         #  upW,    upW_quant,   upA,   upB,   upS,
         # downW, downW_quant, downA, downB, downS,
+
+        # Reconstruct NJT if input was NJT
+        if njt_offsets is not None:
+            dX = dX.view(-1, hd)
+            dX = torch.nested.nested_tensor_from_jagged(dX, offsets=njt_offsets)
+        else:
+            dX = dX.view(batch, seq_len, hd)
+
         return (
-            dX.view(batch, seq_len, hd),
+            dX,
             None,
             None,
             d_gateA.t(),
@@ -379,19 +399,36 @@ class LoRA_QKV(torch.autograd.Function):
     ):
         dtype = X.dtype
 
+        # Check for NJT (Nested Jagged Tensor) input
+        is_njt_input = hasattr(X, "is_nested") and X.is_nested
+
         # bitsandbytes 8-bit matmul expects 2D inputs.
         # TorchInductor/AOTAutograd fails on 3D tensors during backward,
         # so we explicitly flatten the sequence dimension.
-        orig_shape = X.shape
-        X_for_matmul = X
-        if X.dim() == 3:
-            X_for_matmul = X.view(-1, X.shape[-1])
+        if is_njt_input:
+            # NJT: extract values, apply matmul, reconstruct
+            X_values = X.values()  # (total_tokens, hidden_size)
+            njt_offsets = X.offsets()
+            X_for_matmul = X_values
+            orig_shape = None  # Mark as NJT path
+        else:
+            orig_shape = X.shape
+            X_for_matmul = X
+            if X.dim() == 3:
+                X_for_matmul = X.view(-1, X.shape[-1])
+            njt_offsets = None
+
         Q = matmul_lora(X_for_matmul, QW, QW_quant, QA, QB, QS)
         K = matmul_lora(X_for_matmul, KW, KW_quant, KA, KB, KS)
         V = matmul_lora(X_for_matmul, VW, VW_quant, VA, VB, VS)
 
         # Restore original shape after matmul
-        if len(orig_shape) == 3:
+        if is_njt_input:
+            # Reconstruct NJT
+            Q = torch.nested.nested_tensor_from_jagged(Q, offsets=njt_offsets)
+            K = torch.nested.nested_tensor_from_jagged(K, offsets=njt_offsets)
+            V = torch.nested.nested_tensor_from_jagged(V, offsets=njt_offsets)
+        elif len(orig_shape) == 3:
             Q = Q.view(orig_shape[0], orig_shape[1], -1)
             K = K.view(orig_shape[0], orig_shape[1], -1)
             V = V.view(orig_shape[0], orig_shape[1], -1)
@@ -433,7 +470,19 @@ class LoRA_QKV(torch.autograd.Function):
             VB,
         ) = ctx.saved_tensors
 
-        batch, seq_len, hd = X.shape
+        # Handle NJT (Nested Jagged Tensor) inputs
+        is_njt_input = hasattr(dQ, "is_nested") and dQ.is_nested
+        njt_offsets = None
+        if is_njt_input:
+            njt_offsets = dQ.offsets()
+            dQ = dQ.values()
+            dK = dK.values()
+            dV = dV.values()
+            X = X.values()
+            batch, seq_len = 1, dQ.shape[0]  # Flatten dimensions for NJT
+            hd = X.shape[-1]
+        else:
+            batch, seq_len, hd = X.shape
         dQ = dQ.view(-1, dQ.shape[-1])
         dK = dK.reshape(-1, dK.shape[-1])  # view doesn't work on K.T
         dV = dV.view(-1, dV.shape[-1])
@@ -511,8 +560,16 @@ class LoRA_QKV(torch.autograd.Function):
         # QW, QW_quant, QA, QB, QS,
         # KW, KW_quant, KA, KB, KS,
         # VW, VW_quant, VA, VB, VS,
+
+        # Reconstruct NJT if input was NJT
+        if njt_offsets is not None:
+            dX = dX.view(-1, hd)
+            dX = torch.nested.nested_tensor_from_jagged(dX, offsets=njt_offsets)
+        else:
+            dX = dX.view(batch, seq_len, hd)
+
         return (
-            dX.view(batch, seq_len, hd),
+            dX,
             None,
             None,
             d_QA.t(),
@@ -606,7 +663,17 @@ class LoRA_W(torch.autograd.Function):
         W, W_quant, S = ctx.custom_saved_tensors
         A, B, X = ctx.saved_tensors
 
-        batch, seq_len, hd = X.shape
+        # Handle NJT (Nested Jagged Tensor) inputs
+        is_njt_input = hasattr(dY, "is_nested") and dY.is_nested
+        njt_offsets = None
+        if is_njt_input:
+            njt_offsets = dY.offsets()
+            dY = dY.values()
+            X = X.values()
+            batch, seq_len = 1, dY.shape[0]  # Flatten dimensions for NJT
+            hd = X.shape[-1]
+        else:
+            batch, seq_len, hd = X.shape
         dY = dY.reshape(-1, dY.shape[-1])  # Must be reshape
         X = X.reshape(-1, X.shape[-1])  # Must be reshape
         dtype = X.dtype
@@ -634,8 +701,15 @@ class LoRA_W(torch.autograd.Function):
         # dX += dY @ B.to(dtype).t() @ (S * A.to(dtype).t())
         dX.addmm_(dY @ B.t(), A.t(), alpha = S)
 
+        # Reconstruct NJT if input was NJT
+        if njt_offsets is not None:
+            dX = dX.view(-1, hd)
+            dX = torch.nested.nested_tensor_from_jagged(dX, offsets=njt_offsets)
+        else:
+            dX = dX.view(batch, seq_len, hd)
+
         # W, W_quant, A, B, S
-        return dX.view(batch, seq_len, hd), None, None, d_A.t(), d_B.t(), None
+        return dX, None, None, d_A.t(), d_B.t(), None
 
 
 def apply_lora_o(self, X):

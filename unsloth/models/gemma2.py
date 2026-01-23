@@ -92,13 +92,109 @@ def Gemma2Attention_fast_forward(
         del self.RH_Q
         del self.attention
 
-    bsz, q_len, _ = hidden_states.size()
-
     n_heads = self.config.num_attention_heads
     n_groups = self.num_key_value_groups
     n_kv_heads = self.config.num_key_value_heads
     head_dim = self.head_dim
+    hidden_size = n_heads * head_dim
     assert n_kv_heads * n_groups == n_heads
+
+    # Check if hidden_states is NJT (Nested Jagged Tensor)
+    use_njt_path = is_njt(hidden_states)
+
+    if use_njt_path:
+        # NJT Standalone Path for Gemma2
+        bsz = hidden_states.shape[0]
+
+        # Q, K, V projections work natively with NJT
+        Q, K, V = self.apply_qkv(self, hidden_states)
+
+        # Reshape for attention using NJT-aware functions
+        Q = njt_reshape_for_heads(Q, n_heads, head_dim)
+        K = njt_reshape_for_heads(K, n_kv_heads, head_dim)
+        V = njt_reshape_for_heads(V, n_kv_heads, head_dim)
+
+        # Transpose for attention
+        Q = njt_transpose_for_attention(Q)
+        K = njt_transpose_for_attention(K)
+        V = njt_transpose_for_attention(V)
+
+        # Get max sequence length for RoPE
+        offsets = hidden_states.offsets()
+        seq_lengths = (offsets[1:] - offsets[:-1]).tolist()
+        max_seqlen = max(seq_lengths)
+
+        # Get RoPE embeddings
+        device_index = Q.device.index
+        self.rotary_emb.extend_rope_embedding(V, seq_len=max_seqlen)
+        cos, sin = self.rotary_emb.get_cached(max_seqlen, device_index)
+
+        # For NJT, position_ids should be passed from kwargs
+        rope_position_ids = position_ids
+        if rope_position_ids is None:
+            rope_position_ids = kwargs.get("position_ids")
+
+        # Apply RoPE to NJT Q, K using values-based approach
+        Q_bsnh = Q.transpose(1, 2)
+        K_bsnh = K.transpose(1, 2)
+
+        Q_vals = Q_bsnh.values()
+        K_vals = K_bsnh.values()
+        pos_ids = rope_position_ids.values() if is_njt(rope_position_ids) else rope_position_ids.view(-1)
+
+        cos_expanded = cos[pos_ids]
+        sin_expanded = sin[pos_ids]
+
+        def apply_rotary_emb(x, cos_vals, sin_vals):
+            x1 = x[..., :head_dim // 2]
+            x2 = x[..., head_dim // 2:]
+            if cos_vals.dim() == 2 and cos_vals.shape[-1] == head_dim // 2:
+                cos_h = cos_vals.unsqueeze(1)
+                sin_h = sin_vals.unsqueeze(1)
+            else:
+                cos_h = cos_vals[..., :head_dim // 2].unsqueeze(1)
+                sin_h = sin_vals[..., :head_dim // 2].unsqueeze(1)
+            x_rotated_1 = x1 * cos_h - x2 * sin_h
+            x_rotated_2 = x2 * cos_h + x1 * sin_h
+            return torch.cat([x_rotated_1, x_rotated_2], dim=-1)
+
+        Q_rope = apply_rotary_emb(Q_vals, cos_expanded, sin_expanded)
+        K_rope = apply_rotary_emb(K_vals, cos_expanded, sin_expanded)
+
+        # Reconstruct NJT
+        Q_offsets = Q_bsnh.offsets()
+        Q = torch.nested.nested_tensor_from_jagged(Q_rope, offsets=Q_offsets).transpose(1, 2)
+        K = torch.nested.nested_tensor_from_jagged(K_rope, offsets=Q_offsets).transpose(1, 2)
+
+        # Expand K, V for GQA if needed
+        if n_groups != 1:
+            K_vals = K.transpose(1, 2).values()
+            V_vals = V.transpose(1, 2).values()
+            K_expanded = K_vals.unsqueeze(2).expand(-1, -1, n_groups, -1)
+            V_expanded = V_vals.unsqueeze(2).expand(-1, -1, n_groups, -1)
+            K_expanded = K_expanded.reshape(-1, n_heads, head_dim)
+            V_expanded = V_expanded.reshape(-1, n_heads, head_dim)
+            K_offsets = K.transpose(1, 2).offsets()
+            K = torch.nested.nested_tensor_from_jagged(K_expanded, offsets=K_offsets).transpose(1, 2)
+            V = torch.nested.nested_tensor_from_jagged(V_expanded, offsets=K_offsets).transpose(1, 2)
+
+        # Run NJT SDPA attention
+        # Note: Gemma2 has softcapping but SDPA doesn't support it - use scale approximation
+        from torch.nn.functional import scaled_dot_product_attention as sdpa
+        scale = 1.0 / (self.config.query_pre_attn_scalar ** 0.5)
+        A = sdpa(Q, K, V, is_causal=True, scale=scale)
+
+        # Transpose back and reshape
+        A = njt_transpose_from_attention(A)
+        attn_output = njt_reshape_from_heads(A, hidden_size)
+
+        # Output projection
+        attn_output = self.apply_o(self, attn_output)
+
+        return attn_output, None, None
+
+    # Standard path (non-NJT)
+    bsz, q_len, _ = hidden_states.size()
 
     Q, K, V = self.apply_qkv(self, hidden_states)
     Q = Q.view(bsz, q_len, n_heads, head_dim).transpose(1, 2)

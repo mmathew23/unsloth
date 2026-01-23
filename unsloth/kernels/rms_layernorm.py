@@ -239,6 +239,21 @@ def fast_rms_layernorm(layernorm, X: torch.Tensor, gemma: bool = False):
         if hasattr(layernorm, "variance_epsilon")
         else layernorm.eps
     )
+
+    # Handle NJT (Nested Jagged Tensor) inputs
+    # NJT can't be reshaped with -1, so we extract values, apply layernorm, reconstruct
+    if hasattr(X, "is_nested") and X.is_nested:
+        # Extract values and offsets from NJT
+        values = X.values()  # (total_tokens, hidden_size)
+        offsets = X.offsets()
+
+        # Apply layernorm to flattened values
+        out_values = Fast_RMS_Layernorm.apply(values, W, eps, gemma)
+
+        # Reconstruct NJT
+        out = torch.nested.nested_tensor_from_jagged(out_values, offsets=offsets)
+        return out
+
     out = Fast_RMS_Layernorm.apply(X, W, eps, gemma)
     return out
 

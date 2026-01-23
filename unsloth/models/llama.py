@@ -35,6 +35,12 @@ from ..utils.attention_dispatch import (
     AttentionContext,
     run_attention,
     select_attention_backend,
+    is_njt,
+    njt_reshape_for_heads,
+    njt_transpose_for_attention,
+    njt_transpose_from_attention,
+    njt_reshape_from_heads,
+    UNSLOTH_USE_NJT,
 )
 from torch.nn.functional import scaled_dot_product_attention
 from transformers import __version__ as transformers_version
@@ -612,13 +618,130 @@ def LlamaAttention_fast_forward(
         del self.temp_KV
         del self.RH_Q
         del self.attention
-    bsz, q_len, _ = hidden_states.size()
 
     n_heads = self.config.num_attention_heads
     n_groups = self.num_key_value_groups
     n_kv_heads = self.config.num_key_value_heads
     head_dim = self.head_dim
+    hidden_size = n_heads * head_dim
     assert n_kv_heads * n_groups == n_heads
+
+    # Check if hidden_states is NJT (Nested Jagged Tensor)
+    use_njt_path = is_njt(hidden_states)
+
+    if use_njt_path:
+        # NJT Standalone Path
+        # hidden_states shape: (bsz, seq_len*, hidden_size) where seq_len* is ragged
+        bsz = hidden_states.shape[0]
+
+        # Q, K, V projections work natively with NJT
+        Q, K, V = self.apply_qkv(self, hidden_states)
+
+        # Reshape for attention using NJT-aware functions
+        # (bsz, seq_len*, hidden) -> (bsz, seq_len*, n_heads, head_dim)
+        Q = njt_reshape_for_heads(Q, n_heads, head_dim)
+        K = njt_reshape_for_heads(K, n_kv_heads, head_dim)
+        V = njt_reshape_for_heads(V, n_kv_heads, head_dim)
+
+        # Transpose for attention: (bsz, seq_len*, n_heads, head_dim) -> (bsz, n_heads, seq_len*, head_dim)
+        Q = njt_transpose_for_attention(Q)
+        K = njt_transpose_for_attention(K)
+        V = njt_transpose_for_attention(V)
+
+        # Get max sequence length for RoPE
+        # For NJT, we need to get the max from the offsets
+        offsets = hidden_states.offsets()
+        seq_lengths = (offsets[1:] - offsets[:-1]).tolist()
+        max_seqlen = max(seq_lengths)
+
+        # Get RoPE embeddings
+        if position_embeddings and max_seqlen <= position_embeddings[0].shape[0]:
+            cos, sin = position_embeddings
+        else:
+            rotary_emb = self.rotary_emb
+            rotary_emb.extend_rope_embedding(V, seq_len=max_seqlen)
+            cos, sin = rotary_emb.get_cached(max_seqlen, Q.device.index)
+
+        # For NJT, position_ids should be passed from kwargs (set by collator)
+        rope_position_ids = position_ids
+        if rope_position_ids is None:
+            rope_position_ids = kwargs.get("position_ids")
+
+        # Apply RoPE to NJT Q, K
+        # The fast_rope_embedding kernel doesn't support NJT, so we use values-based approach
+        # Q, K shape: (bsz, n_heads, seq_len*, head_dim) -> transpose to (bsz, seq_len*, n_heads, head_dim)
+        Q_bsnh = Q.transpose(1, 2)  # (bsz, seq_len*, n_heads, head_dim)
+        K_bsnh = K.transpose(1, 2)
+
+        # Extract values
+        Q_vals = Q_bsnh.values()  # (total_tokens, n_heads, head_dim)
+        K_vals = K_bsnh.values()
+        pos_ids = rope_position_ids.values() if is_njt(rope_position_ids) else rope_position_ids.view(-1)
+
+        # Apply rotary embedding to each token based on its position
+        # Gather cos/sin for each token's position
+        cos_expanded = cos[pos_ids]  # (total_tokens, head_dim) or (total_tokens, head_dim//2)
+        sin_expanded = sin[pos_ids]
+
+        # Apply rotary embedding: split into two halves and rotate
+        def apply_rotary_emb(x, cos_vals, sin_vals):
+            # x: (total_tokens, n_heads, head_dim)
+            # cos_vals, sin_vals: (total_tokens, head_dim) or (total_tokens, head_dim//2)
+            x1 = x[..., :head_dim // 2]
+            x2 = x[..., head_dim // 2:]
+            if cos_vals.dim() == 2 and cos_vals.shape[-1] == head_dim // 2:
+                # Half-size cos/sin
+                cos_h = cos_vals.unsqueeze(1)  # (total_tokens, 1, head_dim//2)
+                sin_h = sin_vals.unsqueeze(1)
+            else:
+                # Full-size cos/sin - split
+                cos_h = cos_vals[..., :head_dim // 2].unsqueeze(1)
+                sin_h = sin_vals[..., :head_dim // 2].unsqueeze(1)
+            x_rotated_1 = x1 * cos_h - x2 * sin_h
+            x_rotated_2 = x2 * cos_h + x1 * sin_h
+            return torch.cat([x_rotated_1, x_rotated_2], dim=-1)
+
+        Q_rope = apply_rotary_emb(Q_vals, cos_expanded, sin_expanded)
+        K_rope = apply_rotary_emb(K_vals, cos_expanded, sin_expanded)
+
+        # Reconstruct NJT
+        Q_offsets = Q_bsnh.offsets()
+        Q = torch.nested.nested_tensor_from_jagged(Q_rope, offsets=Q_offsets).transpose(1, 2)
+        K = torch.nested.nested_tensor_from_jagged(K_rope, offsets=Q_offsets).transpose(1, 2)
+
+        # Expand K, V for GQA if needed
+        if n_groups != 1:
+            # K, V shape: (bsz, n_kv_heads, seq_len*, head_dim)
+            # Need to expand to (bsz, n_heads, seq_len*, head_dim)
+            # For NJT, we need to work with values
+            K_vals = K.transpose(1, 2).values()  # (total_tokens, n_kv_heads, head_dim)
+            V_vals = V.transpose(1, 2).values()
+            K_expanded = K_vals.unsqueeze(2).expand(-1, -1, n_groups, -1)
+            V_expanded = V_vals.unsqueeze(2).expand(-1, -1, n_groups, -1)
+            K_expanded = K_expanded.reshape(-1, n_heads, head_dim)
+            V_expanded = V_expanded.reshape(-1, n_heads, head_dim)
+            # Reconstruct NJT
+            K_offsets = K.transpose(1, 2).offsets()
+            K = torch.nested.nested_tensor_from_jagged(K_expanded, offsets=K_offsets).transpose(1, 2)
+            V = torch.nested.nested_tensor_from_jagged(V_expanded, offsets=K_offsets).transpose(1, 2)
+
+        # Run NJT SDPA attention
+        from torch.nn.functional import scaled_dot_product_attention as sdpa
+        A = sdpa(Q, K, V, is_causal=True)
+
+        # Transpose back: (bsz, n_heads, seq_len*, head_dim) -> (bsz, seq_len*, n_heads, head_dim)
+        A = njt_transpose_from_attention(A)
+
+        # Reshape to (bsz, seq_len*, hidden_size)
+        attn_output = njt_reshape_from_heads(A, hidden_size)
+
+        # Output projection (works natively with NJT)
+        attn_output = self.apply_o(self, attn_output)
+
+        return attn_output, None, None
+
+    # Standard path (non-NJT)
+    bsz, q_len, _ = hidden_states.size()
 
     Q, K, V = self.apply_qkv(self, hidden_states)
     Q = Q.view(bsz, q_len, n_heads, head_dim).transpose(1, 2)
@@ -626,6 +749,8 @@ def LlamaAttention_fast_forward(
     V = V.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
     seq_info = get_packed_info_from_kwargs(kwargs, Q.device)
 
+    # Standard attention path
+    # NJT conversion is now handled automatically in run_attention when UNSLOTH_USE_NJT=1
     kv_seq_len = K.shape[-2]
     if past_key_value is not None:
         kv_seq_len += past_key_value[0].shape[-2]
@@ -641,11 +766,6 @@ def LlamaAttention_fast_forward(
     if rope_position_ids is None and seq_info is not None:
         rope_position_ids = kwargs.get("position_ids")
 
-    # Q, K = (
-    #     fast_rope_embedding(Q, K, cos, sin)
-    #     if rope_position_ids is None
-    #     else inplace_rope_embedding(Q, K, cos, sin, rope_position_ids)
-    # )
     Q, K = fast_rope_embedding(Q, K, cos, sin, rope_position_ids)
 
     if past_key_value is not None:
@@ -817,9 +937,21 @@ def LlamaModel_fast_forward(
             "Unsloth: You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time"
         )
     elif input_ids is not None:
-        batch_size, seq_length = input_ids.shape
+        # Check if input_ids is NJT (Nested Jagged Tensor)
+        use_njt_input = is_njt(input_ids)
+        if use_njt_input:
+            batch_size = input_ids.shape[0]
+            # For NJT, seq_length is symbolic - get total tokens for tracking
+            seq_length = input_ids.values().shape[0]  # Total tokens (not per-sample)
+        else:
+            batch_size, seq_length = input_ids.shape
     elif inputs_embeds is not None:
-        batch_size, seq_length, _ = inputs_embeds.shape
+        use_njt_input = is_njt(inputs_embeds)
+        if use_njt_input:
+            batch_size = inputs_embeds.shape[0]
+            seq_length = inputs_embeds.values().shape[0]
+        else:
+            batch_size, seq_length, _ = inputs_embeds.shape
     else:
         raise ValueError(
             "Unsloth: You have to specify either decoder_input_ids or decoder_inputs_embeds"
@@ -828,9 +960,10 @@ def LlamaModel_fast_forward(
     seq_length_with_past = seq_length
 
     # Fix out of bounds tokenization unless we were given packed metadata
+    # Skip for NJT mode - the collator handles truncation
     allow_overlength = getattr(self, "_unsloth_allow_packed_overlength", False) or (
         "packed_seq_lengths" in kwargs
-    )
+    ) or use_njt_input
     if hasattr(self, "max_seq_length") and not allow_overlength:
         if seq_length > self.max_seq_length:
             shape = input_ids.shape if input_ids is not None else inputs_embeds.shape
@@ -859,11 +992,16 @@ def LlamaModel_fast_forward(
         )
         position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
     elif position_ids is not None:
-        position_ids = position_ids.view(-1, seq_length).to(torch.int32)  # .long()
+        # For NJT, position_ids is already in the right format from the collator
+        if is_njt(position_ids):
+            # NJT position_ids: keep as-is, just ensure dtype
+            position_ids = position_ids  # Already NJT, dtype handling in attention
+        else:
+            position_ids = position_ids.view(-1, seq_length).to(torch.int32)  # .long()
     else:
         position_ids = None
 
-    if position_ids is not None:
+    if position_ids is not None and not is_njt(position_ids):
         if position_ids.shape[0] != batch_size:
             position_ids = position_ids.repeat((batch_size, 1))
 
@@ -1363,7 +1501,19 @@ def CausalLM_fast_forward(fast_forward_inference):
             )
         hidden_states = outputs[0]
 
-        bsz, q_len, hd = hidden_states.shape
+        # Check if using NJT (Nested Jagged Tensor) mode
+        use_njt_mode = is_njt(hidden_states)
+
+        if use_njt_mode:
+            # NJT path: hidden_states shape is (bsz, seq_len*, hidden_size)
+            bsz = hidden_states.shape[0]
+            hd = hidden_states.shape[-1]
+            # For NJT, q_len is not a concrete value, but we can get total tokens
+            total_tokens = hidden_states.values().shape[0]
+            q_len = total_tokens  # Use total_tokens for size checks
+        else:
+            bsz, q_len, hd = hidden_states.shape
+
         lm_head = self.lm_head.weight
         lm_head_device = lm_head.device
 
@@ -1389,6 +1539,48 @@ def CausalLM_fast_forward(fast_forward_inference):
                 attentions = outputs.attentions,
             )
 
+        # NJT-specific forward and loss computation path
+        if use_njt_mode:
+            import torch.nn.functional as F
+            # For NJT, lm_head works natively on NJT hidden_states
+            logits = self.lm_head(hidden_states.to(dtype))  # NJT output
+
+            loss = None
+            if labels is not None:
+                # Extract values from NJT for loss computation
+                logits_flat = logits.values()  # (total_tokens, vocab_size)
+                labels_flat = labels.values()  # (total_tokens,)
+
+                # Shift for causal LM: predict next token
+                shift_logits = logits_flat[:-1, :].contiguous()
+                shift_labels = labels_flat[1:].contiguous()
+
+                # Apply logit scaling/softcapping if needed
+                if logit_scaling != 0:
+                    shift_logits = logit_scaling * shift_logits
+                if logit_softcapping != 0:
+                    shift_logits = logit_softcapping * torch.tanh(shift_logits / logit_softcapping)
+
+                # Compute cross-entropy loss
+                loss = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                    ignore_index=-100,
+                )
+
+            if not return_dict:
+                output = (logits,) + outputs[1:]
+                return (loss,) + output if loss is not None else output
+
+            return CausalLMOutputWithPast(
+                loss=loss,
+                logits=logits,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+            )
+
+        # Standard (non-NJT) path
         if bsz == 1 and q_len == 1:
             logits = torch.mv(lm_head, hidden_states.ravel().to(dtype))
             logits = logits.unsqueeze(0).unsqueeze(0)

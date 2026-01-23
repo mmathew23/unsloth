@@ -61,6 +61,27 @@ def _exact_forward_kernel(
 
 
 def geglu_exact_forward_kernel(gate, up):
+    # Handle NJT inputs
+    is_njt = hasattr(gate, "is_nested") and gate.is_nested
+    if is_njt:
+        gate_vals = gate.values()
+        up_vals = up.values()
+        njt_offsets = gate.offsets()
+        n_elements = gate_vals.numel()
+        device = gate_vals.device
+        out = torch.empty_like(gate_vals)
+        grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+        with torch_gpu_device(device):
+            _exact_forward_kernel[grid](
+                gate_vals,
+                up_vals,
+                out,
+                n_elements,
+                BLOCK_SIZE = BLOCK_SIZE,
+                LONG_INDEXING = 0 if n_elements <= INT32_SAFETY_BUFFER else 1,
+            )
+        return torch.nested.nested_tensor_from_jagged(out, offsets=njt_offsets)
+
     batch, seq_len, hd = gate.shape
     n_elements = gate.numel()
     device = gate.device
@@ -138,6 +159,25 @@ def _exact_backward_kernel(
 
 
 def geglu_exact_backward_kernel(DW, e, g):
+    # Handle NJT inputs
+    is_njt = hasattr(e, "is_nested") and e.is_nested
+    if is_njt:
+        DW_vals = DW.values()
+        e_vals = e.values()
+        g_vals = g.values()
+        n_elements = e_vals.numel()
+        grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+        with torch_gpu_device(e_vals.device):
+            _exact_backward_kernel[grid](
+                DW_vals,
+                e_vals,
+                g_vals,
+                n_elements,
+                BLOCK_SIZE = BLOCK_SIZE,
+                LONG_INDEXING = 0 if n_elements <= INT32_SAFETY_BUFFER else 1,
+            )
+        return DW, e, g
+
     batch_seq_len, hd = e.shape
     n_elements = e.numel()
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
@@ -191,6 +231,28 @@ def _approx_forward_kernel(
 
 
 def geglu_approx_forward_kernel(gate, up):
+    # Handle NJT inputs
+    is_njt = hasattr(gate, "is_nested") and gate.is_nested
+    if is_njt:
+        gate_vals = gate.values()
+        up_vals = up.values()
+        njt_offsets = gate.offsets()
+        # Process as flat (total_tokens, hd) tensor
+        n_elements = gate_vals.numel()
+        device = gate_vals.device
+        out = torch.empty_like(gate_vals)
+        grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+        with torch_gpu_device(device):
+            _approx_forward_kernel[grid](
+                gate_vals,
+                up_vals,
+                out,
+                n_elements,
+                BLOCK_SIZE = BLOCK_SIZE,
+                LONG_INDEXING = 0 if n_elements <= INT32_SAFETY_BUFFER else 1,
+            )
+        return torch.nested.nested_tensor_from_jagged(out, offsets=njt_offsets)
+
     batch, seq_len, hd = gate.shape
     n_elements = gate.numel()
     device = gate.device
@@ -275,6 +337,25 @@ def _approx_backward_kernel(
 
 
 def geglu_approx_backward_kernel(DW, e, g):
+    # Handle NJT inputs
+    is_njt = hasattr(e, "is_nested") and e.is_nested
+    if is_njt:
+        DW_vals = DW.values()
+        e_vals = e.values()
+        g_vals = g.values()
+        n_elements = e_vals.numel()
+        grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+        with torch_gpu_device(e_vals.device):
+            _approx_backward_kernel[grid](
+                DW_vals,
+                e_vals,
+                g_vals,
+                n_elements,
+                BLOCK_SIZE = BLOCK_SIZE,
+                LONG_INDEXING = 0 if n_elements <= INT32_SAFETY_BUFFER else 1,
+            )
+        return DW, e, g
+
     batch_seq_len, hd = e.shape
     n_elements = e.numel()
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)

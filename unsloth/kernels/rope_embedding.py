@@ -317,7 +317,13 @@ class Fast_RoPE_Embedding_QK(torch.autograd.Function):
 
         if has_indices:
             # TRL's rotary indices are always in int32, so casting is just for safety
-            rope_ptr = rope_indices.reshape(-1).to(dtype = torch.int32, device = Q.device)
+            # Handle NJT rope_indices - extract values() for flat tensor
+            is_njt_rope = hasattr(rope_indices, "is_nested") and rope_indices.is_nested
+            if is_njt_rope:
+                rope_values = rope_indices.values()
+            else:
+                rope_values = rope_indices.reshape(-1)
+            rope_ptr = rope_values.to(dtype = torch.int32, device = Q.device)
         else:
             rope_ptr = cos.new_empty(1, dtype = torch.int32)
 

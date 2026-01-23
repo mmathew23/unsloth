@@ -999,12 +999,24 @@ def fast_linear_forward(proj, X, temp_lora = None, out = None):
 def matmul_lora(X, W, W_quant, A, B, s, out = None):
     dtype = X.dtype
 
-    if X.dim() == 3:
+    # Check for NJT (Nested Jagged Tensor) input
+    is_njt_input = hasattr(X, "is_nested") and X.is_nested
+
+    if is_njt_input:
+        # NJT: extract values, do matmul, reconstruct
+        X_values = X.values()  # (total_tokens, hidden_size)
+        njt_offsets = X.offsets()
+        X = X_values
+        reshape = False
+        njt_mode = True
+    elif X.dim() == 3:
         batch, seq_len, d = X.shape
         X = X.view(-1, X.shape[-1])
         reshape = True
+        njt_mode = False
     else:
         reshape = False
+        njt_mode = False
 
     if isinstance(W, Float8Tensor):
         assert W.ndim == 2
@@ -1031,4 +1043,10 @@ def matmul_lora(X, W, W_quant, A, B, s, out = None):
         out.addmm_(XA, B.to(dtype), alpha = s)
         # out += (X @ A.to(dtype)) @ (s * B.to(dtype))
 
-    return out.view(batch, seq_len, -1) if reshape else out
+    if njt_mode:
+        # Reconstruct NJT
+        return torch.nested.nested_tensor_from_jagged(out, offsets=njt_offsets)
+    elif reshape:
+        return out.view(batch, seq_len, -1)
+    else:
+        return out

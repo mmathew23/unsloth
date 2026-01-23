@@ -57,6 +57,30 @@ def _fg_kernel(
 
 
 def swiglu_fg_kernel(e, g):
+    # Check for NJT (Nested Jagged Tensor) input
+    is_njt_input = hasattr(e, "is_nested") and e.is_nested
+
+    if is_njt_input:
+        # NJT: extract values, apply kernel, reconstruct
+        e_values = e.values()  # (total_tokens, hd)
+        g_values = g.values()
+        njt_offsets = e.offsets()
+
+        n_elements = e_values.numel()
+        h = torch.empty_like(e_values)
+        grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+        with torch_gpu_device(e_values.device):
+            _fg_kernel[grid](
+                e_values,
+                g_values,
+                h,
+                n_elements,
+                BLOCK_SIZE = BLOCK_SIZE,
+                LONG_INDEXING = 0 if n_elements <= INT32_SAFETY_BUFFER else 1,
+            )
+        # Reconstruct NJT
+        return torch.nested.nested_tensor_from_jagged(h, offsets=njt_offsets)
+
     batch, seq_len, hd = e.shape
     n_elements = e.numel()
     h = torch.empty((batch, seq_len, hd), dtype = e.dtype, device = e.device)

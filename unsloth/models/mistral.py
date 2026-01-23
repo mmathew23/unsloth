@@ -74,13 +74,106 @@ def MistralAttention_fast_forward(
         del self.RH_Q
         del self.attention
 
-    bsz, q_len, _ = hidden_states.size()
-
     n_heads = self.config.num_attention_heads
     n_groups = self.num_key_value_groups
     n_kv_heads = self.config.num_key_value_heads
     head_dim = self.head_dim
+    hidden_size = n_heads * head_dim
     assert n_kv_heads * n_groups == n_heads
+
+    # Check if hidden_states is NJT (Nested Jagged Tensor)
+    use_njt_path = is_njt(hidden_states)
+
+    if use_njt_path:
+        # NJT Standalone Path for Mistral
+        bsz = hidden_states.shape[0]
+
+        # Q, K, V projections work natively with NJT
+        Q, K, V = self.apply_qkv(self, hidden_states)
+
+        # Reshape for attention using NJT-aware functions
+        Q = njt_reshape_for_heads(Q, n_heads, head_dim)
+        K = njt_reshape_for_heads(K, n_kv_heads, head_dim)
+        V = njt_reshape_for_heads(V, n_kv_heads, head_dim)
+
+        # Transpose for attention
+        Q = njt_transpose_for_attention(Q)
+        K = njt_transpose_for_attention(K)
+        V = njt_transpose_for_attention(V)
+
+        # Get max sequence length for RoPE
+        offsets = hidden_states.offsets()
+        seq_lengths = (offsets[1:] - offsets[:-1]).tolist()
+        max_seqlen = max(seq_lengths)
+
+        # Get RoPE embeddings
+        self.rotary_emb.extend_rope_embedding(V, seq_len=max_seqlen)
+        cos, sin = self.rotary_emb.get_cached(max_seqlen, Q.device.index)
+
+        # For NJT, position_ids should be passed from kwargs
+        rope_position_ids = position_ids
+        if rope_position_ids is None:
+            rope_position_ids = kwargs.get("position_ids")
+
+        # Apply RoPE to NJT Q, K using values-based approach
+        Q_bsnh = Q.transpose(1, 2)
+        K_bsnh = K.transpose(1, 2)
+
+        Q_vals = Q_bsnh.values()
+        K_vals = K_bsnh.values()
+        pos_ids = rope_position_ids.values() if is_njt(rope_position_ids) else rope_position_ids.view(-1)
+
+        cos_expanded = cos[pos_ids]
+        sin_expanded = sin[pos_ids]
+
+        def apply_rotary_emb(x, cos_vals, sin_vals):
+            x1 = x[..., :head_dim // 2]
+            x2 = x[..., head_dim // 2:]
+            if cos_vals.dim() == 2 and cos_vals.shape[-1] == head_dim // 2:
+                cos_h = cos_vals.unsqueeze(1)
+                sin_h = sin_vals.unsqueeze(1)
+            else:
+                cos_h = cos_vals[..., :head_dim // 2].unsqueeze(1)
+                sin_h = sin_vals[..., :head_dim // 2].unsqueeze(1)
+            x_rotated_1 = x1 * cos_h - x2 * sin_h
+            x_rotated_2 = x2 * cos_h + x1 * sin_h
+            return torch.cat([x_rotated_1, x_rotated_2], dim=-1)
+
+        Q_rope = apply_rotary_emb(Q_vals, cos_expanded, sin_expanded)
+        K_rope = apply_rotary_emb(K_vals, cos_expanded, sin_expanded)
+
+        # Reconstruct NJT
+        Q_offsets = Q_bsnh.offsets()
+        Q = torch.nested.nested_tensor_from_jagged(Q_rope, offsets=Q_offsets).transpose(1, 2)
+        K = torch.nested.nested_tensor_from_jagged(K_rope, offsets=Q_offsets).transpose(1, 2)
+
+        # Expand K, V for GQA if needed
+        if n_groups != 1:
+            K_vals = K.transpose(1, 2).values()
+            V_vals = V.transpose(1, 2).values()
+            K_expanded = K_vals.unsqueeze(2).expand(-1, -1, n_groups, -1)
+            V_expanded = V_vals.unsqueeze(2).expand(-1, -1, n_groups, -1)
+            K_expanded = K_expanded.reshape(-1, n_heads, head_dim)
+            V_expanded = V_expanded.reshape(-1, n_heads, head_dim)
+            K_offsets = K.transpose(1, 2).offsets()
+            K = torch.nested.nested_tensor_from_jagged(K_expanded, offsets=K_offsets).transpose(1, 2)
+            V = torch.nested.nested_tensor_from_jagged(V_expanded, offsets=K_offsets).transpose(1, 2)
+
+        # Run NJT SDPA attention
+        from torch.nn.functional import scaled_dot_product_attention as sdpa
+        A = sdpa(Q, K, V, is_causal=True)
+
+        # Transpose back and reshape
+        A = njt_transpose_from_attention(A)
+        attn_output = njt_reshape_from_heads(A, hidden_size)
+
+        # Output projection
+        attn_output = self.apply_o(self, attn_output)
+
+        return attn_output, None, None
+
+    # Standard path (non-NJT)
+    bsz, q_len, _ = hidden_states.size()
 
     Q, K, V = self.apply_qkv(self, hidden_states)
     Q = Q.view(bsz, q_len, n_heads, head_dim).transpose(1, 2)
@@ -164,7 +257,14 @@ def MistralForCausalLM_fast_forward(
     *args,
     **kwargs,
 ) -> Union[Tuple, CausalLMOutputWithPast]:
-    if causal_mask is None and past_key_values is None:
+    # Check if input_ids is NJT (Nested Jagged Tensor)
+    use_njt_path = is_njt(input_ids)
+
+    if use_njt_path:
+        # For NJT, skip causal mask creation - SDPA handles it internally
+        bsz = input_ids.shape[0]
+        q_len = None  # Not used in NJT path
+    elif causal_mask is None and past_key_values is None:
         bsz, q_len = input_ids.shape
         sliding_window = getattr(self.config, "sliding_window", None)
 
@@ -270,7 +370,15 @@ def MistralForCausalLM_fast_forward(
 
     hidden_states = outputs[0]
 
-    bsz, q_len, hd = hidden_states.shape
+    # Check if outputs are still NJT (they should be for NJT path)
+    output_is_njt = is_njt(hidden_states)
+    if output_is_njt:
+        bsz = hidden_states.shape[0]
+        q_len = None  # Symbolic, not used directly
+        hd = hidden_states.shape[-1]
+    else:
+        bsz, q_len, hd = hidden_states.shape
+
     lm_head = self.lm_head.weight
     lm_head_device = lm_head.device
 
@@ -282,7 +390,7 @@ def MistralForCausalLM_fast_forward(
     # If we are in GRPO mode, return raw hidden states
     if os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1":
         num_logits_to_keep = max(num_logits_to_keep, logits_to_keep)
-        if num_logits_to_keep != 0:
+        if num_logits_to_keep != 0 and not output_is_njt:
             hidden_states = hidden_states[:, -num_logits_to_keep:, :]
         return CausalLMOutputWithPast(
             loss = None,
@@ -292,7 +400,7 @@ def MistralForCausalLM_fast_forward(
             attentions = outputs.attentions,
         )
 
-    if bsz == 1 and q_len == 1:
+    if not output_is_njt and bsz == 1 and q_len == 1:
         logits = torch.mv(lm_head, hidden_states.ravel().to(lm_head.dtype))
         logits = logits.unsqueeze(0).unsqueeze(0)
     elif num_logits_to_keep != 0:
@@ -302,7 +410,8 @@ def MistralForCausalLM_fast_forward(
     else:
         RETURN_LOGITS = os.environ.get("UNSLOTH_RETURN_LOGITS", "0") == "1"
         # < 1024 Normal Unsloth uses less VRAM!
-        if bsz * q_len <= 1024 and not RETURN_LOGITS:
+        # For NJT, q_len is symbolic, so skip this optimization
+        if not use_njt_path and bsz * q_len <= 1024 and not RETURN_LOGITS:
             # Use unsloth_fused_ce_loss which actually calculates the best chunk size to reduce VRAM usage
             RETURN_LOGITS = False
 

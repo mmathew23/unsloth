@@ -20,9 +20,11 @@ __all__ = [
     "DEVICE_COUNT",
     "ALLOW_PREQUANTIZED_MODELS",
     "ALLOW_BITSANDBYTES",
+    "IS_MLX",
 ]
 
 import torch
+import platform
 import functools
 import inspect
 from unsloth_zoo.utils import Version
@@ -35,6 +37,13 @@ def is_hip():
 
 @functools.cache
 def get_device_type():
+    # Check Apple Silicon first (MLX uses its own framework, not torch GPU)
+    if platform.system() == "Darwin" and platform.machine() == "arm64":
+        try:
+            import mlx.core as _mx
+            return "mlx"
+        except ImportError:
+            pass
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         if is_hip():
             return "hip"
@@ -55,15 +64,18 @@ def get_device_type():
                 f"Please reinstall torch - it's most likely broken :("
             )
     raise NotImplementedError(
-        "Unsloth currently only works on NVIDIA, AMD and Intel GPUs."
+        "Unsloth currently only works on NVIDIA, AMD, Intel GPUs, and Apple Silicon."
     )
 
 
 DEVICE_TYPE: str = get_device_type()
+IS_MLX: bool = (DEVICE_TYPE == "mlx")
 # HIP fails for autocast and other torch functions. Use CUDA instead
 DEVICE_TYPE_TORCH = DEVICE_TYPE
 if DEVICE_TYPE_TORCH == "hip":
     DEVICE_TYPE_TORCH = "cuda"
+if DEVICE_TYPE_TORCH == "mlx":
+    DEVICE_TYPE_TORCH = "cpu"
 
 
 @functools.cache

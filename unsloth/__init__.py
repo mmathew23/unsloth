@@ -129,6 +129,7 @@ from unsloth_zoo.device_type import (
     DEVICE_TYPE_TORCH,
     DEVICE_COUNT,
     ALLOW_PREQUANTIZED_MODELS,
+    IS_MLX,
 )
 
 # Fix other issues
@@ -220,6 +221,8 @@ elif DEVICE_TYPE == "xpu":
     # torch.xpu.is_bf16_supported() does not have including_emulation
     # set SUPPORTS_BFLOAT16 as torch.xpu.is_bf16_supported()
     SUPPORTS_BFLOAT16 = torch.xpu.is_bf16_supported()
+elif DEVICE_TYPE == "mlx":
+    SUPPORTS_BFLOAT16 = True  # Apple Silicon natively supports bfloat16
 
 # For Gradio HF Spaces?
 # if "SPACE_AUTHOR_NAME" not in os.environ and "SPACE_REPO_NAME" not in os.environ:
@@ -308,23 +311,29 @@ elif DEVICE_TYPE == "xpu":
     # TODO: check triton for intel installed properly.
     pass
 
-from .models import *
-from .models import __version__
-from .save import *
-from .chat_templates import *
-from .tokenizer_utils import *
-from .trainer import *
+# MLX path: skip GPU kernels/models entirely, use mlx-lm directly
+if IS_MLX:
+    from unsloth_zoo.mlx_trainer import MLXTrainer, MLXTrainingConfig
+    from unsloth_zoo.mlx_loader import FastLanguageModel, FastModel
+    __version__ = unsloth_zoo.__version__
+else:
+    from .models import *
+    from .models import __version__
+    from .save import *
+    from .chat_templates import *
+    from .tokenizer_utils import *
+    from .trainer import *
 
-# Export dataprep utilities for CLI and downstream users
-from .dataprep.raw_text import RawTextDataLoader, TextPreprocessor
-from unsloth_zoo.rl_environments import (
-    check_python_modules,
-    create_locked_down_function,
-    execute_with_time_limit,
-    Benchmarker,
-    is_port_open,
-    launch_openenv,
-)
+    # Export dataprep utilities for CLI and downstream users
+    from .dataprep.raw_text import RawTextDataLoader, TextPreprocessor
+    from unsloth_zoo.rl_environments import (
+        check_python_modules,
+        create_locked_down_function,
+        execute_with_time_limit,
+        Benchmarker,
+        is_port_open,
+        launch_openenv,
+    )
 
-# Patch TRL trainers for backwards compatibility
-_patch_trl_trainer()
+    # Patch TRL trainers for backwards compatibility
+    _patch_trl_trainer()

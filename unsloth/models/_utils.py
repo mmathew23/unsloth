@@ -155,7 +155,7 @@ from unsloth_zoo.temporary_patches import (
 
 
 def apply_unsloth_gradient_checkpointing(
-    use_gradient_checkpointing, max_seq_length, dtype
+    use_gradient_checkpointing, max_seq_length, dtype, use_reentrant = None
 ):
     """
     Apply gradient checkpointing with smart heuristics.
@@ -167,6 +167,7 @@ def apply_unsloth_gradient_checkpointing(
         use_gradient_checkpointing: "unsloth", True, False, or None
         max_seq_length: The maximum sequence length
         dtype: The model dtype for patching
+        use_reentrant: Optional explicit mode override for smart checkpointing
 
     Returns:
         The effective use_gradient_checkpointing value (may change from "unsloth" to True)
@@ -179,7 +180,10 @@ def apply_unsloth_gradient_checkpointing(
             unpatch_unsloth_smart_gradient_checkpointing()
             return True
         else:
-            patch_unsloth_smart_gradient_checkpointing(dtype = dtype)
+            patch_unsloth_smart_gradient_checkpointing(
+                dtype = dtype,
+                use_reentrant = use_reentrant,
+            )
             return "unsloth"
     elif use_gradient_checkpointing in (True, False):
         # User explicitly set True or False - unpatch any previous "unsloth" patching

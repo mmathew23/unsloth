@@ -2717,6 +2717,7 @@ class FastLlamaModel:
         qat_scheme = None,
         target_parameters = None,  # For MoE expert layers (nn.Parameter)
         ensure_weight_tying = False,
+        use_reentrant = None,
         **kwargs,
     ):
         if os.environ.get("UNSLOTH_USE_NEW_MODEL", "0") == "1":
@@ -2757,11 +2758,26 @@ class FastLlamaModel:
             return model
         transformers_set_seed(random_state)
 
+        checkpoint_use_reentrant = use_reentrant
+        if use_reentrant is None:
+            _respect_gc_mode = str(
+                os.environ.get("UNSLOTH_GC_RESPECT_USE_REENTRANT_IN_PEFT_PREP", "0")
+            ).strip().lower() not in ("0", "false", "no", "off")
+            if _respect_gc_mode:
+                _gc_env = str(os.environ.get("UNSLOTH_GC_USE_REENTRANT", "1")).strip().lower()
+                peft_prep_use_reentrant = _gc_env not in ("0", "false", "no", "off")
+            else:
+                peft_prep_use_reentrant = True
+        elif type(use_reentrant) is not bool:
+            raise TypeError("Unsloth: `use_reentrant` must be a boolean or None.")
+        else:
+            peft_prep_use_reentrant = use_reentrant
+
         # Apply gradient checkpointing with smart heuristics
         max_seq = getattr(model, "max_seq_length", 512)
         dtype = model.get_input_embeddings().weight.dtype
         use_gradient_checkpointing = apply_unsloth_gradient_checkpointing(
-            use_gradient_checkpointing, max_seq, dtype
+            use_gradient_checkpointing, max_seq, dtype, use_reentrant = checkpoint_use_reentrant
         )
 
         if type(r) is not int:
@@ -3097,7 +3113,11 @@ class FastLlamaModel:
 
         model._saved_temp_tokenizer = _saved_temp_tokenizer
 
-        model = FastLlamaModel.patch_peft_model(model, use_gradient_checkpointing)
+        model = FastLlamaModel.patch_peft_model(
+            model,
+            use_gradient_checkpointing,
+            use_reentrant = peft_prep_use_reentrant,
+        )
 
         if ensure_weight_tying:
             try:
@@ -3198,12 +3218,20 @@ class FastLlamaModel:
     def patch_peft_model(
         model,
         use_gradient_checkpointing = "unsloth",
+        use_reentrant = True,
     ):
         if os.environ.get("UNSLOTH_USE_NEW_MODEL", "0") == "1":
-            return FastBaseModel.patch_peft_model(
-                model = model,
-                use_gradient_checkpointing = use_gradient_checkpointing,
-            )
+            try:
+                return FastBaseModel.patch_peft_model(
+                    model = model,
+                    use_gradient_checkpointing = use_gradient_checkpointing,
+                    use_reentrant = use_reentrant,
+                )
+            except TypeError:
+                return FastBaseModel.patch_peft_model(
+                    model = model,
+                    use_gradient_checkpointing = use_gradient_checkpointing,
+                )
         if not isinstance(model, PeftModelForCausalLM) and not isinstance(
             model, PeftModelForSequenceClassification
         ):
@@ -3240,7 +3268,7 @@ class FastLlamaModel:
         model = prepare_model_for_kbit_training(
             model,
             use_gradient_checkpointing = use_gradient_checkpointing,
-            use_reentrant = True,
+            use_reentrant = use_reentrant,
         )
 
         # Fix up config for transformers uploading PEFT

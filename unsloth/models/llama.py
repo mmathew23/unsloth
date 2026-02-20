@@ -695,7 +695,6 @@ def LlamaAttention_fast_forward(
         kv_seq_len = kv_seq_len,
         n_heads = n_heads,
         head_dim = head_dim,
-        requires_grad = hidden_states.requires_grad,
         seq_info = seq_info,
         attention_mask = attention_mask,
         causal_mask = causal_mask,
@@ -2760,14 +2759,8 @@ class FastLlamaModel:
 
         checkpoint_use_reentrant = use_reentrant
         if use_reentrant is None:
-            _respect_gc_mode = str(
-                os.environ.get("UNSLOTH_GC_RESPECT_USE_REENTRANT_IN_PEFT_PREP", "0")
-            ).strip().lower() not in ("0", "false", "no", "off")
-            if _respect_gc_mode:
-                _gc_env = str(os.environ.get("UNSLOTH_GC_USE_REENTRANT", "1")).strip().lower()
-                peft_prep_use_reentrant = _gc_env not in ("0", "false", "no", "off")
-            else:
-                peft_prep_use_reentrant = True
+            _gc_env = str(os.environ.get("UNSLOTH_GC_USE_REENTRANT", "1")).strip().lower()
+            peft_prep_use_reentrant = _gc_env not in ("0", "false", "no", "off")
         elif type(use_reentrant) is not bool:
             raise TypeError("Unsloth: `use_reentrant` must be a boolean or None.")
         else:

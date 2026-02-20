@@ -18,8 +18,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Any, Optional, Tuple
 
+import torch
 from torch import Tensor
 from torch.nn.functional import scaled_dot_product_attention
 
@@ -75,7 +77,6 @@ class AttentionContext:
     kv_seq_len: int
     n_heads: int
     head_dim: int
-    requires_grad: bool
     seq_info: Optional[Tuple[Tensor, Tensor, int]]
     attention_mask: Optional[Tensor]
     causal_mask: Optional[Any]
@@ -84,6 +85,19 @@ class AttentionContext:
 
 def select_attention_backend(use_varlen: bool = False) -> str:
     """Return attention backend based on availability / priority order."""
+
+    forced = os.environ.get("UNSLOTH_COMPILE_ATTN_BACKEND", "").strip().lower()
+    if forced:
+        if forced in (FLASH_DENSE, FLASH_VARLEN):
+            if HAS_FLASH_ATTENTION:
+                if forced == FLASH_VARLEN and not use_varlen:
+                    return FLASH_DENSE
+                return forced
+        elif forced == XFORMERS:
+            if HAS_XFORMERS:
+                return XFORMERS
+        elif forced == SDPA:
+            return SDPA
 
     if HAS_FLASH_ATTENTION:
         if use_varlen:
@@ -129,7 +143,10 @@ def run_attention(
     q_len = context.q_len
     head_dim = context.head_dim
     kv_seq_len = context.kv_seq_len
-    requires_grad = context.requires_grad
+    # Training can require backward here even when the incoming hidden states do not
+    # require grad (e.g., frozen embeddings + LoRA weights). Use actual Q/K/V grad
+    # requirements instead of the upstream hidden-state flag for backend shape choices.
+    requires_grad = bool(torch.is_grad_enabled() and (Q.requires_grad or K.requires_grad or V.requires_grad))
     sliding_window = context.sliding_window
 
     if backend == FLASH_VARLEN:

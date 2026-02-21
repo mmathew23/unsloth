@@ -352,7 +352,7 @@ def _fla_rotary_qk_fwdbwd(
     if not seqlen_offsets.is_contiguous():
         seqlen_offsets = seqlen_offsets.contiguous()
 
-    block_size, num_warps = _calculate_launch_settings(dq)
+    block_size, num_warps = _calculate_launch_settings(rotary_half_dim)
     grid = (bq * seq_len, hq)
     _fla_rotary_embedding_qk_kernel[grid](
         q_ptr = q_out,
@@ -437,7 +437,7 @@ def _fla_rotary_qk_positions_fwdbwd(
 
     q_out = q
     k_out = k
-    block_size, num_warps = _calculate_launch_settings(dq)
+    block_size, num_warps = _calculate_launch_settings(rotary_half_dim)
     grid = (bq * tq, hq)
     _fla_rotary_embedding_qk_indices_kernel[grid](
         q_ptr = q_out,

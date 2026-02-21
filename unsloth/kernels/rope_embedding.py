@@ -17,22 +17,18 @@ import triton
 import triton.language as tl
 import torch
 import os
-from collections import OrderedDict
 from ..device_type import DEVICE_COUNT
 from .utils import calculate_settings, torch_gpu_device, torch_device_stream
-from .vendors.fla import fla_rotary_embedding_qk, fla_rotary_embedding_qk_positions
+from .vendors.fla import fla_rotary_embedding_qk_positions
+try:
+    from unsloth_zoo.kernel_backends import get_rotary_kernel_backend
+except Exception:
+    def get_rotary_kernel_backend() -> str:
+        value = os.environ.get("UNSLOTH_FLA_ROTARY", "0")
+        return "fla" if value.strip().lower() in ("1", "true", "yes", "on") else "unsloth"
 
 def _use_fla_rotary() -> bool:
-    value = os.environ.get("UNSLOTH_FLA_ROTARY", "0")
-    return value.strip().lower() in ("1", "true", "yes", "on")
-
-
-_ROTARY_LINEAR_OFFSET_CACHE_MAXSIZE = 64
-_ROTARY_HALF_CACHE_MAXSIZE = 16
-_ROTARY_LINEAR_OFFSET_CACHE: OrderedDict[tuple, torch.Tensor | None] = OrderedDict()
-_ROTARY_LAST_OFFSET_CACHE_KEY = None
-_ROTARY_LAST_OFFSET_CACHE_VALUE = None
-_ROTARY_HALF_CACHE: OrderedDict[tuple, tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
+    return get_rotary_kernel_backend() == "fla"
 
 def _rope_embedding_QK(
     Q,
@@ -316,86 +312,6 @@ def _fast_rope_embedding_unsloth(
     return Q_out, K_out
 
 
-def _get_rotary_offsets_if_linear(position_ids, batch, seq_len, cache_len, device):
-    global _ROTARY_LAST_OFFSET_CACHE_KEY
-    global _ROTARY_LAST_OFFSET_CACHE_VALUE
-    if position_ids is None:
-        return torch.zeros(batch, dtype = torch.int32, device = device)
-    if not isinstance(position_ids, torch.Tensor):
-        return None
-    if position_ids.ndim != 2:
-        return None
-    if position_ids.shape[0] != batch or position_ids.shape[1] != seq_len:
-        return None
-    if position_ids.dtype not in (torch.int32, torch.int64):
-        return None
-
-    if position_ids.device != device:
-        position_ids = position_ids.to(device = device, non_blocking = True)
-    cache_key = (
-        id(position_ids),
-        int(cache_len),
-    )
-    if cache_key == _ROTARY_LAST_OFFSET_CACHE_KEY:
-        return _ROTARY_LAST_OFFSET_CACHE_VALUE
-
-    cached = _ROTARY_LINEAR_OFFSET_CACHE.get(cache_key)
-    if cached is not None or cache_key in _ROTARY_LINEAR_OFFSET_CACHE:
-        _ROTARY_LINEAR_OFFSET_CACHE.move_to_end(cache_key)
-        _ROTARY_LAST_OFFSET_CACHE_KEY = cache_key
-        _ROTARY_LAST_OFFSET_CACHE_VALUE = cached
-        return cached
-
-    offsets64 = position_ids[:, 0].to(dtype = torch.int64)
-    valid = (offsets64 >= 0) & ((offsets64 + seq_len) <= cache_len)
-    if seq_len > 1:
-        linear = torch.all(position_ids[:, 1:] - position_ids[:, :-1] == 1, dim = 1)
-        valid = valid & linear
-
-    if not bool(valid.all().item()):
-        _ROTARY_LINEAR_OFFSET_CACHE[cache_key] = None
-        if len(_ROTARY_LINEAR_OFFSET_CACHE) > _ROTARY_LINEAR_OFFSET_CACHE_MAXSIZE:
-            _ROTARY_LINEAR_OFFSET_CACHE.popitem(last = False)
-        _ROTARY_LAST_OFFSET_CACHE_KEY = cache_key
-        _ROTARY_LAST_OFFSET_CACHE_VALUE = None
-        return None
-    offsets = offsets64.to(dtype = torch.int32)
-    _ROTARY_LINEAR_OFFSET_CACHE[cache_key] = offsets
-    if len(_ROTARY_LINEAR_OFFSET_CACHE) > _ROTARY_LINEAR_OFFSET_CACHE_MAXSIZE:
-        _ROTARY_LINEAR_OFFSET_CACHE.popitem(last = False)
-    _ROTARY_LAST_OFFSET_CACHE_KEY = cache_key
-    _ROTARY_LAST_OFFSET_CACHE_VALUE = offsets
-    return offsets
-
-
-def _get_contiguous_rotary_half(cos, sin, rotary_half_dim):
-    if (
-        cos.shape[-1] == rotary_half_dim
-        and sin.shape[-1] == rotary_half_dim
-        and cos.is_contiguous()
-        and sin.is_contiguous()
-    ):
-        return cos, sin
-
-    cache_key = (
-        id(cos),
-        id(sin),
-        int(rotary_half_dim),
-    )
-    cached = _ROTARY_HALF_CACHE.get(cache_key)
-    if cached is not None:
-        _ROTARY_HALF_CACHE.move_to_end(cache_key)
-        return cached
-
-    cos_half = cos[:, :rotary_half_dim].contiguous()
-    sin_half = sin[:, :rotary_half_dim].contiguous()
-    cached = (cos_half, sin_half)
-    _ROTARY_HALF_CACHE[cache_key] = cached
-    if len(_ROTARY_HALF_CACHE) > _ROTARY_HALF_CACHE_MAXSIZE:
-        _ROTARY_HALF_CACHE.popitem(last = False)
-    return cached
-
-
 @torch.compiler.disable
 def _fast_rope_embedding_fla(
     Q,
@@ -419,40 +335,41 @@ def _fast_rope_embedding_fla(
     rotary_half_dim = head_dim // 2
     if cos.shape[-1] < rotary_half_dim or sin.shape[-1] < rotary_half_dim:
         return None
-    cos_half, sin_half = _get_contiguous_rotary_half(
-        cos,
-        sin,
-        rotary_half_dim,
-    )
+    if cos.stride(-1) != 1:
+        cos = cos.contiguous()
+    if sin.stride(-1) != 1:
+        sin = sin.contiguous()
+
+    positions = None
+    if rope_embedding_indices is not None:
+        if not isinstance(rope_embedding_indices, torch.Tensor):
+            return None
+
+        if rope_embedding_indices.ndim == 2:
+            if rope_embedding_indices.shape != (batch, seq_len):
+                return None
+            positions = rope_embedding_indices
+        elif rope_embedding_indices.ndim == 1:
+            if rope_embedding_indices.numel() != batch * seq_len:
+                return None
+            positions = rope_embedding_indices.reshape(batch, seq_len)
+        else:
+            return None
+
+        if positions.device != Q.device:
+            positions = positions.to(device = Q.device, non_blocking = True)
+        if positions.dtype != torch.int32:
+            positions = positions.to(dtype = torch.int32)
 
     try:
-        offsets = _get_rotary_offsets_if_linear(
-            position_ids = rope_embedding_indices,
-            batch = batch,
-            seq_len = seq_len,
-            cache_len = cos_half.shape[0],
-            device = Q.device,
+        Q_out, K_out = fla_rotary_embedding_qk_positions(
+            Q,
+            K,
+            cos,
+            sin,
+            positions,
+            validate_positions = False,
         )
-        if offsets is None:
-            if not isinstance(rope_embedding_indices, torch.Tensor):
-                return None
-            Q_out, K_out = fla_rotary_embedding_qk_positions(
-                Q,
-                K,
-                cos_half,
-                sin_half,
-                rope_embedding_indices,
-                validate_positions = False,
-            )
-        else:
-            Q_out, K_out = fla_rotary_embedding_qk(
-                Q,
-                K,
-                cos_half,
-                sin_half,
-                offsets,
-                validate_offsets = False,
-            )
     except (RuntimeError, ValueError):
         return None
 

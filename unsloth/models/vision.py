@@ -420,6 +420,7 @@ class FastBaseModel:
         tokenizer_name = None,
         auto_model = AutoModelForVision2Seq,
         use_gradient_checkpointing = "unsloth",
+        use_reentrant = None,
         supports_sdpa = True,
         whisper_language = None,
         whisper_task = None,
@@ -441,6 +442,7 @@ class FastBaseModel:
             raise RuntimeError(
                 "Unsloth: UNSLOTH_VLLM_STANDBY is True, but UNSLOTH_VLLM_STANDBY is not set to 1!"
             )
+        effective_use_reentrant = resolve_use_reentrant(use_reentrant, default = True)
 
         if model_types is None:
             raise RuntimeError(
@@ -1086,6 +1088,7 @@ class FastBaseModel:
         model = FastBaseModel.post_patch_model(
             model,
             use_gradient_checkpointing = use_gradient_checkpointing,
+            use_reentrant = effective_use_reentrant,
             trust_remote_code = trust_remote_code,
             model_type = model_type_arch,
             tokenizer = tokenizer,
@@ -1115,6 +1118,7 @@ class FastBaseModel:
         layers_to_transform = None,
         layers_pattern = None,
         use_gradient_checkpointing = "unsloth",
+        use_reentrant = None,
         random_state = 3407,
         max_seq_length = 2048,  # not used anymore
         use_rslora = False,
@@ -1133,6 +1137,12 @@ class FastBaseModel:
                 "Unsloth: Full finetuning is enabled, so .get_peft_model has no effect"
             )
             return model
+        default_use_reentrant = get_model_default_use_reentrant(model, default = True)
+        effective_use_reentrant = resolve_use_reentrant(
+            use_reentrant,
+            default = default_use_reentrant,
+        )
+        set_model_default_use_reentrant(model, effective_use_reentrant)
         transformers_set_seed(random_state)
 
         if type(r) is not int:
@@ -1223,6 +1233,7 @@ class FastBaseModel:
         model = prepare_model_for_kbit_training(
             model,
             use_gradient_checkpointing = use_gradient_checkpointing,
+            use_reentrant = effective_use_reentrant,
         )
         model = _get_peft_model(model, lora_config)
         # Apply QAT + LoRA if specified
@@ -1237,6 +1248,7 @@ class FastBaseModel:
         model = FastBaseModel.post_patch_model(
             model,
             use_gradient_checkpointing = use_gradient_checkpointing,
+            use_reentrant = effective_use_reentrant,
             trust_remote_code = trust_remote_code,
         )
         model.max_seq_length = max_seq_length
@@ -1267,6 +1279,7 @@ class FastBaseModel:
     def post_patch_model(
         model,
         use_gradient_checkpointing = True,
+        use_reentrant = None,
         trust_remote_code = False,
         model_type = None,
         tokenizer = None,
@@ -1288,7 +1301,16 @@ class FastBaseModel:
 
         # VLMs can hit DDP "marked ready twice" with re-entrant checkpointing.
         # See: https://github.com/unslothai/unsloth/issues/3713.
-        use_reentrant = not is_distributed()
+        use_reentrant = resolve_use_reentrant(
+            use_reentrant,
+            default = not is_distributed(),
+        )
+        if is_distributed() and use_reentrant:
+            logger.warning_once(
+                "Unsloth: For vision models under distributed training, forcing "
+                "`use_reentrant=False` to avoid DDP marked-ready-twice errors."
+            )
+            use_reentrant = False
         if not use_reentrant:
             # Under DDP, avoid the offloaded/re-entrant checkpoint patch.
             unpatch_unsloth_gradient_checkpointing()
@@ -1336,6 +1358,7 @@ class FastBaseModel:
         if hasattr(m, "_saved_temp_tokenizer"):
             if hasattr(m._saved_temp_tokenizer, "tokenizer"):
                 m._saved_temp_tokenizer.tokenizer.padding_side = "left"
+        set_model_default_use_reentrant(model, use_reentrant)
         # Also set is_loaded_in_8bit to disable incorrect DDP
         m.is_loaded_in_8bit = True if not full_finetuning else False
 

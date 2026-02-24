@@ -47,6 +47,16 @@ XFORMERS_BLOCK_DIAG_CLS = (
 )
 
 
+def _is_reentrant_checkpoint_active() -> bool:
+    if os.environ.get("UNSLOTH_GC_DISABLE_REENTRANT_LAYOUT_GUARD", "0") == "1":
+        return False
+    try:
+        from unsloth_zoo.gradient_checkpointing import is_reentrant_checkpoint_active
+        return bool(is_reentrant_checkpoint_active())
+    except Exception:
+        return False
+
+
 @dataclass
 class AttentionConfig:
     """
@@ -80,6 +90,7 @@ class AttentionContext:
     seq_info: Optional[Tuple[Tensor, Tensor, int]]
     attention_mask: Optional[Tensor]
     causal_mask: Optional[Any]
+    hidden_states_requires_grad: Optional[bool] = None
     sliding_window: Optional[int] = None
 
 
@@ -143,10 +154,17 @@ def run_attention(
     q_len = context.q_len
     head_dim = context.head_dim
     kv_seq_len = context.kv_seq_len
-    # Training can require backward here even when the incoming hidden states do not
-    # require grad (e.g., frozen embeddings + LoRA weights). Use actual Q/K/V grad
-    # requirements instead of the upstream hidden-state flag for backend shape choices.
-    requires_grad = bool(torch.is_grad_enabled() and (Q.requires_grad or K.requires_grad or V.requires_grad))
+    # Keep legacy behavior as the primary signal (hidden_states.requires_grad).
+    # When running inside reentrant checkpoint phases, force this legacy signal
+    # for both original forward and backward-time recompute so layout selection
+    # does not diverge across phases.
+    requires_grad = bool(context.hidden_states_requires_grad)
+    if (
+        (not requires_grad)
+        and torch.is_grad_enabled()
+        and (not _is_reentrant_checkpoint_active())
+    ):
+        requires_grad = bool(Q.requires_grad or K.requires_grad or V.requires_grad)
     sliding_window = context.sliding_window
 
     if backend == FLASH_VARLEN:

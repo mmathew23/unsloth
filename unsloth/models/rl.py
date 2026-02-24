@@ -22,6 +22,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 import inspect
 import os
 import re
+import unsloth_zoo.gradient_checkpointing as unsloth_gc
 from unsloth_zoo.compiler import create_new_function
 from unsloth_zoo.log import logger
 from unsloth_zoo.logging_utils import PatchRLStatistics
@@ -1182,8 +1183,10 @@ def _patch_trl_rl_trainers(trainer_file = "grpo_trainer"):
     # Keep this override only when users opted into reentrant mode.
     RLConfig_post = ""
     if trl_version >= Version("0.27.0") and RLConfig_name == "GRPOConfig":
-        use_reentrant = str(os.environ.get("UNSLOTH_GC_USE_REENTRANT", "1")).strip().lower()
-        if use_reentrant not in ("0", "false", "no", "off"):
+        use_reentrant = bool(
+            getattr(unsloth_gc, "UNSLOTH_GC_PATCH_USE_REENTRANT", True)
+        )
+        if use_reentrant:
             RLConfig_post = (
                 "        # Unsloth: Remove use_reentrant=False forced by TRL 0.27.0+\n"
                 "        if getattr(self, 'gradient_checkpointing_kwargs', None) is not None:\n"

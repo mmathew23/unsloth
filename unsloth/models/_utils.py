@@ -60,6 +60,9 @@ __all__ = [
     "patch_unsloth_smart_gradient_checkpointing",
     "unpatch_unsloth_smart_gradient_checkpointing",
     "apply_unsloth_gradient_checkpointing",
+    "resolve_use_reentrant",
+    "set_model_default_use_reentrant",
+    "get_model_default_use_reentrant",
     "patch_compiled_autograd",
     "process_vision_info",
     "unsloth_compile_transformers",
@@ -190,6 +193,36 @@ def apply_unsloth_gradient_checkpointing(
         unpatch_unsloth_smart_gradient_checkpointing()
         return use_gradient_checkpointing
     return use_gradient_checkpointing
+
+def resolve_use_reentrant(use_reentrant: Optional[bool], default: bool = True) -> bool:
+    if use_reentrant is None:
+        return bool(default)
+    if type(use_reentrant) is not bool:
+        raise TypeError("Unsloth: `use_reentrant` must be a boolean or None.")
+    return bool(use_reentrant)
+
+
+def set_model_default_use_reentrant(model: Any, use_reentrant: bool) -> None:
+    if type(use_reentrant) is not bool:
+        raise TypeError("Unsloth: `use_reentrant` must be a boolean.")
+    if model is None:
+        return
+    m = model
+    seen = set()
+    while m is not None and id(m) not in seen:
+        seen.add(id(m))
+        try:
+            setattr(m, "_unsloth_use_reentrant", bool(use_reentrant))
+        except Exception:
+            pass
+        m = getattr(m, "model", None)
+
+
+def get_model_default_use_reentrant(model: Any, default: bool = True) -> bool:
+    value = getattr(model, "_unsloth_use_reentrant", None)
+    if type(value) is bool:
+        return value
+    return bool(default)
 
 
 def prefer_flex_attn_if_supported(model_class, config):

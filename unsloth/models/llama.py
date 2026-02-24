@@ -695,6 +695,7 @@ def LlamaAttention_fast_forward(
         kv_seq_len = kv_seq_len,
         n_heads = n_heads,
         head_dim = head_dim,
+        hidden_states_requires_grad = hidden_states.requires_grad,
         seq_info = seq_info,
         attention_mask = attention_mask,
         causal_mask = causal_mask,
@@ -2193,6 +2194,7 @@ class FastLlamaModel:
         num_labels = None,
         qat_scheme = None,
         load_in_fp8 = False,  # fp8 LoRA (True, False, 'block')
+        use_reentrant = None,
         **kwargs,
     ):
         os.environ["UNSLOTH_USE_NEW_MODEL"] = "0"
@@ -2229,6 +2231,7 @@ class FastLlamaModel:
         token = hf_login(token)
         if model_patcher is None:
             model_patcher = FastLlamaModel
+        effective_use_reentrant = resolve_use_reentrant(use_reentrant, default = True)
         SUPPORTS_BFLOAT16 = is_bfloat16_supported()
 
         if DEVICE_TYPE == "cuda":
@@ -2678,6 +2681,7 @@ class FastLlamaModel:
                     ):
                         if module.padding_idx < module.weight.shape[0]:
                             module.weight[module.padding_idx] = 0
+        set_model_default_use_reentrant(model, effective_use_reentrant)
         return model, tokenizer
 
     @staticmethod
@@ -2720,6 +2724,12 @@ class FastLlamaModel:
         **kwargs,
     ):
         if os.environ.get("UNSLOTH_USE_NEW_MODEL", "0") == "1":
+            default_use_reentrant = get_model_default_use_reentrant(model, default = True)
+            effective_use_reentrant = resolve_use_reentrant(
+                use_reentrant,
+                default = default_use_reentrant,
+            )
+            set_model_default_use_reentrant(model, effective_use_reentrant)
             # Check for other PEFT args in kwargs
             for peft_arg, flag in (
                 ("finetune_vision_layers", False),
@@ -2748,6 +2758,7 @@ class FastLlamaModel:
                 temporary_location = temporary_location,
                 target_parameters = target_parameters,
                 ensure_weight_tying = ensure_weight_tying,
+                use_reentrant = effective_use_reentrant,
                 **kwargs,
             )
         if os.environ.get("UNSLOTH_ENABLE_FULL_FINETUNING", "0") == "1":
@@ -2756,21 +2767,18 @@ class FastLlamaModel:
             )
             return model
         transformers_set_seed(random_state)
-
-        checkpoint_use_reentrant = use_reentrant
-        if use_reentrant is None:
-            _gc_env = str(os.environ.get("UNSLOTH_GC_USE_REENTRANT", "1")).strip().lower()
-            peft_prep_use_reentrant = _gc_env not in ("0", "false", "no", "off")
-        elif type(use_reentrant) is not bool:
-            raise TypeError("Unsloth: `use_reentrant` must be a boolean or None.")
-        else:
-            peft_prep_use_reentrant = use_reentrant
+        default_use_reentrant = get_model_default_use_reentrant(model, default = True)
+        effective_use_reentrant = resolve_use_reentrant(
+            use_reentrant,
+            default = default_use_reentrant,
+        )
+        set_model_default_use_reentrant(model, effective_use_reentrant)
 
         # Apply gradient checkpointing with smart heuristics
         max_seq = getattr(model, "max_seq_length", 512)
         dtype = model.get_input_embeddings().weight.dtype
         use_gradient_checkpointing = apply_unsloth_gradient_checkpointing(
-            use_gradient_checkpointing, max_seq, dtype, use_reentrant = checkpoint_use_reentrant
+            use_gradient_checkpointing, max_seq, dtype, use_reentrant = effective_use_reentrant
         )
 
         if type(r) is not int:
@@ -3109,7 +3117,7 @@ class FastLlamaModel:
         model = FastLlamaModel.patch_peft_model(
             model,
             use_gradient_checkpointing,
-            use_reentrant = peft_prep_use_reentrant,
+            use_reentrant = effective_use_reentrant,
         )
 
         if ensure_weight_tying:
@@ -3214,17 +3222,11 @@ class FastLlamaModel:
         use_reentrant = True,
     ):
         if os.environ.get("UNSLOTH_USE_NEW_MODEL", "0") == "1":
-            try:
-                return FastBaseModel.patch_peft_model(
-                    model = model,
-                    use_gradient_checkpointing = use_gradient_checkpointing,
-                    use_reentrant = use_reentrant,
-                )
-            except TypeError:
-                return FastBaseModel.patch_peft_model(
-                    model = model,
-                    use_gradient_checkpointing = use_gradient_checkpointing,
-                )
+            return FastBaseModel.patch_peft_model(
+                model = model,
+                use_gradient_checkpointing = use_gradient_checkpointing,
+                use_reentrant = use_reentrant,
+            )
         if not isinstance(model, PeftModelForCausalLM) and not isinstance(
             model, PeftModelForSequenceClassification
         ):

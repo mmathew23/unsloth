@@ -1007,7 +1007,12 @@ def LlamaModel_fast_forward(
 
     # Check checkpointing method
     gradient_checkpointing = False
-
+    checkpoint_use_reentrant = get_model_default_use_reentrant(self, default = True)
+    configured_checkpoint_use_reentrant = getattr(
+        self, "_gradient_checkpointing_use_reentrant", None
+    )
+    if type(configured_checkpoint_use_reentrant) is bool:
+        checkpoint_use_reentrant = configured_checkpoint_use_reentrant
     if self.gradient_checkpointing and self.training and not use_cache:
         gradient_checkpointing = True
 
@@ -1148,7 +1153,7 @@ def LlamaModel_fast_forward(
                 mask,
                 attention_mask,
                 position_ids,
-                use_reentrant = True,
+                use_reentrant = checkpoint_use_reentrant,
                 preserve_rng_state = False,
             )
             hidden_states = layer_outputs[0]
@@ -3533,6 +3538,19 @@ class FastLlamaModel:
         for module in model.modules():
             if hasattr(module, "gradient_checkpointing"):
                 module.gradient_checkpointing = use_gradient_checkpointing
+        if use_gradient_checkpointing:
+            # Ensure GradientCheckpointingLayer.__call__ uses the explicit
+            # user-selected mode instead of stale/default checkpoint kwargs.
+            checkpoint_fn = torch.utils.checkpoint.checkpoint
+            effective_use_reentrant = get_model_default_use_reentrant(
+                model, default = True
+            )
+            for module in model.modules():
+                if hasattr(module, "_gradient_checkpointing_func"):
+                    module._gradient_checkpointing_func = functools.partial(
+                        checkpoint_fn,
+                        use_reentrant = effective_use_reentrant,
+                    )
 
         # Also re-enable training for embeddings for NEFTune
         if hasattr(model, "get_input_embeddings"):

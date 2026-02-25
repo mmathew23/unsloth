@@ -1180,19 +1180,17 @@ def _patch_trl_rl_trainers(trainer_file = "grpo_trainer"):
     RLConfig_call_args = call_args
 
     # TRL 0.27.0+ forces use_reentrant=False in gradient_checkpointing_kwargs.
-    # Keep this override only when users opted into reentrant mode.
+    # Always strip this override so Unsloth controls checkpoint mode explicitly.
     RLConfig_post = ""
     if trl_version >= Version("0.27.0") and RLConfig_name == "GRPOConfig":
-        use_reentrant = bool(
-            getattr(unsloth_gc, "UNSLOTH_GC_PATCH_USE_REENTRANT", True)
+        RLConfig_post = (
+            "        # Unsloth: Remove use_reentrant=False forced by TRL 0.27.0+\n"
+            "        print('Unsloth debug: RLConfig_post executed; checking gradient_checkpointing_kwargs use_reentrant override')\n"
+            "        if getattr(self, 'gradient_checkpointing_kwargs', None) is not None:\n"
+            "            if 'use_reentrant' in self.gradient_checkpointing_kwargs:\n"
+            "                del self.gradient_checkpointing_kwargs['use_reentrant']\n"
+            "                print('Unsloth debug: removed gradient_checkpointing_kwargs[\\'use_reentrant\\'] from RLConfig')\n"
         )
-        if use_reentrant:
-            RLConfig_post = (
-                "        # Unsloth: Remove use_reentrant=False forced by TRL 0.27.0+\n"
-                "        if getattr(self, 'gradient_checkpointing_kwargs', None) is not None:\n"
-                "            if 'use_reentrant' in self.gradient_checkpointing_kwargs:\n"
-                "                del self.gradient_checkpointing_kwargs['use_reentrant']\n"
-            )
 
     # Patch vLLM and other functions
     RLTrainer_extras = patch_functions(

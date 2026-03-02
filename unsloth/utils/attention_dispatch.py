@@ -48,13 +48,7 @@ XFORMERS_BLOCK_DIAG_CLS = (
 
 
 def _is_reentrant_checkpoint_active() -> bool:
-    if os.environ.get("UNSLOTH_GC_DISABLE_REENTRANT_LAYOUT_GUARD", "0") == "1":
-        return False
-    try:
-        from unsloth_zoo.gradient_checkpointing import is_reentrant_checkpoint_active
-        return bool(is_reentrant_checkpoint_active())
-    except Exception:
-        return False
+    return False
 
 
 @dataclass

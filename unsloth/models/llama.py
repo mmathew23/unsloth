@@ -1008,11 +1008,6 @@ def LlamaModel_fast_forward(
     # Check checkpointing method
     gradient_checkpointing = False
     checkpoint_use_reentrant = get_model_default_use_reentrant(self, default = True)
-    configured_checkpoint_use_reentrant = getattr(
-        self, "_gradient_checkpointing_use_reentrant", None
-    )
-    if type(configured_checkpoint_use_reentrant) is bool:
-        checkpoint_use_reentrant = configured_checkpoint_use_reentrant
     if self.gradient_checkpointing and self.training and not use_cache:
         gradient_checkpointing = True
 
@@ -2734,7 +2729,6 @@ class FastLlamaModel:
                 use_reentrant,
                 default = default_use_reentrant,
             )
-            set_model_default_use_reentrant(model, effective_use_reentrant)
             # Check for other PEFT args in kwargs
             for peft_arg, flag in (
                 ("finetune_vision_layers", False),

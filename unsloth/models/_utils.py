@@ -205,40 +205,22 @@ def resolve_use_reentrant(use_reentrant: Optional[bool], default: bool = True) -
 def set_model_default_use_reentrant(model: Any, use_reentrant: bool) -> None:
     if type(use_reentrant) is not bool:
         raise TypeError("Unsloth: `use_reentrant` must be a boolean.")
-    if model is None:
-        return
-    queue = [model]
-    seen = set()
-    while queue:
-        m = queue.pop()
-        if m is None or id(m) in seen:
-            continue
-        seen.add(id(m))
+    m = model
+    while m is not None:
         try:
-            setattr(m, "_unsloth_use_reentrant", bool(use_reentrant))
+            m._unsloth_use_reentrant = bool(use_reentrant)
         except Exception:
-            pass
-        for attr in ("model", "base_model"):
-            child = getattr(m, attr, None)
-            if child is not None and id(child) not in seen:
-                queue.append(child)
+            break
+        next_m = getattr(m, "model", None)
+        if next_m is None or next_m is m:
+            break
+        m = next_m
 
 
 def get_model_default_use_reentrant(model: Any, default: bool = True) -> bool:
-    queue = [model]
-    seen = set()
-    while queue:
-        m = queue.pop()
-        if m is None or id(m) in seen:
-            continue
-        seen.add(id(m))
-        value = getattr(m, "_unsloth_use_reentrant", None)
-        if type(value) is bool:
-            return value
-        for attr in ("model", "base_model"):
-            child = getattr(m, attr, None)
-            if child is not None and id(child) not in seen:
-                queue.append(child)
+    value = getattr(model, "_unsloth_use_reentrant", None)
+    if type(value) is bool:
+        return value
     return bool(default)
 
 

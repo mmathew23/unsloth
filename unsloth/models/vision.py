@@ -1311,19 +1311,6 @@ class FastBaseModel:
                 "`use_reentrant=False` to avoid DDP marked-ready-twice errors."
             )
             use_reentrant = False
-        # if not use_reentrant:
-        #     # Under DDP, avoid the offloaded/re-entrant checkpoint patch.
-        #     unpatch_unsloth_gradient_checkpointing()
-        #     unpatch_unsloth_smart_gradient_checkpointing()
-        #     # Force native checkpoint to default to non-reentrant for downstream calls.
-        #     _orig_checkpoint = torch_checkpoint.checkpoint
-
-        #     def _nonre_checkpoint(function, *args, **kwargs):
-        #         kwargs["use_reentrant"] = False
-        #         return _orig_checkpoint(function, *args, **kwargs)
-
-        #     torch_checkpoint.checkpoint = _nonre_checkpoint
-        #     hf_modeling_utils.checkpoint = _nonre_checkpoint
 
         model = prepare_model_for_training(
             model,

@@ -281,12 +281,65 @@ class ContextParallelManager:
             mask_packed_sequence_boundaries(shift_labels, packed_seq_lengths)
         inputs["shift_labels"] = shift_labels
 
+    def _pad_inputs_for_context_parallel(self, inputs: dict[str, torch.Tensor]) -> None:
+        """
+        Right-pad sequence buffers so PyTorch context_parallel load balancing can shard.
+
+        PyTorch's ring attention path currently expects sequence length to be divisible by
+        ``2 * cp_size``. Variable-length packed batches can violate this constraint.
+        We pad with ignore / masked values so training semantics stay unchanged.
+        """
+        multiple = max(int(self.settings.size) * 2, 1)
+        if multiple <= 1:
+            return
+
+        seq_len = None
+        for name in _BUFFER_NAMES:
+            tensor = inputs.get(name)
+            if isinstance(tensor, torch.Tensor) and tensor.ndim > 1:
+                seq_len = int(tensor.size(1))
+                break
+        if seq_len is None:
+            return
+
+        pad_len = (-seq_len) % multiple
+        if pad_len == 0:
+            return
+
+        def _pad_sequence_tensor(name: str, tensor: torch.Tensor) -> torch.Tensor:
+            if tensor.ndim <= 1:
+                return tensor
+            if name in ("labels", "shift_labels"):
+                return F.pad(tensor, (0, pad_len), value = -100)
+            if name == "attention_mask":
+                pad_value = False if tensor.dtype == torch.bool else 0
+                return F.pad(tensor, (0, pad_len), value = pad_value)
+            if name == "position_ids":
+                if tensor.size(1) == 0:
+                    padding = torch.arange(
+                        pad_len, device = tensor.device, dtype = tensor.dtype
+                    ).view(1, pad_len)
+                else:
+                    start = tensor[:, -1:] + 1
+                    offsets = torch.arange(
+                        pad_len, device = tensor.device, dtype = tensor.dtype
+                    ).view(1, pad_len)
+                    padding = start + offsets
+                return torch.cat([tensor, padding.expand(tensor.size(0), -1)], dim = 1)
+            return F.pad(tensor, (0, pad_len), value = 0)
+
+        for name in _BUFFER_NAMES:
+            tensor = inputs.get(name)
+            if isinstance(tensor, torch.Tensor):
+                inputs[name] = _pad_sequence_tensor(name, tensor)
+
     @contextlib.contextmanager
     def apply(self, inputs: dict[str, torch.Tensor]) -> Iterator[None]:
         """Wrap training step to shard buffers and patch SDPA for ring attention."""
         token = _ACTIVE_MANAGER.set(self)
         self._ensure_position_ids(inputs)
         self._ensure_shift_labels(inputs)
+        self._pad_inputs_for_context_parallel(inputs)
         buffers, seq_dims, no_restore = self._collect_buffers(inputs)
 
         with context_parallel(

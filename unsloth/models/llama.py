@@ -737,6 +737,11 @@ def LlamaAttention_fast_forward(
     K = K.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
     V = V.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
     seq_info = get_packed_info_from_kwargs(kwargs, Q.device)
+    # Context parallel currently uses SDPA ring-attention and does not support
+    # varlen packed attention masks in the attention kernel path.
+    # Keep packed metadata in kwargs for boundary-aware loss masking, but avoid
+    # routing attention through varlen/masked packed kernels under CP.
+    seq_info_for_attention = None if cp_active else seq_info
 
     kv_seq_len = K.shape[-2]
     if past_key_value is not None:
@@ -809,7 +814,7 @@ def LlamaAttention_fast_forward(
     past_key_value = (K, V) if use_cache else None
 
     # Attention module
-    use_varlen = seq_info is not None and past_key_value is None
+    use_varlen = seq_info_for_attention is not None and past_key_value is None
     backend = (
         SDPA if attention_mask is not None else select_attention_backend(use_varlen)
     )
@@ -829,7 +834,7 @@ def LlamaAttention_fast_forward(
         n_heads = n_heads,
         head_dim = head_dim,
         requires_grad = hidden_states.requires_grad,
-        seq_info = seq_info,
+        seq_info = seq_info_for_attention,
         attention_mask = attention_mask,
         causal_mask = causal_mask,
     )

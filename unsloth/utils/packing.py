@@ -171,6 +171,74 @@ def enable_sample_packing(
     collator._unsloth_packing_wrapped = True
 
 
+def enable_context_parallel_packing_metadata(
+    model,
+    trainer,
+    *,
+    sequence_lengths_key: str = "seq_lengths",
+) -> None:
+    """Attach packed sequence metadata without enabling padding-free collation."""
+    if model is None or trainer is None:
+        raise ValueError("model and trainer must not be None")
+
+    mark_allow_overlength(model)
+
+    if hasattr(trainer, "args") and hasattr(trainer.args, "remove_unused_columns"):
+        trainer.args.remove_unused_columns = False
+
+    collator = getattr(trainer, "data_collator", None)
+    if collator is None or not hasattr(collator, "torch_call"):
+        return
+    if getattr(collator, "_unsloth_cp_packing_wrapped", False):
+        return
+
+    original_torch_call = collator.torch_call
+
+    def torch_call_with_cp_packing_metadata(examples: Sequence[dict]):
+        batch = original_torch_call(examples)
+        per_example_lengths: list[list[int]] = []
+        if examples and isinstance(examples[0], dict):
+            for example in examples:
+                lengths = example.get(sequence_lengths_key)
+                if isinstance(lengths, Iterable):
+                    seq_list = [int(length) for length in lengths]
+                    if seq_list:
+                        per_example_lengths.append(seq_list)
+                        continue
+                ids = example.get("input_ids")
+                if isinstance(ids, Iterable):
+                    per_example_lengths.append([len(ids)])
+
+        if per_example_lengths:
+            padded_seq_len = None
+            input_ids = batch.get("input_ids")
+            if isinstance(input_ids, torch.Tensor) and input_ids.ndim == 2:
+                padded_seq_len = int(input_ids.shape[1])
+                # Dense multi-row packed batches under CP currently use SDPA ring attention
+                # without packed attention masks. Attaching flattened packed metadata here
+                # can over-mask labels across row offsets and destabilize loss.
+                if input_ids.shape[0] > 1:
+                    return batch
+
+            flat_lengths: list[int] = []
+            for lengths in per_example_lengths:
+                flat_lengths.extend(lengths)
+                if padded_seq_len is not None:
+                    gap = padded_seq_len - sum(lengths)
+                    if gap > 0:
+                        # Preserve row offsets when labels are flattened for boundary masking.
+                        # Padding gaps are already -100 and therefore harmless to mask.
+                        flat_lengths.append(gap)
+
+            batch["packed_seq_lengths"] = torch.tensor(
+                flat_lengths, dtype = torch.int32
+            )
+        return batch
+
+    collator.torch_call = torch_call_with_cp_packing_metadata
+    collator._unsloth_cp_packing_wrapped = True
+
+
 def enable_padding_free_metadata(model, trainer):
     """Inject seq-length metadata when padding-free batching is enabled without packing."""
     collator = getattr(trainer, "data_collator", None)
@@ -345,6 +413,7 @@ __all__ = [
     "configure_sample_packing",
     "configure_padding_free",
     "enable_sample_packing",
+    "enable_context_parallel_packing_metadata",
     "enable_padding_free_metadata",
     "mark_allow_overlength",
     "get_packed_info_from_kwargs",

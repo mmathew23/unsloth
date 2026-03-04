@@ -16,6 +16,7 @@
 from .packing import (
     configure_padding_free,
     configure_sample_packing,
+    enable_context_parallel_packing_metadata,
     enable_padding_free_metadata,
     enable_sample_packing,
     mark_allow_overlength,
@@ -35,6 +36,7 @@ __all__ = [
     "configure_sample_packing",
     "configure_padding_free",
     "enable_sample_packing",
+    "enable_context_parallel_packing_metadata",
     "enable_padding_free_metadata",
     "mark_allow_overlength",
     "AttentionConfig",

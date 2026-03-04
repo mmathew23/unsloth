@@ -27,6 +27,7 @@ from . import is_bfloat16_supported
 from unsloth.utils import (
     configure_padding_free,
     configure_sample_packing,
+    enable_context_parallel_packing_metadata,
     enable_padding_free_metadata,
     enable_sample_packing,
 )
@@ -357,8 +358,6 @@ def _patch_sft_trainer_auto_packing(trl_module):
 
         processing_class = kwargs.get("processing_class") or kwargs.get("tokenizer")
         data_collator = kwargs.get("data_collator")
-
-        # Check if context parallelism is enabled
         cp_size = getattr(config_arg, "context_parallel_size", 1) or 1
         is_context_parallel = cp_size > 1
 
@@ -368,7 +367,6 @@ def _patch_sft_trainer_auto_packing(trl_module):
             or isinstance(processing_class, ProcessorMixin)
             or is_vlm
             or is_unsupported_model
-            or is_context_parallel  # CP uses ring attention which doesn't support packed masks
             or (
                 os.environ.get("UNSLOTH_RETURN_LOGITS", "0") == "1"
             )  # Disable padding free on forced logits
@@ -389,14 +387,24 @@ def _patch_sft_trainer_auto_packing(trl_module):
                 reason = "vision-language model"
             elif is_unsupported_model:
                 reason = f"unsupported model type(s): {', '.join(model_types)}"
-            elif is_context_parallel:
-                reason = "context parallelism enabled"
             message = "Unsloth: Sample packing/padding-free skipped " f"({reason})."
             print(message)
 
         packing_active = False
+        cp_packing_mode = False
         if _should_pack(config_arg) and not blocked:
-            configure_sample_packing(config_arg)
+            if is_context_parallel:
+                # CP + varlen packing is not supported by ring SDPA sharding.
+                # Keep dataset packing enabled, but force non-varlen batching.
+                if hasattr(config_arg, "packing"):
+                    setattr(config_arg, "packing", True)
+                if hasattr(config_arg, "padding_free"):
+                    setattr(config_arg, "padding_free", False)
+                if hasattr(config_arg, "remove_unused_columns"):
+                    setattr(config_arg, "remove_unused_columns", False)
+                cp_packing_mode = True
+            else:
+                configure_sample_packing(config_arg)
             packing_active = True
             logger.info("Unsloth: Sample packing enabled for SFTTrainer instance.")
 
@@ -442,10 +450,33 @@ def _patch_sft_trainer_auto_packing(trl_module):
             and trainer_packing
             and (packing_active or _should_pack(trainer_args))
         ):
-            enable_sample_packing(self.model, self)
-            print(
-                "🦥 Unsloth: Packing enabled - training is >2x faster and uses less VRAM!"
-            )
+            if cp_packing_mode:
+                if trainer_args is not None:
+                    setattr(trainer_args, "padding_free", False)
+                enable_context_parallel_packing_metadata(self.model, self)
+                collator = getattr(self, "data_collator", None)
+                if collator is not None and hasattr(collator, "padding_free"):
+                    # TRL may still default collator.padding_free=True when packing=True.
+                    # CP ring-attention expects dense batches here, so force it off.
+                    collator.padding_free = False
+                if collator is not None and hasattr(collator, "padding"):
+                    collator.padding = "max_length"
+                if collator is not None and hasattr(collator, "max_length"):
+                    max_len = None
+                    if trainer_args is not None:
+                        max_len = getattr(trainer_args, "max_seq_length", None)
+                        if max_len is None:
+                            max_len = getattr(trainer_args, "max_length", None)
+                    if isinstance(max_len, int) and max_len > 0:
+                        collator.max_length = max_len
+                print(
+                    "🦥 Unsloth: Packing enabled for context parallelism."
+                )
+            else:
+                enable_sample_packing(self.model, self)
+                print(
+                    "🦥 Unsloth: Packing enabled - training is >2x faster and uses less VRAM!"
+                )
         elif not blocked and trainer_padding_free:
             enable_padding_free_metadata(self.model, self)
             message = (

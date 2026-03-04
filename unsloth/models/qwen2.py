@@ -55,6 +55,11 @@ class FastQwen2Model(FastLlamaModel):
         Qwen2ForCausalLM.forward = CausalLM_fast_forward(
             LlamaModel_fast_forward_inference
         )
+        setattr(
+            Qwen2ForCausalLM,
+            "_unsloth_supports_context_parallel_shift_labels",
+            True,
+        )
         PeftModelForCausalLM.forward = PeftModel_fast_forward
         fix_prepare_inputs_for_generation(Qwen2ForCausalLM)
 

@@ -550,6 +550,11 @@ class FastGraniteModel(FastLlamaModel):
         GraniteForCausalLM.forward = CausalLM_fast_forward(
             GraniteModel_fast_forward_inference
         )
+        setattr(
+            GraniteForCausalLM,
+            "_unsloth_supports_context_parallel_shift_labels",
+            True,
+        )
         GraniteForCausalLM.__init__ = patched_init(GraniteForCausalLM.__init__)
         PeftModelForCausalLM.forward = PeftModel_fast_forward
         fix_prepare_inputs_for_generation(GraniteForCausalLM)

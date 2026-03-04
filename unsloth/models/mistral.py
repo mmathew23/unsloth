@@ -158,6 +158,7 @@ def MistralForCausalLM_fast_forward(
     past_key_values: Optional[List[torch.FloatTensor]] = None,
     inputs_embeds: Optional[torch.FloatTensor] = None,
     labels: Optional[torch.LongTensor] = None,
+    shift_labels: Optional[torch.LongTensor] = None,
     use_cache: Optional[bool] = None,
     output_attentions: Optional[bool] = None,
     output_hidden_states: Optional[bool] = None,
@@ -359,18 +360,15 @@ def MistralForCausalLM_fast_forward(
     loss = None
     if labels is not None:
         shift_logits = logits
-        # if not hasattr(self, "extra_ignored_labels"):
-        #     # Fixes https://github.com/unslothai/unsloth/issues/10
-        #     self.extra_ignored_labels = torch.full((self.max_seq_length, 1), -100, device = "cuda:0")
-        # pass
-        # shift_labels = torch.hstack((labels[..., 1:], self.extra_ignored_labels[:labels.shape[0]]))
-        shift_labels = torch.empty_like(labels)
-        shift_labels[..., :-1] = labels[..., 1:]
-        shift_labels[..., -1] = -100
-        mask_packed_sequence_boundaries(
-            shift_labels,
-            kwargs.get("packed_seq_lengths"),
-        )
+        has_pre_shift = shift_labels is not None
+        if not has_pre_shift:
+            shift_labels = torch.empty_like(labels)
+            shift_labels[..., :-1] = labels[..., 1:]
+            shift_labels[..., -1] = -100
+            mask_packed_sequence_boundaries(
+                shift_labels,
+                kwargs.get("packed_seq_lengths"),
+            )
         n_items = kwargs.get("num_items_in_batch", None)
         if n_items is None:
             n_items = kwargs.get("n_items", None)
@@ -431,6 +429,11 @@ class FastMistralModel(FastLlamaModel):
         MistralDecoderLayer.forward = LlamaDecoderLayer_fast_forward
         MistralModel.forward = LlamaModel_fast_forward
         MistralForCausalLM.forward = MistralForCausalLM_fast_forward
+        setattr(
+            MistralForCausalLM,
+            "_unsloth_supports_context_parallel_shift_labels",
+            True,
+        )
         PeftModelForCausalLM.forward = PeftModel_fast_forward
         fix_prepare_inputs_for_generation(MistralForCausalLM)
 

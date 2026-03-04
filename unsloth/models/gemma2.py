@@ -602,6 +602,11 @@ class FastGemma2Model(FastLlamaModel):
         Gemma2ForCausalLM.forward = CausalLM_fast_forward(
             Gemma2Model_fast_forward_inference
         )
+        setattr(
+            Gemma2ForCausalLM,
+            "_unsloth_supports_context_parallel_shift_labels",
+            True,
+        )
         PeftModelForCausalLM.forward = PeftModel_fast_forward
         fix_prepare_inputs_for_generation(Gemma2ForCausalLM)
 

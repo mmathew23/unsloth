@@ -724,6 +724,11 @@ class FastFalconH1Model(FastLlamaModel):
         FalconH1ForCausalLM.forward = CausalLM_fast_forward(
             _FalconH1_fast_forward_inference(FalconH1Attention_fast_forward_inference)
         )
+        setattr(
+            FalconH1ForCausalLM,
+            "_unsloth_supports_context_parallel_shift_labels",
+            True,
+        )
         PeftModelForCausalLM.forward = PeftModel_fast_forward
         fix_prepare_inputs_for_generation(FalconH1ForCausalLM)
 

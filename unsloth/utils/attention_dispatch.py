@@ -338,7 +338,7 @@ def run_attention(
 
         if use_sdpa_gqa:
             kwargs.setdefault("enable_gqa", True)
-            out = scaled_dot_product_attention(Q, K, V, **kwargs)
+            out = F.scaled_dot_product_attention(Q, K, V, **kwargs)
             return out.transpose(1, 2)
 
         K_mod = K

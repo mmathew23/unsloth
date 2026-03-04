@@ -3,9 +3,11 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import functools
+import os
 import sys
 import warnings
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Iterator, Optional, Tuple
 
 import torch
@@ -34,6 +36,68 @@ _BUFFER_NAMES = (
     "position_ids",
     "shift_labels",
 )
+
+
+@dataclass
+class DistInfo:
+    rank: int
+    local_rank: int
+    world_size: int
+    device: torch.device
+
+
+def init_distributed(
+    *,
+    backend: str = "nccl",
+    timeout: timedelta = timedelta(minutes=30),
+) -> DistInfo:
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
+    if dist.is_available() and dist.is_initialized():
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+    else:
+        dist.init_process_group(
+            backend=backend,
+            init_method="env://",
+            timeout=timeout,
+            device_id=device if device.type == "cuda" else None,
+        )
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ.get("LOCAL_RANK", rank))
+        device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+    return DistInfo(rank=rank, local_rank=local_rank, world_size=world_size, device=device)
+
+
+def init_mesh(
+    dp: int,
+    *,
+    tp: int = 1,
+    cp: int = 1,
+    device_type: str = "cuda",
+) -> DeviceMesh:
+    if not (dist.is_available() and dist.is_initialized()):
+        raise RuntimeError("torch.distributed must be initialized before init_mesh().")
+    world_size = dist.get_world_size()
+    if dp * tp * cp != world_size:
+        raise ValueError(
+            f"dp*tp*cp must equal world_size "
+            f"(dp={dp}, tp={tp}, cp={cp}, world_size={world_size})."
+        )
+    shape = []
+    names = []
+    for size, name in ((dp, "dp"), (tp, "tp"), (cp, "cp")):
+        if size > 1:
+            shape.append(size)
+            names.append(name)
+    if not shape:
+        shape, names = [1], ["dp"]
+
+    from torch.distributed.device_mesh import init_device_mesh
+    return init_device_mesh(device_type, tuple(shape), mesh_dim_names=tuple(names))
 
 
 def get_cp_manager() -> Optional["ContextParallelManager"]:
@@ -94,20 +158,48 @@ def _attach_context_parallel_attention_hooks(model: torch.nn.Module) -> list:
 
 
 class ContextParallelManager:
-    """Toggles PyTorch context parallelism."""
+    """Toggles PyTorch context parallelism.
 
-    def __init__(self, settings: ContextParallelSettings):
+    Args:
+        settings: CP configuration (size, etc.).
+        device_mesh: Optional pre-built DeviceMesh (e.g. from Accelerate / FSDP2).
+            Must contain a ``"cp"`` dimension whose size equals ``settings.size``.
+            When *None*, a ``(dp, cp)`` mesh is created automatically with
+            ``dp = world_size // cp_size``.
+    """
+
+    def __init__(
+        self,
+        settings: ContextParallelSettings,
+        device_mesh: Optional[DeviceMesh] = None,
+    ):
         self.settings = settings
-        self._mesh: Optional[DeviceMesh] = None
-        self._device_mesh: Optional[DeviceMesh] = None
-        self._cp_group: Optional[dist.ProcessGroup] = None
-        self._cp_rank_index: int = 0
-        self._dp_world_size: int = 1
         self._world_size: int = dist.get_world_size()
         self._report_loss: Optional[torch.Tensor] = None
         self._attention_hook_handles: list = []
-        self._mesh = self._build_mesh()
-        self._device_mesh = self._build_device_mesh()
+
+        if device_mesh is not None:
+            # Validate the external mesh has a matching cp dimension.
+            names = getattr(device_mesh, "mesh_dim_names", ())
+            if "cp" not in names:
+                raise ValueError(
+                    "Provided device_mesh must contain a 'cp' dimension, "
+                    f"got dimensions: {names}"
+                )
+            cp_dim_size = device_mesh.size(mesh_dim = "cp")
+            if cp_dim_size != settings.size:
+                raise ValueError(
+                    f"device_mesh 'cp' dimension size ({cp_dim_size}) "
+                    f"!= settings.size ({settings.size})."
+                )
+            self._full_mesh: DeviceMesh = device_mesh
+        else:
+            dp = self._world_size // settings.size
+            self._full_mesh = init_mesh(dp, cp = settings.size, device_type = DEVICE_TYPE_TORCH)
+
+        # 1D submesh for PyTorch's context_parallel() API (requires 1D).
+        self._cp_mesh: DeviceMesh = self._full_mesh["cp"]
+        self._cp_group: dist.ProcessGroup = self._cp_mesh.get_group()
 
     def attach_attention_hooks(self, model: torch.nn.Module) -> None:
         """
@@ -118,39 +210,39 @@ class ContextParallelManager:
             return
         self._attention_hook_handles = _attach_context_parallel_attention_hooks(model)
 
-    def _build_mesh(self) -> DeviceMesh:
-        rank = torch.distributed.get_rank()
-        group_index = rank // self.settings.size
-        start = group_index * self.settings.size
-        cp_ranks = torch.arange(start, start + self.settings.size, dtype = torch.int64)
-        mesh = DeviceMesh(DEVICE_TYPE_TORCH, cp_ranks)
-        self._cp_group = mesh.get_group()
-        self._cp_rank_index = int(rank - start)
-        return mesh
-
-    def _build_device_mesh(self) -> DeviceMesh:
-        self._dp_world_size = self._world_size // self.settings.size
-        mesh = torch.arange(self._world_size, dtype = torch.int64).reshape(
-            self._dp_world_size, self.settings.size
-        )
-        return DeviceMesh(
-            DEVICE_TYPE_TORCH, mesh, mesh_dim_names = ("dp_replicate", "cp")
-        )
-
     @property
     def device_mesh(self) -> Optional[DeviceMesh]:
-        return self._device_mesh
+        return self._full_mesh
 
     @property
     def data_parallel_world_size(self) -> int:
-        return self._dp_world_size
+        """Product of all non-CP mesh dimensions (handles dp, fsdp, hsdp, tp)."""
+        total = 1
+        for name in self._full_mesh.mesh_dim_names:
+            if name != "cp":
+                total *= self._full_mesh.size(mesh_dim = name)
+        return total
 
     @property
     def cp_rank_index(self) -> int:
-        return self._cp_rank_index
+        return self._full_mesh.get_local_rank(mesh_dim = "cp")
 
     def data_parallel_rank(self) -> int:
-        return dist.get_rank() // self.settings.size
+        """Flat rank across all non-CP mesh dimensions.
+
+        For (dp=4, cp=2): returns 0..3.
+        For (dp_replicate=2, dp_shard=2, cp=2): returns 0..3
+        (i.e. replicate_rank * dp_shard + shard_rank).
+        """
+        flat_rank = 0
+        stride = 1
+        for name in reversed(self._full_mesh.mesh_dim_names):
+            if name == "cp":
+                continue
+            local_rank = self._full_mesh.get_local_rank(mesh_dim = name)
+            flat_rank += local_rank * stride
+            stride *= self._full_mesh.size(mesh_dim = name)
+        return flat_rank
 
     def _collect_buffers(
         self, inputs: dict[str, torch.Tensor]
@@ -198,7 +290,7 @@ class ContextParallelManager:
         buffers, seq_dims, no_restore = self._collect_buffers(inputs)
 
         with context_parallel(
-            self._mesh,
+            self._cp_mesh,
             buffers = buffers,
             buffer_seq_dims = seq_dims,
             no_restore_buffers = no_restore,
@@ -361,30 +453,38 @@ def patch_sft_trainer() -> None:
                     f"({dist.get_world_size()}). Launch with at least {settings.size} processes."
                 )
             else:
-                self._context_parallel_manager = ContextParallelManager(settings)
+                # Check if Accelerate already provides a mesh (e.g. from FSDP2).
+                # If it has a "cp" dimension, reuse it so all parallelism
+                # strategies share the same topology.
+                accelerator = getattr(self, "accelerator", None)
+                existing_mesh = (
+                    getattr(accelerator, "torch_device_mesh", None)
+                    if accelerator is not None
+                    else None
+                )
+                has_cp_dim = "cp" in getattr(existing_mesh, "mesh_dim_names", ())
+                external_mesh = existing_mesh if has_cp_dim else None
+                self._context_parallel_manager = ContextParallelManager(
+                    settings, device_mesh = external_mesh,
+                )
         else:
             self._context_parallel_manager = None
+
         accelerator = getattr(self, "accelerator", None)
         manager = self._context_parallel_manager
         if manager:
             print(
                 f"Unsloth: Context parallelism enabled with size={manager.settings.size}"
             )
-        mesh = getattr(manager, "device_mesh", None) if manager else None
-        existing_mesh = (
-            getattr(accelerator, "torch_device_mesh", None)
-            if accelerator is not None
-            else None
-        )
-        if (
-            accelerator is not None
-            and mesh is not None
-            and (
-                existing_mesh is None
-                or "cp" not in getattr(existing_mesh, "mesh_dim_names", ())
-            )
-        ):
-            setattr(accelerator.state, "device_mesh", mesh)
+
+        # Publish our mesh to Accelerate so DDP / FSDP2 can see the
+        # full topology.  Skip if Accelerate already has one with a cp dim
+        # (we reused it above).
+        if accelerator is not None and manager is not None:
+            existing_mesh = getattr(accelerator, "torch_device_mesh", None)
+            has_cp_dim = "cp" in getattr(existing_mesh, "mesh_dim_names", ())
+            if not has_cp_dim:
+                setattr(accelerator.state, "device_mesh", manager.device_mesh)
 
         # Enable sync_each_batch when using CP to ensure consistent computation graph
         # for DDP + static_graph mode. This is needed because ring attention changes

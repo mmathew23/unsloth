@@ -235,7 +235,7 @@ class Fast_RMS_Layernorm(torch.autograd.Function):
 
 
 # [TODO] Unsure why RMS Layernorm is not torch.compiling properly
-@torch.compiler.disable
+@torch.compiler.disable(recursive = False)
 def fast_rms_layernorm(layernorm, X: torch.Tensor, gemma: bool = False):
     W: torch.Tensor = layernorm.weight
     eps: float = (

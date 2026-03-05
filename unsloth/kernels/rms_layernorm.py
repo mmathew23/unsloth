@@ -234,9 +234,8 @@ class Fast_RMS_Layernorm(torch.autograd.Function):
         return dX, None, None, None
 
 
-# Triton custom autograd.Function kernels are not traceable by Dynamo,
-# so we disable this function but allow its callers to be compiled.
-@torch.compiler.disable(recursive = False)
+# [TODO] Unsure why RMS Layernorm is not torch.compiling properly
+@torch.compiler.disable
 def fast_rms_layernorm(layernorm, X: torch.Tensor, gemma: bool = False):
     W: torch.Tensor = layernorm.weight
     eps: float = (

@@ -1636,7 +1636,7 @@ def CausalLM_fast_forward(fast_forward_inference):
     return _CausalLM_fast_forward
 
 
-@torch.compiler.disable(recursive = False)
+@torch._disable_dynamo
 def PeftModel_fast_forward(
     self,
     input_ids = None,

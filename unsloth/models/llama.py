@@ -737,11 +737,80 @@ def LlamaAttention_fast_forward(
     K = K.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
     V = V.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
     seq_info = get_packed_info_from_kwargs(kwargs, Q.device)
-    # Context parallel currently uses SDPA ring-attention and does not support
-    # varlen packed attention masks in the attention kernel path.
-    # Keep packed metadata in kwargs for boundary-aware loss masking, but avoid
-    # routing attention through varlen/masked packed kernels under CP.
-    seq_info_for_attention = None if cp_active else seq_info
+    # Keep packed metadata for attention.
+    seq_info_for_attention = seq_info
+    if cp_active and seq_info_for_attention is not None:
+        global_lengths, _, _ = seq_info_for_attention
+        padded_total = q_len * max(cp_size, 1)
+        lengths = global_lengths
+        current_total = int(lengths.sum().item())
+        if current_total < padded_total:
+            # CP right-padding adds ignored tail tokens which should be treated as
+            # a separate packed segment so local masks keep the expected shape.
+            pad_tail = torch.tensor(
+                [padded_total - current_total], dtype = torch.int32, device = Q.device
+            )
+            lengths = torch.cat([lengths, pad_tail], dim = 0)
+        elif current_total > padded_total:
+            seq_info_for_attention = None
+
+        if seq_info_for_attention is not None:
+            if cp_size > 1 and padded_total % (cp_size * 2) == 0:
+                load_balance_enabled = True
+                try:
+                    from torch.distributed.tensor.experimental import _attention as _cp_attention
+
+                    options = getattr(_cp_attention, "_cp_options", None)
+                    if options is not None:
+                        load_balance_enabled = bool(
+                            getattr(options, "enable_load_balance", True)
+                        )
+                except Exception:
+                    load_balance_enabled = True
+
+                if load_balance_enabled:
+                    chunk_size = padded_total // (cp_size * 2)
+                    chunk_order = []
+                    for cp_rank in range(cp_size):
+                        chunk_order.append(cp_rank)
+                        chunk_order.append(cp_size * 2 - cp_rank - 1)
+
+                    boundaries = []
+                    cursor = 0
+                    for length in lengths.tolist():
+                        length = int(length)
+                        if length <= 0:
+                            continue
+                        boundaries.append((cursor, cursor + length))
+                        cursor += length
+
+                    reordered_lengths = []
+                    for chunk_idx in chunk_order:
+                        chunk_start = chunk_idx * chunk_size
+                        chunk_end = chunk_start + chunk_size
+                        for seq_start, seq_end in boundaries:
+                            overlap_start = max(seq_start, chunk_start)
+                            overlap_end = min(seq_end, chunk_end)
+                            if overlap_end > overlap_start:
+                                reordered_lengths.append(overlap_end - overlap_start)
+                            if seq_start >= chunk_end:
+                                break
+
+                    if reordered_lengths:
+                        lengths = torch.tensor(
+                            reordered_lengths, dtype = torch.int32, device = Q.device
+                        )
+
+            # Rebuild cumulative lengths if we injected CP padding tail.
+            if lengths is not global_lengths:
+                cu = torch.empty(
+                    lengths.numel() + 1,
+                    dtype = torch.int32,
+                    device = Q.device,
+                )
+                cu[0] = 0
+                torch.cumsum(lengths, dim = 0, dtype = torch.int32, out = cu[1:])
+                seq_info_for_attention = (lengths, cu, int(lengths.max().item()))
 
     kv_seq_len = K.shape[-2]
     if past_key_value is not None:
@@ -814,7 +883,10 @@ def LlamaAttention_fast_forward(
     past_key_value = (K, V) if use_cache else None
 
     # Attention module
-    use_varlen = seq_info_for_attention is not None and past_key_value is None
+    # CP still uses SDPA backend, but can consume seq_info for packed mask building.
+    use_varlen = (
+        seq_info_for_attention is not None and past_key_value is None and not cp_active
+    )
     backend = (
         SDPA if attention_mask is not None else select_attention_backend(use_varlen)
     )

@@ -382,7 +382,7 @@ class ContextParallelManager:
         else:
             tensor = loss
 
-        # Sum across ranks and divide by cp_size for correct mean.
+        # Average across CP ranks for reporting.
         global_loss = tensor.detach().clone()
         dist.all_reduce(global_loss, op = dist.ReduceOp.SUM, group = self._cp_group)
         global_loss = global_loss / self.settings.size
@@ -572,10 +572,37 @@ def patch_sft_trainer() -> None:
             # unsloth_fused_ce_loss with the pre-shifted labels.
             # We keep labels so the fused CE loss path is triggered (requires labels is not None).
 
-            # Scale by GA and cp_size to match gradient behavior of CP=1.
-            ga_steps = getattr(self.args, "gradient_accumulation_steps", 1)
-            cp_size = manager.settings.size
-            inputs["num_items_in_batch"] = global_tokens * ga_steps / cp_size
+            # Preserve trainer-provided normalization when available.
+            n_items = kwargs.get("num_items_in_batch", kwargs.get("n_items", None))
+            if n_items is None:
+                ga_steps = getattr(self.args, "gradient_accumulation_steps", 1)
+                # global_tokens is already reduced across the CP group.
+                n_items = global_tokens * ga_steps
+            cp_size = max(int(getattr(manager.settings, "size", 1)), 1)
+            if cp_size > 1:
+                # CP ranks process sequence shards for the same DP batch, while DDP
+                # still averages gradients across all ranks. Convert token counts to
+                # per-rank normalization to avoid an extra 1/cp shrink.
+                #
+                # When `average_tokens_across_devices=True`, trainer-provided
+                # `num_items_in_batch` has already been gathered across *all* ranks
+                # (including duplicated CP replicas), so we must divide by both
+                # world_size and cp_size.
+                if (
+                    kwargs.get("num_items_in_batch", kwargs.get("n_items", None))
+                    is not None
+                    and bool(getattr(self.args, "average_tokens_across_devices", False))
+                    and dist.is_available()
+                    and dist.is_initialized()
+                ):
+                    divisor = cp_size * dist.get_world_size()
+                else:
+                    divisor = cp_size
+                if torch.is_tensor(n_items):
+                    n_items = n_items / divisor
+                else:
+                    n_items = float(n_items) / divisor
+            inputs["num_items_in_batch"] = n_items
 
             outputs = model(**inputs)
             loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]

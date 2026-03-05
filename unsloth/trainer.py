@@ -27,7 +27,6 @@ from . import is_bfloat16_supported
 from unsloth.utils import (
     configure_padding_free,
     configure_sample_packing,
-    enable_context_parallel_packing_metadata,
     enable_padding_free_metadata,
     enable_sample_packing,
 )
@@ -391,20 +390,10 @@ def _patch_sft_trainer_auto_packing(trl_module):
             print(message)
 
         packing_active = False
-        cp_packing_mode = False
         if _should_pack(config_arg) and not blocked:
-            if is_context_parallel:
-                # CP + varlen packing is not supported by ring SDPA sharding.
-                # Keep dataset packing enabled, but force non-varlen batching.
-                if hasattr(config_arg, "packing"):
-                    setattr(config_arg, "packing", True)
-                if hasattr(config_arg, "padding_free"):
-                    setattr(config_arg, "padding_free", False)
-                if hasattr(config_arg, "remove_unused_columns"):
-                    setattr(config_arg, "remove_unused_columns", False)
-                cp_packing_mode = True
-            else:
-                configure_sample_packing(config_arg)
+            # Keep packing semantics consistent across single / DDP / CP.
+            # CP label masking is handled in context_parallel.py via shift_labels.
+            configure_sample_packing(config_arg)
             packing_active = True
             logger.info("Unsloth: Sample packing enabled for SFTTrainer instance.")
 
@@ -450,30 +439,12 @@ def _patch_sft_trainer_auto_packing(trl_module):
             and trainer_packing
             and (packing_active or _should_pack(trainer_args))
         ):
-            if cp_packing_mode:
-                if trainer_args is not None:
-                    setattr(trainer_args, "padding_free", False)
-                enable_context_parallel_packing_metadata(self.model, self)
-                collator = getattr(self, "data_collator", None)
-                if collator is not None and hasattr(collator, "padding_free"):
-                    # TRL may still default collator.padding_free=True when packing=True.
-                    # CP ring-attention expects dense batches here, so force it off.
-                    collator.padding_free = False
-                if collator is not None and hasattr(collator, "padding"):
-                    collator.padding = "max_length"
-                if collator is not None and hasattr(collator, "max_length"):
-                    max_len = None
-                    if trainer_args is not None:
-                        max_len = getattr(trainer_args, "max_seq_length", None)
-                        if max_len is None:
-                            max_len = getattr(trainer_args, "max_length", None)
-                    if isinstance(max_len, int) and max_len > 0:
-                        collator.max_length = max_len
+            enable_sample_packing(self.model, self)
+            if is_context_parallel:
                 print(
                     "🦥 Unsloth: Packing enabled for context parallelism."
                 )
             else:
-                enable_sample_packing(self.model, self)
                 print(
                     "🦥 Unsloth: Packing enabled - training is >2x faster and uses less VRAM!"
                 )

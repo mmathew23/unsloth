@@ -253,6 +253,27 @@ def run_attention(
             out = out.view(bsz, q_len, n_heads, head_dim)
         return out
     else:
+        cp_manager = get_cp_manager()
+
+        def _maybe_wrap_cp_mask(mask: Optional[Tensor]) -> Optional[Tensor]:
+            if mask is None or cp_manager is None:
+                return mask
+            cp_mesh = getattr(cp_manager, "_cp_mesh", None)
+            if cp_mesh is None:
+                return mask
+            try:
+                from torch.distributed.tensor import DTensor, Replicate
+            except Exception:
+                return mask
+            if isinstance(mask, DTensor):
+                return mask
+            return DTensor.from_local(
+                mask.contiguous(),
+                cp_mesh,
+                [Replicate()],
+                run_check = False,
+            )
+
         local_mask = context.attention_mask
         is_causal_local = False
         if context.seq_info is not None and local_mask is None:
@@ -262,6 +283,7 @@ def run_attention(
                 device = Q.device,
                 sliding_window = sliding_window,
             )
+            local_mask = _maybe_wrap_cp_mask(local_mask)
         else:
             q_len_local = Q.shape[-2]
             k_len_local = K.shape[-2]
@@ -317,6 +339,7 @@ def run_attention(
                         dim = -1, keepdim = True
                     )  # (bsz,1,q_len,1)
                     local_mask = local_mask | no_allowed
+                local_mask = _maybe_wrap_cp_mask(local_mask)
 
             is_causal_local = local_mask is None and q_len_local == k_len_local
 

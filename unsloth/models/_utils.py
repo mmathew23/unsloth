@@ -192,7 +192,8 @@ from unsloth_zoo.temporary_patches import (
 
 
 def apply_unsloth_gradient_checkpointing(
-    use_gradient_checkpointing, max_seq_length, dtype, use_reentrant = None
+    use_gradient_checkpointing, max_seq_length, dtype, use_reentrant = None,
+    sac_policy = None,
 ):
     """
     Apply gradient checkpointing with smart heuristics.
@@ -205,10 +206,24 @@ def apply_unsloth_gradient_checkpointing(
         max_seq_length: The maximum sequence length
         dtype: The model dtype for patching
         use_reentrant: Optional explicit mode override for smart checkpointing
+        sac_policy: Optional SAC policy (requires use_reentrant=False)
 
     Returns:
         The effective use_gradient_checkpointing value (may change from "unsloth" to True)
     """
+    if sac_policy is not None:
+        if use_reentrant is True:
+            raise ValueError(
+                "Unsloth: sac_policy requires use_reentrant=False. "
+                "SAC uses PyTorch's context_fn which is only available "
+                "with non-reentrant checkpointing."
+            )
+        if use_gradient_checkpointing is False:
+            raise ValueError(
+                "Unsloth: sac_policy requires gradient checkpointing to be "
+                "enabled (use_gradient_checkpointing=True or 'unsloth')."
+            )
+
     if use_gradient_checkpointing == "unsloth":
         # Gradient offloading overhead is not worth it for small sequences.
         # Benchmarks show crossover point is around seq_len 384-512.

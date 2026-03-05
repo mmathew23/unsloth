@@ -29,6 +29,7 @@ from ._utils import (
     get_quant_type,
 )
 from .loader_utils import _get_fp8_mode_and_check_settings
+from unsloth_zoo.gradient_checkpointing import _bind_gradient_checkpointing_func
 from ..utils.packing import (
     get_packed_info_from_kwargs,
     mask_packed_sequence_boundaries,
@@ -3572,12 +3573,10 @@ class FastLlamaModel:
             effective_use_reentrant = get_model_default_use_reentrant(
                 model, default = True
             )
-            for module in model.modules():
-                if hasattr(module, "_gradient_checkpointing_func"):
-                    module._gradient_checkpointing_func = functools.partial(
-                        checkpoint_fn,
-                        use_reentrant = effective_use_reentrant,
-                    )
+            context_fn = getattr(model, "_unsloth_sac_context_fn", None)
+            _bind_gradient_checkpointing_func(
+                model, checkpoint_fn, effective_use_reentrant, context_fn,
+            )
 
         # Also re-enable training for embeddings for NEFTune
         if hasattr(model, "get_input_embeddings"):

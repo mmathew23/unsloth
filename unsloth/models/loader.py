@@ -237,6 +237,7 @@ class FastLanguageModel(FastLlamaModel):
         trust_remote_code = False,
         use_gradient_checkpointing = "unsloth",
         use_reentrant = None,
+        sac_policy = None,
         resize_model_vocab = None,
         revision = None,
         use_exact_model_name = False,
@@ -688,6 +689,7 @@ class FastLanguageModel(FastLlamaModel):
             max_seq_length,
             dtype,
             use_reentrant = effective_use_reentrant,
+            sac_policy = sac_policy,
         )
 
         # Check if this is local model since the tokenizer gets overwritten
@@ -807,6 +809,11 @@ class FastLanguageModel(FastLlamaModel):
             patch_tiled_mlp(model, patch_options_str = patch_tiled_mlp_choice)
 
         model = _fix_rope_inv_freq(model)
+
+        if sac_policy is not None:
+            from unsloth_zoo.gradient_checkpointing import resolve_sac_context_fn
+            model._unsloth_sac_context_fn = resolve_sac_context_fn(sac_policy)
+
         return model, tokenizer
 
 
@@ -849,6 +856,7 @@ class FastModel(FastBaseModel):
         trust_remote_code = False,
         use_gradient_checkpointing = "unsloth",
         use_reentrant = None,
+        sac_policy = None,
         resize_model_vocab = None,  # [TODO] No effect
         revision = None,
         return_logits = False,  # Return logits
@@ -1355,6 +1363,7 @@ class FastModel(FastBaseModel):
             max_seq_length,
             dtype,
             use_reentrant = effective_use_reentrant,
+            sac_policy = sac_policy,
         )
         with redirector:
             patch_loss_functions(torch_compile = False)
@@ -1548,6 +1557,11 @@ class FastModel(FastBaseModel):
             patch_tiled_mlp(model, patch_options_str = patch_tiled_mlp_choice)
 
         model = _fix_rope_inv_freq(model)
+
+        if sac_policy is not None:
+            from unsloth_zoo.gradient_checkpointing import resolve_sac_context_fn
+            model._unsloth_sac_context_fn = resolve_sac_context_fn(sac_policy)
+
         return model, tokenizer
 
 

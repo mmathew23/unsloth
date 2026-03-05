@@ -37,6 +37,7 @@ from ..models.loader_utils import is_distributed
 from unsloth_zoo.gradient_checkpointing import (
     unpatch_unsloth_gradient_checkpointing,
     unpatch_unsloth_smart_gradient_checkpointing,
+    _bind_gradient_checkpointing_func,
 )
 import torch.utils.checkpoint as torch_checkpoint
 import transformers.modeling_utils as hf_modeling_utils
@@ -1545,12 +1546,10 @@ class FastBaseModel:
             effective_use_reentrant = get_model_default_use_reentrant(
                 model, default = True
             )
-            for module in model.modules():
-                if hasattr(module, "_gradient_checkpointing_func"):
-                    module._gradient_checkpointing_func = functools.partial(
-                        checkpoint_fn,
-                        use_reentrant = effective_use_reentrant,
-                    )
+            context_fn = getattr(model, "_unsloth_sac_context_fn", None)
+            _bind_gradient_checkpointing_func(
+                model, checkpoint_fn, effective_use_reentrant, context_fn,
+            )
 
         # Also re-enable training for embeddings for NEFTune
         if hasattr(model, "get_input_embeddings"):

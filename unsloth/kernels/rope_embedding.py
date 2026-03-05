@@ -277,7 +277,8 @@ class Fast_RoPE_Embedding(torch.autograd.Function):
         )
 
 
-# [TODO] Unsure why RoPE Embedding is not torch.compiling properly
+# Triton custom autograd.Function kernels are not traceable by Dynamo,
+# so we disable this function but allow its callers to be compiled.
 @torch.compiler.disable(recursive = False)
 def fast_rope_embedding(
     Q,

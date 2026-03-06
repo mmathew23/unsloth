@@ -254,10 +254,16 @@ def resolve_use_reentrant(use_reentrant: Optional[bool], default: bool = True) -
 def set_model_default_use_reentrant(model: Any, use_reentrant: bool) -> None:
     if type(use_reentrant) is not bool:
         raise TypeError("Unsloth: `use_reentrant` must be a boolean.")
+    value = bool(use_reentrant)
+    for module in model.modules():
+        try:
+            module._unsloth_use_reentrant = value
+        except Exception:
+            pass
     m = model
     while m is not None:
         try:
-            m._unsloth_use_reentrant = bool(use_reentrant)
+            m._unsloth_use_reentrant = value
         except Exception:
             break
         next_m = getattr(m, "model", None)

@@ -1547,8 +1547,9 @@ class FastBaseModel:
                 model, default = True
             )
             context_fn = getattr(model, "_unsloth_sac_context_fn", None)
+            offload_backend = getattr(model, "_unsloth_gc_offload_backend", None)
             _bind_gradient_checkpointing_func(
-                model, checkpoint_fn, effective_use_reentrant, context_fn,
+                model, checkpoint_fn, effective_use_reentrant, context_fn, offload_backend,
             )
 
         # Also re-enable training for embeddings for NEFTune

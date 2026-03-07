@@ -251,6 +251,37 @@ def resolve_use_reentrant(use_reentrant: Optional[bool], default: bool = True) -
     return bool(use_reentrant)
 
 
+def _patch_gradient_checkpointing_enable_default(module: Any, default_use_reentrant: bool) -> None:
+    gradient_checkpointing_enable = getattr(module, "gradient_checkpointing_enable", None)
+    if gradient_checkpointing_enable is None:
+        return
+
+    original = getattr(module, "_unsloth_original_gradient_checkpointing_enable", None)
+    if original is None:
+        original = gradient_checkpointing_enable
+        try:
+            module._unsloth_original_gradient_checkpointing_enable = original
+        except Exception:
+            return
+
+    @functools.wraps(original)
+    def wrapped_gradient_checkpointing_enable(*args, **kwargs):
+        gradient_checkpointing_kwargs = kwargs.get("gradient_checkpointing_kwargs", None)
+        if gradient_checkpointing_kwargs is None:
+            effective_use_reentrant = getattr(module, "_unsloth_use_reentrant", None)
+            if type(effective_use_reentrant) is not bool:
+                effective_use_reentrant = bool(default_use_reentrant)
+            kwargs["gradient_checkpointing_kwargs"] = {
+                "use_reentrant": effective_use_reentrant,
+            }
+        return original(*args, **kwargs)
+
+    try:
+        module.gradient_checkpointing_enable = wrapped_gradient_checkpointing_enable
+    except Exception:
+        pass
+
+
 def set_model_default_use_reentrant(model: Any, use_reentrant: bool) -> None:
     if type(use_reentrant) is not bool:
         raise TypeError("Unsloth: `use_reentrant` must be a boolean.")
@@ -258,12 +289,14 @@ def set_model_default_use_reentrant(model: Any, use_reentrant: bool) -> None:
     for module in model.modules():
         try:
             module._unsloth_use_reentrant = value
+            _patch_gradient_checkpointing_enable_default(module, value)
         except Exception:
             pass
     m = model
     while m is not None:
         try:
             m._unsloth_use_reentrant = value
+            _patch_gradient_checkpointing_enable_default(m, value)
         except Exception:
             break
         next_m = getattr(m, "model", None)

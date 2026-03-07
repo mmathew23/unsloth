@@ -311,8 +311,77 @@ def prefer_flex_attn_if_supported(model_class, config):
         return None
 
 
+def _ensure_grad_aware_transformers_flex_attention_cache() -> None:
+    """Patch Transformers' flex-attention wrapper to cache by grad mode too.
+
+    Reentrant checkpointing first runs checkpointed layers under ``no_grad``,
+    then replays them under grad-enabled mode during backward. Transformers'
+    singleton cache only keys on ``training`` by default, which can reuse a
+    graph compiled for the wrong execution mode.
+    """
+    try:
+        import transformers.integrations.flex_attention as flex_integration
+    except Exception:
+        return
+
+    if getattr(flex_integration, "__unsloth_flex_attention_patch__", False):
+        return
+
+    wrapped_cls = getattr(flex_integration, "WrappedFlexAttention", None)
+    flex_attention = getattr(flex_integration, "flex_attention", None)
+    if wrapped_cls is None or flex_attention is None:
+        return
+
+    is_torch_less_or_equal = getattr(flex_integration, "is_torch_less_or_equal", None)
+    get_torch_version = getattr(flex_integration, "get_torch_version", None)
+    version = getattr(flex_integration, "version", None)
+    if is_torch_less_or_equal is None or get_torch_version is None or version is None:
+        return
+
+    class GradAwareWrappedFlexAttention:
+        _instance = None
+        _compiled_flex_attention = {}
+
+        def __new__(cls, *args, **kwargs):
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+            return cls._instance
+
+        @torch.compiler.disable(recursive = False)
+        def __init__(self, training):
+            self.training = bool(training)
+            self.grad_enabled = bool(torch.is_grad_enabled())
+            key = (self.training, self.grad_enabled)
+            if key in self._compiled_flex_attention:
+                return
+
+            if is_torch_less_or_equal("2.5.1"):
+                compiled = torch.compile(flex_attention, dynamic = False)
+            elif version.parse(get_torch_version()).base_version == "2.6.0" and self.training:
+                compiled = torch.compile(
+                    flex_attention, dynamic = False, mode = "max-autotune-no-cudagraphs"
+                )
+            else:
+                compiled = torch.compile(flex_attention)
+            self._compiled_flex_attention[key] = compiled
+
+        def __call__(self):
+            key = (self.training, self.grad_enabled)
+            return self._compiled_flex_attention[key]
+
+    flex_integration.WrappedFlexAttention = GradAwareWrappedFlexAttention
+    flex_integration.__unsloth_flex_attention_patch__ = True
+
+
 for temporary_patch in TEMPORARY_PATCHES:
     temporary_patch()
+
+# Disabled for now: this only hardens Transformers' flex-attention compile cache
+# for the reentrant no_grad -> grad-enabled replay case. It is safe to keep off
+# for the current ship target because the non-reentrant retained-graph fix set
+# does not depend on it, and Gemma's remaining parity drift was not resolved by
+# this patch anyway.
+# _ensure_grad_aware_transformers_flex_attention_cache()
 
 # =============================================
 # Disable some warnings which can get annoying

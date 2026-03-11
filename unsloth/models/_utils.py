@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-__version__ = "2026.3.4"
+__version__ = "2026.3.3"
 
 __all__ = [
     "SUPPORTS_BFLOAT16",
@@ -61,6 +61,9 @@ __all__ = [
     "patch_unsloth_smart_gradient_checkpointing",
     "unpatch_unsloth_smart_gradient_checkpointing",
     "apply_unsloth_gradient_checkpointing",
+    "resolve_use_reentrant",
+    "set_model_default_use_reentrant",
+    "get_model_default_use_reentrant",
     "patch_compiled_autograd",
     "process_vision_info",
     "unsloth_compile_transformers",
@@ -189,7 +192,8 @@ from unsloth_zoo.temporary_patches import (
 
 
 def apply_unsloth_gradient_checkpointing(
-    use_gradient_checkpointing, max_seq_length, dtype
+    use_gradient_checkpointing, max_seq_length, dtype, use_reentrant = None,
+    sac_policy = None,
 ):
     """
     Apply gradient checkpointing with smart heuristics.
@@ -201,10 +205,25 @@ def apply_unsloth_gradient_checkpointing(
         use_gradient_checkpointing: "unsloth", True, False, or None
         max_seq_length: The maximum sequence length
         dtype: The model dtype for patching
+        use_reentrant: Optional explicit mode override for smart checkpointing
+        sac_policy: Optional SAC policy (requires use_reentrant=False)
 
     Returns:
         The effective use_gradient_checkpointing value (may change from "unsloth" to True)
     """
+    if sac_policy is not None:
+        if use_reentrant is True:
+            raise ValueError(
+                "Unsloth: sac_policy requires use_reentrant=False. "
+                "SAC uses PyTorch's context_fn which is only available "
+                "with non-reentrant checkpointing."
+            )
+        if use_gradient_checkpointing is False:
+            raise ValueError(
+                "Unsloth: sac_policy requires gradient checkpointing to be "
+                "enabled (use_gradient_checkpointing=True or 'unsloth')."
+            )
+
     if use_gradient_checkpointing == "unsloth":
         # Gradient offloading overhead is not worth it for small sequences.
         # Benchmarks show crossover point is around seq_len 384-512.
@@ -213,13 +232,84 @@ def apply_unsloth_gradient_checkpointing(
             unpatch_unsloth_smart_gradient_checkpointing()
             return True
         else:
-            patch_unsloth_smart_gradient_checkpointing(dtype = dtype)
+            patch_unsloth_smart_gradient_checkpointing(
+                dtype = dtype,
+                use_reentrant = use_reentrant,
+            )
             return "unsloth"
     elif use_gradient_checkpointing in (True, False):
         # User explicitly set True or False - unpatch any previous "unsloth" patching
         unpatch_unsloth_smart_gradient_checkpointing()
         return use_gradient_checkpointing
     return use_gradient_checkpointing
+
+def resolve_use_reentrant(use_reentrant: Optional[bool], default: bool = True) -> bool:
+    if use_reentrant is None:
+        return bool(default)
+    if type(use_reentrant) is not bool:
+        raise TypeError("Unsloth: `use_reentrant` must be a boolean or None.")
+    return bool(use_reentrant)
+
+
+def _patch_gradient_checkpointing_enable_default(module: Any, default_use_reentrant: bool) -> None:
+    gradient_checkpointing_enable = getattr(module, "gradient_checkpointing_enable", None)
+    if gradient_checkpointing_enable is None:
+        return
+
+    original = getattr(module, "_unsloth_original_gradient_checkpointing_enable", None)
+    if original is None:
+        original = gradient_checkpointing_enable
+        try:
+            module._unsloth_original_gradient_checkpointing_enable = original
+        except Exception:
+            return
+
+    @functools.wraps(original)
+    def wrapped_gradient_checkpointing_enable(*args, **kwargs):
+        gradient_checkpointing_kwargs = kwargs.get("gradient_checkpointing_kwargs", None)
+        if gradient_checkpointing_kwargs is None:
+            effective_use_reentrant = getattr(module, "_unsloth_use_reentrant", None)
+            if type(effective_use_reentrant) is not bool:
+                effective_use_reentrant = bool(default_use_reentrant)
+            kwargs["gradient_checkpointing_kwargs"] = {
+                "use_reentrant": effective_use_reentrant,
+            }
+        return original(*args, **kwargs)
+
+    try:
+        module.gradient_checkpointing_enable = wrapped_gradient_checkpointing_enable
+    except Exception:
+        pass
+
+
+def set_model_default_use_reentrant(model: Any, use_reentrant: bool) -> None:
+    if type(use_reentrant) is not bool:
+        raise TypeError("Unsloth: `use_reentrant` must be a boolean.")
+    value = bool(use_reentrant)
+    for module in model.modules():
+        try:
+            module._unsloth_use_reentrant = value
+            _patch_gradient_checkpointing_enable_default(module, value)
+        except Exception:
+            pass
+    m = model
+    while m is not None:
+        try:
+            m._unsloth_use_reentrant = value
+            _patch_gradient_checkpointing_enable_default(m, value)
+        except Exception:
+            break
+        next_m = getattr(m, "model", None)
+        if next_m is None or next_m is m:
+            break
+        m = next_m
+
+
+def get_model_default_use_reentrant(model: Any, default: bool = True) -> bool:
+    value = getattr(model, "_unsloth_use_reentrant", None)
+    if type(value) is bool:
+        return value
+    return bool(default)
 
 
 def prefer_flex_attn_if_supported(model_class, config):
@@ -254,21 +344,8 @@ def prefer_flex_attn_if_supported(model_class, config):
         return None
 
 
-def _run_temporary_patches(phase):
-    import inspect
-
-    for temporary_patch in TEMPORARY_PATCHES:
-        try:
-            sig = inspect.signature(temporary_patch)
-            if "phase" in sig.parameters:
-                temporary_patch(phase = phase)
-            else:
-                temporary_patch()
-        except (ValueError, TypeError):
-            temporary_patch()
-
-
-_run_temporary_patches("init")
+for temporary_patch in TEMPORARY_PATCHES:
+    temporary_patch()
 
 # =============================================
 # Disable some warnings which can get annoying
@@ -2108,7 +2185,8 @@ def unsloth_compile_transformers(
 
     # Run patches BEFORE compiler so class replacements (e.g. GptOssTopKRouter,
     # GptOssExperts) are in place before the compiler caches references to them.
-    _run_temporary_patches("pre_compile")
+    for temporary_patch in TEMPORARY_PATCHES:
+        temporary_patch()
 
     for model_type in model_types:
         _unsloth_compile_transformers(
@@ -2140,7 +2218,8 @@ def unsloth_compile_transformers(
             supports_sdpa = supports_sdpa,
         )
     # Redo patches which override compiler
-    _run_temporary_patches("post_compile")
+    for temporary_patch in TEMPORARY_PATCHES:
+        temporary_patch()
     return model_types, supports_sdpa[0]
 
 

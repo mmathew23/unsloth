@@ -29,6 +29,7 @@ from ._utils import (
     get_quant_type,
 )
 from .loader_utils import _get_fp8_mode_and_check_settings
+from unsloth_zoo.gradient_checkpointing import _bind_gradient_checkpointing_func
 from ..utils.packing import (
     get_packed_info_from_kwargs,
     mask_packed_sequence_boundaries,
@@ -1091,7 +1092,7 @@ def LlamaModel_fast_forward(
 
     # Check checkpointing method
     gradient_checkpointing = False
-
+    checkpoint_use_reentrant = get_model_default_use_reentrant(self, default = True)
     if self.gradient_checkpointing and self.training and not use_cache:
         gradient_checkpointing = True
 
@@ -1232,7 +1233,7 @@ def LlamaModel_fast_forward(
                 mask,
                 attention_mask,
                 position_ids,
-                use_reentrant = True,
+                use_reentrant = checkpoint_use_reentrant,
                 preserve_rng_state = False,
             )
             hidden_states = layer_outputs[0]
@@ -2207,6 +2208,7 @@ class FastLlamaModel:
         num_labels = None,
         qat_scheme = None,
         load_in_fp8 = False,  # fp8 LoRA (True, False, 'block')
+        use_reentrant = None,
         **kwargs,
     ):
         os.environ["UNSLOTH_USE_NEW_MODEL"] = "0"
@@ -2243,6 +2245,7 @@ class FastLlamaModel:
         token = hf_login(token)
         if model_patcher is None:
             model_patcher = FastLlamaModel
+        effective_use_reentrant = resolve_use_reentrant(use_reentrant, default = True)
         SUPPORTS_BFLOAT16 = is_bfloat16_supported()
 
         if DEVICE_TYPE == "cuda":
@@ -2713,6 +2716,7 @@ class FastLlamaModel:
                                 ):
                                     continue
                                 module.weight[module.padding_idx] = 0
+        set_model_default_use_reentrant(model, effective_use_reentrant)
         return model, tokenizer
 
     @staticmethod
@@ -2751,9 +2755,15 @@ class FastLlamaModel:
         qat_scheme = None,
         target_parameters = None,  # For MoE expert layers (nn.Parameter)
         ensure_weight_tying = False,
+        use_reentrant = None,
         **kwargs,
     ):
         if os.environ.get("UNSLOTH_USE_NEW_MODEL", "0") == "1":
+            default_use_reentrant = get_model_default_use_reentrant(model, default = True)
+            effective_use_reentrant = resolve_use_reentrant(
+                use_reentrant,
+                default = default_use_reentrant,
+            )
             # Check for other PEFT args in kwargs
             for peft_arg, flag in (
                 ("finetune_vision_layers", False),
@@ -2782,6 +2792,7 @@ class FastLlamaModel:
                 temporary_location = temporary_location,
                 target_parameters = target_parameters,
                 ensure_weight_tying = ensure_weight_tying,
+                use_reentrant = effective_use_reentrant,
                 **kwargs,
             )
         if os.environ.get("UNSLOTH_ENABLE_FULL_FINETUNING", "0") == "1":
@@ -2790,12 +2801,18 @@ class FastLlamaModel:
             )
             return model
         transformers_set_seed(random_state)
+        default_use_reentrant = get_model_default_use_reentrant(model, default = True)
+        effective_use_reentrant = resolve_use_reentrant(
+            use_reentrant,
+            default = default_use_reentrant,
+        )
+        set_model_default_use_reentrant(model, effective_use_reentrant)
 
         # Apply gradient checkpointing with smart heuristics
         max_seq = getattr(model, "max_seq_length", 512)
         dtype = model.get_input_embeddings().weight.dtype
         use_gradient_checkpointing = apply_unsloth_gradient_checkpointing(
-            use_gradient_checkpointing, max_seq, dtype
+            use_gradient_checkpointing, max_seq, dtype, use_reentrant = effective_use_reentrant
         )
 
         if type(r) is not int:
@@ -3130,7 +3147,11 @@ class FastLlamaModel:
 
         model._saved_temp_tokenizer = _saved_temp_tokenizer
 
-        model = FastLlamaModel.patch_peft_model(model, use_gradient_checkpointing)
+        model = FastLlamaModel.patch_peft_model(
+            model,
+            use_gradient_checkpointing,
+            use_reentrant = effective_use_reentrant,
+        )
 
         if ensure_weight_tying:
             try:
@@ -3231,11 +3252,13 @@ class FastLlamaModel:
     def patch_peft_model(
         model,
         use_gradient_checkpointing = "unsloth",
+        use_reentrant = True,
     ):
         if os.environ.get("UNSLOTH_USE_NEW_MODEL", "0") == "1":
             return FastBaseModel.patch_peft_model(
                 model = model,
                 use_gradient_checkpointing = use_gradient_checkpointing,
+                use_reentrant = use_reentrant,
             )
         if not isinstance(model, PeftModelForCausalLM) and not isinstance(
             model, PeftModelForSequenceClassification
@@ -3273,7 +3296,7 @@ class FastLlamaModel:
         model = prepare_model_for_kbit_training(
             model,
             use_gradient_checkpointing = use_gradient_checkpointing,
-            use_reentrant = True,
+            use_reentrant = use_reentrant,
         )
 
         # Fix up config for transformers uploading PEFT
@@ -3543,6 +3566,18 @@ class FastLlamaModel:
         for module in model.modules():
             if hasattr(module, "gradient_checkpointing"):
                 module.gradient_checkpointing = use_gradient_checkpointing
+        if use_gradient_checkpointing:
+            # Ensure GradientCheckpointingLayer.__call__ uses the explicit
+            # user-selected mode instead of stale/default checkpoint kwargs.
+            checkpoint_fn = torch.utils.checkpoint.checkpoint
+            effective_use_reentrant = get_model_default_use_reentrant(
+                model, default = True
+            )
+            context_fn = getattr(model, "_unsloth_sac_context_fn", None)
+            offload_backend = getattr(model, "_unsloth_gc_offload_backend", None)
+            _bind_gradient_checkpointing_func(
+                model, checkpoint_fn, effective_use_reentrant, context_fn, offload_backend,
+            )
 
         # Also re-enable training for embeddings for NEFTune
         if hasattr(model, "get_input_embeddings"):

@@ -25,6 +25,14 @@ from .utils import (
 )
 
 
+def _should_allow_inplace_backward_reuse(module, inplace: bool) -> bool:
+    # some inplace optimization break the use_reentrant=False contract
+    # they expect save tensor for backward not to change
+    if not inplace:
+        return False
+    return bool(getattr(module, "_unsloth_use_reentrant", True))
+
+
 class LoRA_MLP(torch.autograd.Function):
     """
     ### LoRA weights
@@ -233,6 +241,7 @@ from .swiglu import swiglu_fg_kernel, swiglu_DWf_DW_dfg_kernel
 
 
 def apply_lora_mlp_swiglu(self, X, inplace = True):
+    inplace = _should_allow_inplace_backward_reuse(self, inplace)
     X = _maybe_fake_quantize_activations(X, self.gate_proj)
     gateW, gateW_quant, gateA, gateB, gateS = get_lora_parameters(self.gate_proj)
     upW, upW_quant, upA, upB, upS = get_lora_parameters(self.up_proj)
@@ -265,6 +274,7 @@ from .geglu import geglu_exact_forward_kernel, geglu_exact_backward_kernel
 
 
 def apply_lora_mlp_geglu_exact(self, X, inplace = True):
+    inplace = _should_allow_inplace_backward_reuse(self, inplace)
     X = _maybe_fake_quantize_activations(X, self.gate_proj)
     gateW, gateW_quant, gateA, gateB, gateS = get_lora_parameters(self.gate_proj)
     upW, upW_quant, upA, upB, upS = get_lora_parameters(self.up_proj)
@@ -296,7 +306,8 @@ def apply_lora_mlp_geglu_exact(self, X, inplace = True):
 from .geglu import geglu_approx_forward_kernel, geglu_approx_backward_kernel
 
 
-def apply_lora_mlp_geglu_approx(self, X):
+def apply_lora_mlp_geglu_approx(self, X, inplace = True):
+    inplace = _should_allow_inplace_backward_reuse(self, inplace)
     X = _maybe_fake_quantize_activations(X, self.gate_proj)
     gateW, gateW_quant, gateA, gateB, gateS = get_lora_parameters(self.gate_proj)
     upW, upW_quant, upA, upB, upS = get_lora_parameters(self.up_proj)
@@ -320,6 +331,7 @@ def apply_lora_mlp_geglu_approx(self, X):
         downS,
         geglu_approx_forward_kernel,
         geglu_approx_backward_kernel,
+        inplace,
     )
     return out
 
@@ -533,6 +545,7 @@ class LoRA_QKV(torch.autograd.Function):
 
 
 def apply_lora_qkv(self, X, inplace = True):
+    inplace = _should_allow_inplace_backward_reuse(self, inplace)
     X = _maybe_fake_quantize_activations(X, self.q_proj)
     QW, QW_quant, QA, QB, QS = get_lora_parameters(self.q_proj)
     KW, KW_quant, KA, KB, KS = get_lora_parameters(self.k_proj)

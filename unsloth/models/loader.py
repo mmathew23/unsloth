@@ -93,6 +93,7 @@ from ._utils import (
     patch_model_and_tokenizer,
     prepare_model_for_kbit_training,
     apply_unsloth_gradient_checkpointing,
+    resolve_use_reentrant,
     patch_compiled_autograd,
     process_vision_info,
     unsloth_compile_transformers,
@@ -235,6 +236,8 @@ class FastLanguageModel(FastLlamaModel):
         fix_tokenizer = True,
         trust_remote_code = False,
         use_gradient_checkpointing = "unsloth",
+        use_reentrant = None,
+        sac_policy = None,
         resize_model_vocab = None,
         revision = None,
         use_exact_model_name = False,
@@ -270,6 +273,7 @@ class FastLanguageModel(FastLlamaModel):
 
         # Login to allow private models
         token = hf_login(token)
+        effective_use_reentrant = resolve_use_reentrant(use_reentrant, default = True)
         # Align dtype with bnb_4bit_compute_dtype if provided and dtype is unset.
         if dtype is None and quantization_config is not None:
             bnb_compute_dtype = None
@@ -312,6 +316,7 @@ class FastLanguageModel(FastLlamaModel):
                 fix_tokenizer = fix_tokenizer,  # [TODO] No effect
                 trust_remote_code = trust_remote_code,
                 use_gradient_checkpointing = use_gradient_checkpointing,
+                use_reentrant = effective_use_reentrant,
                 resize_model_vocab = resize_model_vocab,  # [TODO] No effect
                 revision = revision,
                 return_logits = False,  # Return logits
@@ -397,7 +402,7 @@ class FastLanguageModel(FastLlamaModel):
                     load_in_fp8 = False
 
         # Check if pre-quantized models are allowed
-        # AMD Instinct GPUs need blocksize = 128 on bitsandbytes < 0.49.2 (our pre-quants use blocksize = 64)
+        # For eg AMD Instinct GPUs need blocksize = 128, but our pre-quants are blocksize = 64
         if not ALLOW_PREQUANTIZED_MODELS and model_name.lower().endswith(
             ("-unsloth-bnb-4bit", "-bnb-4bit")
         ):
@@ -537,7 +542,7 @@ class FastLanguageModel(FastLlamaModel):
                     trust_remote_code = trust_remote_code,
                 )
             # Check if pre-quantized models are allowed
-            # AMD Instinct GPUs need blocksize = 128 on bitsandbytes < 0.49.2 (our pre-quants use blocksize = 64)
+            # For eg AMD Instinct GPUs need blocksize = 128, but our pre-quants are blocksize = 64
             if not ALLOW_PREQUANTIZED_MODELS and model_name.lower().endswith(
                 ("-unsloth-bnb-4bit", "-bnb-4bit")
             ):
@@ -656,6 +661,7 @@ class FastLanguageModel(FastLlamaModel):
                 fix_tokenizer = fix_tokenizer,  # [TODO] No effect
                 trust_remote_code = trust_remote_code,
                 use_gradient_checkpointing = use_gradient_checkpointing,
+                use_reentrant = effective_use_reentrant,
                 resize_model_vocab = resize_model_vocab,  # [TODO] No effect
                 revision = revision,
                 return_logits = False,  # Return logits
@@ -679,7 +685,11 @@ class FastLanguageModel(FastLlamaModel):
 
         # Apply gradient checkpointing with smart heuristics
         use_gradient_checkpointing = apply_unsloth_gradient_checkpointing(
-            use_gradient_checkpointing, max_seq_length, dtype
+            use_gradient_checkpointing,
+            max_seq_length,
+            dtype,
+            use_reentrant = effective_use_reentrant,
+            sac_policy = sac_policy,
         )
 
         # Check if this is local model since the tokenizer gets overwritten
@@ -721,6 +731,7 @@ class FastLanguageModel(FastLlamaModel):
             max_lora_rank = max_lora_rank,
             disable_log_stats = disable_log_stats,
             load_in_fp8 = load_in_fp8,
+            use_reentrant = effective_use_reentrant,
             *args,
             **kwargs,
         )
@@ -783,7 +794,11 @@ class FastLanguageModel(FastLlamaModel):
                 trust_remote_code = trust_remote_code,
             )
             # Patch it as well!
-            model = dispatch_model.patch_peft_model(model, use_gradient_checkpointing)
+            model = dispatch_model.patch_peft_model(
+                model,
+                use_gradient_checkpointing,
+                use_reentrant = effective_use_reentrant,
+            )
 
         # Patch Tiled MLP
         # to turn on set UNSLOTH_TILED_MLP to "arctic", "target", or "target:{GB}""
@@ -794,6 +809,11 @@ class FastLanguageModel(FastLlamaModel):
             patch_tiled_mlp(model, patch_options_str = patch_tiled_mlp_choice)
 
         model = _fix_rope_inv_freq(model)
+
+        if sac_policy is not None:
+            from unsloth_zoo.gradient_checkpointing import resolve_sac_context_fn
+            model._unsloth_sac_context_fn = resolve_sac_context_fn(sac_policy)
+
         return model, tokenizer
 
 
@@ -835,6 +855,8 @@ class FastModel(FastBaseModel):
         fix_tokenizer = True,  # [TODO] No effect
         trust_remote_code = False,
         use_gradient_checkpointing = "unsloth",
+        use_reentrant = None,
+        sac_policy = None,
         resize_model_vocab = None,  # [TODO] No effect
         revision = None,
         return_logits = False,  # Return logits
@@ -878,6 +900,7 @@ class FastModel(FastBaseModel):
 
         # Login to allow private models
         token = hf_login(token)
+        effective_use_reentrant = resolve_use_reentrant(use_reentrant, default = True)
         if whisper_language is not None:
             assert type(whisper_language) is str
         if whisper_task is not None:
@@ -1005,7 +1028,7 @@ class FastModel(FastBaseModel):
                     load_in_fp8 = False
 
         # Check if pre-quantized models are allowed
-        # AMD Instinct GPUs need blocksize = 128 on bitsandbytes < 0.49.2 (our pre-quants use blocksize = 64)
+        # For eg AMD Instinct GPUs need blocksize = 128, but our pre-quants are blocksize = 64
         if not ALLOW_PREQUANTIZED_MODELS and model_name.lower().endswith(
             ("-unsloth-bnb-4bit", "-bnb-4bit")
         ):
@@ -1288,7 +1311,7 @@ class FastModel(FastBaseModel):
             if not use_exact_model_name:
                 model_name = get_model_name(model_name, load_in_4bit)
             # Check if pre-quantized models are allowed
-            # AMD Instinct GPUs need blocksize = 128 on bitsandbytes < 0.49.2 (our pre-quants use blocksize = 64)
+            # For eg AMD Instinct GPUs need blocksize = 128, but our pre-quants are blocksize = 64
             if not ALLOW_PREQUANTIZED_MODELS and model_name.lower().endswith(
                 ("-unsloth-bnb-4bit", "-bnb-4bit")
             ):
@@ -1336,7 +1359,11 @@ class FastModel(FastBaseModel):
                 break
         # Apply gradient checkpointing with smart heuristics
         use_gradient_checkpointing = apply_unsloth_gradient_checkpointing(
-            use_gradient_checkpointing, max_seq_length, dtype
+            use_gradient_checkpointing,
+            max_seq_length,
+            dtype,
+            use_reentrant = effective_use_reentrant,
+            sac_policy = sac_policy,
         )
         with redirector:
             patch_loss_functions(torch_compile = False)
@@ -1432,6 +1459,7 @@ class FastModel(FastBaseModel):
             tokenizer_name = tokenizer_name,
             auto_model = auto_model,
             use_gradient_checkpointing = use_gradient_checkpointing,
+            use_reentrant = effective_use_reentrant,
             supports_sdpa = supports_sdpa,
             whisper_language = whisper_language,
             whisper_task = whisper_task,
@@ -1509,7 +1537,10 @@ class FastModel(FastBaseModel):
             )
             # Patch it as well!
             model = FastBaseModel.post_patch_model(
-                model, use_gradient_checkpointing, trust_remote_code = trust_remote_code
+                model,
+                use_gradient_checkpointing,
+                trust_remote_code = trust_remote_code,
+                use_reentrant = effective_use_reentrant,
             )
 
         # Apply QAT if specified
@@ -1526,6 +1557,11 @@ class FastModel(FastBaseModel):
             patch_tiled_mlp(model, patch_options_str = patch_tiled_mlp_choice)
 
         model = _fix_rope_inv_freq(model)
+
+        if sac_policy is not None:
+            from unsloth_zoo.gradient_checkpointing import resolve_sac_context_fn
+            model._unsloth_sac_context_fn = resolve_sac_context_fn(sac_policy)
+
         return model, tokenizer
 
 

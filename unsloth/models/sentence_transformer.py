@@ -1322,6 +1322,7 @@ class FastSentenceTransformer(FastModel):
         fix_tokenizer = True,
         trust_remote_code = False,
         use_gradient_checkpointing = False,  # Changed default: conflicts with torch.compile
+        use_reentrant = None,
         resize_model_vocab = None,
         revision = None,
         use_exact_model_name = False,
@@ -1664,6 +1665,7 @@ class FastSentenceTransformer(FastModel):
                 fix_tokenizer = fix_tokenizer,
                 trust_remote_code = trust_remote_code,
                 use_gradient_checkpointing = use_gradient_checkpointing,
+                use_reentrant = use_reentrant,
                 resize_model_vocab = resize_model_vocab,
                 revision = revision,
                 return_logits = False,
@@ -1822,6 +1824,7 @@ class FastSentenceTransformer(FastModel):
         layers_to_transform = None,
         layers_pattern = None,
         use_gradient_checkpointing = False,  # Changed default: conflicts with torch.compile
+        use_reentrant = None,
         random_state = 3407,
         max_seq_length = 2048,
         use_rslora = False,
@@ -1883,6 +1886,7 @@ class FastSentenceTransformer(FastModel):
                         inner_model = prepare_model_for_kbit_training(
                             inner_model,
                             use_gradient_checkpointing = _gc_for_kbit,
+                            use_reentrant = use_reentrant,
                         )
                         print("Unsloth: Prepared quantized model for k-bit training")
                         gc_enabled = bool(_gc_for_kbit)
@@ -1895,6 +1899,7 @@ class FastSentenceTransformer(FastModel):
                             inner_model = prepare_model_for_kbit_training(
                                 inner_model,
                                 use_gradient_checkpointing = False,
+                                use_reentrant = use_reentrant,
                             )
                             print(
                                 "Unsloth: Prepared quantized model for k-bit training (without gradient checkpointing)"
@@ -1982,6 +1987,7 @@ class FastSentenceTransformer(FastModel):
                 layers_to_transform = layers_to_transform,
                 layers_pattern = layers_pattern,
                 use_gradient_checkpointing = use_gradient_checkpointing,
+                use_reentrant = use_reentrant,
                 random_state = random_state,
                 max_seq_length = max_seq_length,
                 use_rslora = use_rslora,
@@ -2005,6 +2011,7 @@ class FastSentenceTransformer(FastModel):
                 layers_to_transform = layers_to_transform,
                 layers_pattern = layers_pattern,
                 use_gradient_checkpointing = use_gradient_checkpointing,
+                use_reentrant = use_reentrant,
                 random_state = random_state,
                 max_seq_length = max_seq_length,
                 use_rslora = use_rslora,

@@ -173,7 +173,7 @@ def FalconH1Attention_fast_forward(
         kv_seq_len = kv_seq_len,
         n_heads = n_heads,
         head_dim = head_dim,
-        requires_grad = hidden_states.requires_grad,
+        requires_grad = Q.requires_grad,
         seq_info = seq_info,
         attention_mask = attention_mask,
         causal_mask = causal_mask,

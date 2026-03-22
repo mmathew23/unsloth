@@ -1251,7 +1251,7 @@ if (-not (Test-Path $UnslothHome)) { New-Item -ItemType Directory -Force $Unslot
 $LlamaCppDir = Join-Path $UnslothHome "llama.cpp"
 $NeedLlamaSourceBuild = $false
 $RequestedLlamaTag = if ($env:UNSLOTH_LLAMA_TAG) { $env:UNSLOTH_LLAMA_TAG } else { "latest" }
-$HelperReleaseRepo = if ($env:UNSLOTH_LLAMA_RELEASE_REPO) { $env:UNSLOTH_LLAMA_RELEASE_REPO } else { "mmathew23/llama.cpp-prebuilt" }
+$HelperReleaseRepo = if ($env:UNSLOTH_LLAMA_RELEASE_REPO) { $env:UNSLOTH_LLAMA_RELEASE_REPO } else { "unslothai/unsloth" }
 $ResolvedLlamaTag = (& python "$PSScriptRoot\install_llama_prebuilt.py" --resolve-install-tag $RequestedLlamaTag --published-repo $HelperReleaseRepo).Trim()
 if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($ResolvedLlamaTag)) {
     throw "Failed to resolve llama.cpp release tag from '$RequestedLlamaTag'"

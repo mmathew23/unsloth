@@ -1322,6 +1322,22 @@ def extract_archive(archive_path: Path, destination: Path) -> None:
             raise PrebuiltFallback(f"archive member escaped destination: {member_name}") from exc
         return target
 
+    def safe_link_target(base: Path, member_name: str, link_name: str, target: Path) -> tuple[str, Path]:
+        normalized = link_name.replace("\\", "/")
+        link_path = Path(normalized)
+        if link_path.is_absolute():
+            raise PrebuiltFallback(f"archive link used an absolute target: {member_name} -> {link_name}")
+        if not normalized:
+            raise PrebuiltFallback(f"archive link used an empty target: {member_name}")
+
+        resolved = (target.parent / link_path).resolve()
+        base_resolved = base.resolve()
+        try:
+            resolved.relative_to(base_resolved)
+        except ValueError as exc:
+            raise PrebuiltFallback(f"archive link escaped destination: {member_name} -> {link_name}") from exc
+        return normalized, resolved
+
     def extract_zip_safely(source: Path, base: Path) -> None:
         with zipfile.ZipFile(source) as archive:
             for member in archive.infolist():
@@ -1337,13 +1353,15 @@ def extract_archive(archive_path: Path, destination: Path) -> None:
                     shutil.copyfileobj(src, dst)
 
     def extract_tar_safely(source: Path, base: Path) -> None:
+        pending_links: list[tuple[tarfile.TarInfo, Path]] = []
         with tarfile.open(source, "r:gz") as archive:
             for member in archive.getmembers():
                 target = safe_extract_path(base, member.name)
-                if member.islnk() or member.issym():
-                    raise PrebuiltFallback(f"tar archive contained a link entry: {member.name}")
                 if member.isdir():
                     target.mkdir(parents=True, exist_ok=True)
+                    continue
+                if member.islnk() or member.issym():
+                    pending_links.append((member, target))
                     continue
                 if not member.isfile():
                     raise PrebuiltFallback(f"tar archive contained an unsupported entry: {member.name}")
@@ -1353,6 +1371,35 @@ def extract_archive(archive_path: Path, destination: Path) -> None:
                     raise PrebuiltFallback(f"tar archive entry could not be read: {member.name}")
                 with extracted, target.open("wb") as dst:
                     shutil.copyfileobj(extracted, dst)
+
+        unresolved = list(pending_links)
+        while unresolved:
+            next_round: list[tuple[tarfile.TarInfo, Path]] = []
+            progressed = False
+            for member, target in unresolved:
+                normalized_link, resolved_target = safe_link_target(base, member.name, member.linkname, target)
+                if not resolved_target.exists() and not resolved_target.is_symlink():
+                    next_round.append((member, target))
+                    continue
+                if resolved_target.is_dir():
+                    raise PrebuiltFallback(f"archive link targeted a directory: {member.name} -> {member.linkname}")
+
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.exists() or target.is_symlink():
+                    target.unlink()
+
+                if member.issym():
+                    target.symlink_to(normalized_link)
+                else:
+                    shutil.copy2(resolved_target, target)
+                progressed = True
+
+            if not progressed:
+                details = ", ".join(
+                    f"{member.name} -> {member.linkname}" for member, _ in next_round
+                )
+                raise PrebuiltFallback(f"tar archive contained unresolved link entries: {details}")
+            unresolved = next_round
 
     destination.mkdir(parents=True, exist_ok=True)
     if archive_path.name.endswith(".zip"):

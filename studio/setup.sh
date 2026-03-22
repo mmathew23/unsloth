@@ -319,7 +319,7 @@ LLAMA_SERVER_BIN="$LLAMA_CPP_DIR/build/bin/llama-server"
 _NEED_LLAMA_SOURCE_BUILD=false
 _LLAMA_FORCE_COMPILE="${UNSLOTH_LLAMA_FORCE_COMPILE:-0}"
 _REQUESTED_LLAMA_TAG="${UNSLOTH_LLAMA_TAG:-latest}"
-_RESOLVED_LLAMA_TAG="$(python "$SCRIPT_DIR/install_llama_prebuilt.py" --resolve-install-tag "$_REQUESTED_LLAMA_TAG" --published-repo "${UNSLOTH_LLAMA_RELEASE_REPO:-mmathew23/llama.cpp-prebuilt}")"
+_RESOLVED_LLAMA_TAG="$(python "$SCRIPT_DIR/install_llama_prebuilt.py" --resolve-install-tag "$_REQUESTED_LLAMA_TAG" --published-repo "${UNSLOTH_LLAMA_RELEASE_REPO:-unslothai/unsloth}")"
 
 echo ""
 echo "Resolved llama.cpp release tag: $_RESOLVED_LLAMA_TAG"
@@ -335,7 +335,7 @@ else
         python "$SCRIPT_DIR/install_llama_prebuilt.py"
         --install-dir "$LLAMA_CPP_DIR"
         --llama-tag "$_RESOLVED_LLAMA_TAG"
-        --published-repo "${UNSLOTH_LLAMA_RELEASE_REPO:-mmathew23/llama.cpp-prebuilt}"
+        --published-repo "${UNSLOTH_LLAMA_RELEASE_REPO:-unslothai/unsloth}"
     )
     if [ -n "${UNSLOTH_LLAMA_RELEASE_TAG:-}" ]; then
         _PREBUILT_CMD+=(--published-release-tag "$UNSLOTH_LLAMA_RELEASE_TAG")

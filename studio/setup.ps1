@@ -1267,6 +1267,9 @@ if ($env:UNSLOTH_LLAMA_FORCE_COMPILE -eq "1") {
 } else {
     Write-Host ""
     Write-Host "Installing prebuilt llama.cpp bundle (preferred path)..." -ForegroundColor Cyan
+    if (Test-Path $LlamaCppDir) {
+        Write-Host "Existing llama.cpp install detected -- validating staged prebuilt update before replacement" -ForegroundColor Gray
+    }
     $prebuiltArgs = @(
         "$PSScriptRoot\install_llama_prebuilt.py",
         "--install-dir", $LlamaCppDir,
@@ -1285,6 +1288,9 @@ if ($env:UNSLOTH_LLAMA_FORCE_COMPILE -eq "1") {
     if ($prebuiltExit -eq 0) {
         Write-Host "[OK] Prebuilt llama.cpp installed and validated" -ForegroundColor Green
     } else {
+        if (Test-Path $LlamaCppDir) {
+            Write-Host "[WARN] Prebuilt update failed; existing install was restored or cleaned before source build fallback" -ForegroundColor Yellow
+        }
         Write-Host "[WARN] Prebuilt llama.cpp path unavailable or failed validation -- falling back to source build" -ForegroundColor Yellow
         $NeedLlamaSourceBuild = $true
     }

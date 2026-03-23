@@ -366,6 +366,9 @@ if [ "$_LLAMA_FORCE_COMPILE" = "1" ]; then
 else
     echo ""
     echo "Installing prebuilt llama.cpp bundle (preferred path)..."
+    if [ -d "$LLAMA_CPP_DIR" ]; then
+        echo "Existing llama.cpp install detected -- validating staged prebuilt update before replacement"
+    fi
     _PREBUILT_CMD=(
         python "$SCRIPT_DIR/install_llama_prebuilt.py"
         --install-dir "$LLAMA_CPP_DIR"
@@ -383,6 +386,9 @@ else
     if [ "$_PREBUILT_STATUS" -eq 0 ]; then
         echo "✅ Prebuilt llama.cpp installed and validated"
     else
+        if [ -d "$LLAMA_CPP_DIR" ]; then
+            echo "⚠️  Prebuilt update failed; existing install was restored or cleaned before source build fallback"
+        fi
         echo "⚠️  Prebuilt llama.cpp path unavailable or failed validation -- falling back to source build"
         _NEED_LLAMA_SOURCE_BUILD=true
     fi

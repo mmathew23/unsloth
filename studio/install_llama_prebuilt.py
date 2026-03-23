@@ -1615,7 +1615,9 @@ def prune_install_staging_root(install_dir: Path) -> None:
 
 
 def create_install_staging_dir(install_dir: Path) -> Path:
-    return Path(tempfile.mkdtemp(prefix=f"{install_dir.name}.staging-", dir=install_staging_root(install_dir)))
+    staging_dir = Path(tempfile.mkdtemp(prefix=f"{install_dir.name}.staging-", dir=install_staging_root(install_dir)))
+    log(f"created install staging dir {staging_dir}")
+    return staging_dir
 
 
 def unique_install_side_path(install_dir: Path, label: str) -> Path:
@@ -1633,6 +1635,46 @@ def unique_install_side_path(install_dir: Path, label: str) -> Path:
 def remove_tree(path: Path | None) -> None:
     if path and path.exists():
         shutil.rmtree(path, ignore_errors=True)
+
+
+def remove_tree_logged(path: Path | None, label: str) -> None:
+    if not path:
+        return
+    if not path.exists():
+        log(f"{label} already absent at {path}")
+        return
+    log(f"removing {label} at {path}")
+    try:
+        shutil.rmtree(path)
+    except Exception as exc:
+        log(f"failed to remove {label} at {path}: {exc}")
+        raise
+
+
+def cleanup_install_side_paths(
+    install_dir: Path,
+    *,
+    staging_dir: Path | None = None,
+    rollback_dir: Path | None = None,
+    failed_dir: Path | None = None,
+    active_dir: Path | None = None,
+) -> None:
+    cleanup_failures: list[str] = []
+    for label, path in (
+        ("failed install path", failed_dir),
+        ("rollback path", rollback_dir),
+        ("active install path", active_dir),
+        ("staging dir", staging_dir),
+    ):
+        if not path:
+            continue
+        try:
+            remove_tree_logged(path, label)
+        except Exception as exc:
+            cleanup_failures.append(f"{label} ({path}): {exc}")
+    prune_install_staging_root(install_dir)
+    if cleanup_failures:
+        raise RuntimeError("cleanup failed for " + "; ".join(cleanup_failures))
 
 
 def confirm_install_tree(install_dir: Path, host: HostInfo) -> None:
@@ -1665,27 +1707,67 @@ def activate_install_tree(staging_dir: Path, install_dir: Path, host: HostInfo) 
     try:
         if install_dir.exists():
             rollback_dir = unique_install_side_path(install_dir, "rollback")
+            log(f"moving existing install to rollback path {rollback_dir}")
             os.replace(install_dir, rollback_dir)
             log(f"moved existing install to rollback path {rollback_dir.name}")
 
+        log(f"activating staged install {staging_dir} -> {install_dir}")
         os.replace(staging_dir, install_dir)
+        log(f"activated staged install at {install_dir}")
+        log(f"confirming activated install tree at {install_dir}")
         confirm_install_tree(install_dir, host)
-    except Exception:
+        log(f"activated install tree confirmed at {install_dir}")
+    except Exception as exc:
+        log(f"activation failed for staged install: {exc}")
         try:
             if install_dir.exists():
                 failed_dir = unique_install_side_path(install_dir, "failed")
+                log(f"moving failed active install to {failed_dir}")
                 os.replace(install_dir, failed_dir)
             elif staging_dir.exists():
                 failed_dir = staging_dir
                 staging_dir = None
+                log(f"retaining failed staging tree at {failed_dir}")
 
             if rollback_dir and rollback_dir.exists():
+                log(f"restoring rollback path {rollback_dir} -> {install_dir}")
                 os.replace(rollback_dir, install_dir)
+                log(f"restored previous install from rollback path {rollback_dir.name}")
+                raise PrebuiltFallback(
+                    "staged prebuilt validation passed but activation failed; restored previous install "
+                    f"({textwrap.shorten(str(exc), width=200, placeholder='...')})"
+                ) from exc
+        except PrebuiltFallback:
+            raise
         except Exception as rollback_exc:
             log(f"rollback after failed activation also failed: {rollback_exc}")
-        raise
+
+        log("rollback restoration failed; cleaning staging, install, and rollback paths before source build fallback")
+        cleanup_error: Exception | None = None
+        try:
+            cleanup_install_side_paths(
+                install_dir,
+                staging_dir=staging_dir,
+                rollback_dir=rollback_dir,
+                failed_dir=failed_dir,
+                active_dir=install_dir,
+            )
+        except Exception as cleanup_exc:
+            cleanup_error = cleanup_exc
+            log(f"cleanup after rollback failure also failed: {cleanup_exc}")
+        details = textwrap.shorten(str(exc), width=200, placeholder="...")
+        if cleanup_error is not None:
+            raise PrebuiltFallback(
+                "staged prebuilt validation passed but activation and rollback failed; "
+                f"cleanup also reported errors ({details}; cleanup={cleanup_error})"
+            ) from exc
+        raise PrebuiltFallback(
+            "staged prebuilt validation passed but activation and rollback failed; "
+            f"cleaned install state for fresh source build ({details})"
+        ) from exc
     else:
-        remove_tree(rollback_dir)
+        if rollback_dir:
+            remove_tree_logged(rollback_dir, "rollback path")
     finally:
         remove_tree(failed_dir)
         remove_tree(staging_dir)
@@ -2310,7 +2392,9 @@ def validate_prebuilt_choice(
     prebuilt_fallback_used: bool,
     quantized_path: Path,
 ) -> tuple[Path, Path]:
+    log(f"hydrating upstream llama.cpp source for {llama_tag} into {install_dir}")
     hydrate_source_tree(llama_tag, install_dir, work_dir)
+    log(f"overlaying prebuilt bundle {choice.name} into {install_dir}")
     server_path, quantize_path = install_from_archives(choice, host, install_dir, work_dir)
     preflight_linux_installed_binaries((server_path, quantize_path), install_dir, host)
     ensure_repo_shape(install_dir)
@@ -2336,6 +2420,7 @@ def validate_prebuilt_choice(
         install_dir,
         runtime_line=choice.runtime_line,
     )
+    log(f"staged prebuilt validation succeeded for {choice.name}")
     return server_path, quantize_path
 
 
@@ -2406,6 +2491,10 @@ def install_prebuilt(install_dir: Path, llama_tag: str, published_repo: str, pub
     choice: AssetChoice | None = None
     try:
         with install_lock(install_lock_path(install_dir)):
+            if install_dir.exists():
+                log(f"existing llama.cpp install detected at {install_dir}; validating staged prebuilt update before replacement")
+            else:
+                log(f"no existing llama.cpp install detected at {install_dir}; performing fresh prebuilt install")
             requested_tag, llama_tag, attempts = resolve_install_attempts(
                 llama_tag,
                 host,

@@ -299,6 +299,10 @@ def download_file(url: str, destination: Path) -> None:
     raise last_exc
 
 
+def upstream_source_archive_url(tag: str) -> str:
+    return f"https://github.com/{UPSTREAM_REPO}/archive/refs/tags/{urllib.parse.quote(tag, safe='')}.tar.gz"
+
+
 def github_release_assets(repo: str, tag: str) -> dict[str, str]:
     payload = fetch_json(f"https://api.github.com/repos/{repo}/releases/tags/{urllib.parse.quote(tag, safe='')}")
     if not isinstance(payload, dict):
@@ -1448,6 +1452,54 @@ def ensure_converter_scripts(install_dir: Path, llama_tag: str) -> None:
         atomic_write_bytes(install_dir / file_name, data)
 
 
+def extracted_archive_root(extract_dir: Path) -> Path:
+    children = [path for path in extract_dir.iterdir()]
+    if len(children) == 1 and children[0].is_dir():
+        return children[0]
+    return extract_dir
+
+
+def copy_directory_contents(source_dir: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    for item in source_dir.iterdir():
+        target = destination / item.name
+        if item.is_dir():
+            shutil.copytree(item, target, dirs_exist_ok=True)
+        else:
+            shutil.copy2(item, target)
+
+
+def hydrate_source_tree(upstream_tag: str, install_dir: Path, work_dir: Path) -> None:
+    archive_path = work_dir / f"llama.cpp-source-{upstream_tag}.tar.gz"
+    source_url = upstream_source_archive_url(upstream_tag)
+    extract_dir = Path(tempfile.mkdtemp(prefix="source-extract-", dir=work_dir))
+
+    try:
+        log(f"downloading llama.cpp source tree for upstream tag {upstream_tag}")
+        download_file(source_url, archive_path)
+        extract_archive(archive_path, extract_dir)
+        source_root = extracted_archive_root(extract_dir)
+        required_paths = [
+            source_root / "CMakeLists.txt",
+            source_root / "convert_hf_to_gguf.py",
+            source_root / "gguf-py",
+        ]
+        missing = [str(path.relative_to(source_root)) for path in required_paths if not path.exists()]
+        if missing:
+            raise PrebuiltFallback(
+                "upstream source archive was missing required repo files: " + ", ".join(missing)
+            )
+        copy_directory_contents(source_root, install_dir)
+    except PrebuiltFallback:
+        raise
+    except Exception as exc:
+        raise PrebuiltFallback(
+            f"failed to hydrate upstream llama.cpp source tree for {upstream_tag}: {exc}"
+        ) from exc
+    finally:
+        remove_tree(extract_dir)
+
+
 def normalize_install_layout(install_dir: Path, host: HostInfo) -> tuple[Path, Path]:
     build_bin = install_dir / "build" / "bin"
     if host.is_windows:
@@ -1492,6 +1544,44 @@ def create_exec_entrypoint(entrypoint: Path, target: Path) -> None:
         entrypoint.symlink_to(os.path.relpath(target, entrypoint.parent))
     except Exception:
         write_exec_wrapper(entrypoint, target)
+
+
+def overlay_directory_for_choice(install_dir: Path, choice: AssetChoice, host: HostInfo) -> Path:
+    if host.is_windows or choice.install_kind.startswith("windows"):
+        path = install_dir / "build" / "bin" / "Release"
+    else:
+        path = install_dir / "build" / "bin"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def runtime_patterns_for_choice(choice: AssetChoice) -> list[str]:
+    if choice.install_kind in {"linux-cpu", "linux-cuda"}:
+        return [
+            "llama-server",
+            "llama-quantize",
+            "libllama.so*",
+            "libggml.so*",
+            "libggml-base.so*",
+            "libmtmd.so*",
+            "libggml-cpu-*.so*",
+            "libggml-cuda.so*",
+            "libggml-rpc.so*",
+        ]
+    if choice.install_kind in {"macos-arm64", "macos-x64"}:
+        return ["llama-server", "llama-quantize", "lib*.dylib"]
+    if choice.install_kind in {"windows-cpu", "windows-cuda"}:
+        return ["*.exe", "*.dll"]
+    raise PrebuiltFallback(f"unsupported install kind for runtime overlay: {choice.install_kind}")
+
+
+def metadata_patterns_for_choice(choice: AssetChoice) -> list[str]:
+    patterns = ["BUILD_INFO.txt", "THIRD_PARTY_LICENSES.txt"]
+    if choice.install_kind.startswith("windows"):
+        patterns.append("LICENSE.txt")
+    else:
+        patterns.append("LICENSE")
+    return patterns
 
 
 @contextmanager
@@ -1550,11 +1640,17 @@ def confirm_install_tree(install_dir: Path, host: HostInfo) -> None:
         expected = [
             install_dir / "build" / "bin" / "Release" / "llama-server.exe",
             install_dir / "build" / "bin" / "Release" / "llama-quantize.exe",
+            install_dir / "convert_hf_to_gguf.py",
+            install_dir / "gguf-py",
         ]
     else:
         expected = [
             install_dir / "llama-server",
             install_dir / "llama-quantize",
+            install_dir / "build" / "bin" / "llama-server",
+            install_dir / "build" / "bin" / "llama-quantize",
+            install_dir / "convert_hf_to_gguf.py",
+            install_dir / "gguf-py",
         ]
 
     expected.append(install_dir / "UNSLOTH_PREBUILT_INFO.json")
@@ -1605,72 +1701,15 @@ def install_from_archives(choice: AssetChoice, host: HostInfo, install_dir: Path
     extract_dir = Path(tempfile.mkdtemp(prefix="extract-", dir=work_dir))
 
     try:
-        if choice.is_ready_bundle:
-            extract_archive(main_archive, extract_dir)
-            source_dir = extract_dir
-            for item in source_dir.iterdir():
-                if item.is_dir():
-                    shutil.copytree(item, install_dir / item.name, dirs_exist_ok=True)
-                else:
-                    shutil.copy2(item, install_dir / item.name)
-            if host.is_windows:
-                exec_dir = install_dir / "build" / "bin" / "Release"
-                exec_dir.mkdir(parents=True, exist_ok=True)
-                for candidate in list(install_dir.iterdir()):
-                    if candidate == install_dir / "build" or candidate.is_dir():
-                        continue
-                    if fnmatch.fnmatch(candidate.name, "*.exe") or fnmatch.fnmatch(candidate.name, "*.dll"):
-                        shutil.copy2(candidate, exec_dir / candidate.name)
-        else:
-            extract_archive(main_archive, extract_dir)
-            source_dir = extract_dir
-            if choice.install_kind == "linux-cpu":
-                copy_globs(
-                    source_dir,
-                    install_dir,
-                    [
-                        "llama-server",
-                        "llama-quantize",
-                        "libllama.so*",
-                        "libggml.so*",
-                        "libggml-base.so*",
-                        "libmtmd.so*",
-                        "libggml-cpu-*.so*",
-                        "LICENSE",
-                        "BUILD_INFO.txt",
-                    ],
-                    required=False,
-                )
-                copy_globs(source_dir, install_dir, ["llama-server", "llama-quantize"], required=True)
-            elif choice.install_kind in {"macos-arm64", "macos-x64"}:
-                copy_globs(
-                    source_dir,
-                    install_dir,
-                    [
-                        "llama-server",
-                        "llama-quantize",
-                        "lib*.dylib",
-                        "LICENSE",
-                        "BUILD_INFO.txt",
-                    ],
-                    required=False,
-                )
-                copy_globs(source_dir, install_dir, ["llama-server", "llama-quantize"], required=True)
-            elif choice.install_kind == "windows-cpu":
-                exec_dir = install_dir / "build" / "bin" / "Release"
-                copy_globs(source_dir, exec_dir, ["*.exe", "*.dll", "LICENSE", "BUILD_INFO.txt"], required=False)
-                copy_globs(source_dir, exec_dir, ["llama-server.exe", "llama-quantize.exe"], required=True)
-            elif choice.install_kind == "windows-cuda":
-                exec_dir = install_dir / "build" / "bin" / "Release"
-                copy_globs(source_dir, exec_dir, ["*.exe", "*.dll", "LICENSE", "BUILD_INFO.txt"], required=False)
-                copy_globs(source_dir, exec_dir, ["llama-server.exe", "llama-quantize.exe"], required=True)
-            else:
-                raise PrebuiltFallback(f"unsupported upstream install kind: {choice.install_kind}")
+        extract_archive(main_archive, extract_dir)
+        source_dir = extract_dir
+        overlay_dir = overlay_directory_for_choice(install_dir, choice, host)
+        copy_globs(source_dir, overlay_dir, runtime_patterns_for_choice(choice), required=True)
+        copy_globs(source_dir, install_dir, metadata_patterns_for_choice(choice), required=False)
     finally:
         remove_tree(extract_dir)
 
     if host.is_windows:
-        server_path, quantize_path = normalize_install_layout(install_dir, host)
         exec_dir = install_dir / "build" / "bin" / "Release"
         server_src = next(exec_dir.glob("llama-server.exe"), None)
         quantize_src = next(exec_dir.glob("llama-quantize.exe"), None)
@@ -1678,13 +1717,14 @@ def install_from_archives(choice: AssetChoice, host: HostInfo, install_dir: Path
             raise PrebuiltFallback("windows executables were not installed correctly")
         return server_src, quantize_src
 
-    source_server = discover_installed_executable(install_dir, "llama-server")
-    source_quantize = discover_installed_executable(install_dir, "llama-quantize")
+    build_bin = install_dir / "build" / "bin"
+    source_server = build_bin / "llama-server"
+    source_quantize = build_bin / "llama-quantize"
+    if not source_server.exists() or not source_quantize.exists():
+        raise PrebuiltFallback("unix executables were not installed correctly into build/bin")
     os.chmod(source_server, 0o755)
     os.chmod(source_quantize, 0o755)
 
-    build_bin = install_dir / "build" / "bin"
-    build_bin.mkdir(parents=True, exist_ok=True)
     root_server = install_dir / "llama-server"
     root_quantize = install_dir / "llama-quantize"
     if source_server != root_server:
@@ -1702,8 +1742,14 @@ def install_from_archives(choice: AssetChoice, host: HostInfo, install_dir: Path
 
 
 def ensure_repo_shape(install_dir: Path) -> None:
-    for relative in ("src", "ggml", "common"):
-        (install_dir / relative).mkdir(parents=True, exist_ok=True)
+    required = [
+        install_dir / "CMakeLists.txt",
+        install_dir / "convert_hf_to_gguf.py",
+        install_dir / "gguf-py",
+    ]
+    missing = [str(path.relative_to(install_dir)) for path in required if not path.exists()]
+    if missing:
+        raise PrebuiltFallback("hydrated llama.cpp source tree was missing: " + ", ".join(missing))
 
 
 def validation_model_cache_path(install_dir: Path) -> Path:
@@ -2198,109 +2244,189 @@ def collect_system_report(host: HostInfo, choice: AssetChoice | None, install_di
     return "\n".join(lines)
 
 
+def resolve_install_attempts(
+    llama_tag: str,
+    host: HostInfo,
+    published_repo: str,
+    published_release_tag: str,
+) -> tuple[str, str, list[AssetChoice]]:
+    requested_tag = llama_tag
+    resolved_tag = resolve_requested_install_tag(llama_tag, host, published_repo, published_release_tag)
+
+    if host.is_linux and host.is_x86_64 and host.has_usable_nvidia:
+        linux_cuda_selection = resolve_linux_cuda_choice(host, resolved_tag, published_repo, published_release_tag)
+        attempts = linux_cuda_selection.attempts
+        if not attempts:
+            raise PrebuiltFallback("no compatible Linux CUDA asset was found")
+        log_lines(linux_cuda_selection.selection_log)
+        return requested_tag, resolved_tag, attempts
+
+    if host.is_windows and host.is_x86_64 and host.has_usable_nvidia:
+        upstream_assets = github_release_assets(UPSTREAM_REPO, resolved_tag)
+        attempts = resolve_windows_cuda_choices(host, resolved_tag, upstream_assets)
+        if not attempts:
+            raise PrebuiltFallback("no compatible Windows CUDA asset was found")
+        if attempts[0].selection_log:
+            log_lines(attempts[0].selection_log)
+        return requested_tag, resolved_tag, attempts
+
+    choice = resolve_asset_choice(host, resolved_tag, published_repo, published_release_tag)
+    if choice.selection_log:
+        log_lines(choice.selection_log)
+    return requested_tag, resolved_tag, [choice]
+
+
+def write_prebuilt_metadata(
+    install_dir: Path,
+    *,
+    requested_tag: str,
+    llama_tag: str,
+    choice: AssetChoice,
+    prebuilt_fallback_used: bool,
+) -> None:
+    metadata = {
+        "requested_tag": requested_tag,
+        "tag": llama_tag,
+        "asset": choice.name,
+        "source": choice.source_label,
+        "bundle_profile": choice.bundle_profile,
+        "runtime_line": choice.runtime_line,
+        "coverage_class": choice.coverage_class,
+        "prebuilt_fallback_used": prebuilt_fallback_used,
+        "installed_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    (install_dir / "UNSLOTH_PREBUILT_INFO.json").write_text(json.dumps(metadata, indent=2) + "\n")
+
+
+def validate_prebuilt_choice(
+    choice: AssetChoice,
+    host: HostInfo,
+    install_dir: Path,
+    work_dir: Path,
+    probe_path: Path,
+    *,
+    requested_tag: str,
+    llama_tag: str,
+    prebuilt_fallback_used: bool,
+    quantized_path: Path,
+) -> tuple[Path, Path]:
+    hydrate_source_tree(llama_tag, install_dir, work_dir)
+    server_path, quantize_path = install_from_archives(choice, host, install_dir, work_dir)
+    preflight_linux_installed_binaries((server_path, quantize_path), install_dir, host)
+    ensure_repo_shape(install_dir)
+    write_prebuilt_metadata(
+        install_dir,
+        requested_tag=requested_tag,
+        llama_tag=llama_tag,
+        choice=choice,
+        prebuilt_fallback_used=prebuilt_fallback_used,
+    )
+    validate_quantize(
+        quantize_path,
+        probe_path,
+        quantized_path,
+        install_dir,
+        host,
+        runtime_line=choice.runtime_line,
+    )
+    validate_server(
+        server_path,
+        probe_path,
+        host,
+        install_dir,
+        runtime_line=choice.runtime_line,
+    )
+    return server_path, quantize_path
+
+
+def validate_prebuilt_attempts(
+    attempts: Iterable[AssetChoice],
+    host: HostInfo,
+    install_dir: Path,
+    work_dir: Path,
+    probe_path: Path,
+    *,
+    requested_tag: str,
+    llama_tag: str,
+) -> tuple[AssetChoice, Path, bool]:
+    attempt_list = list(attempts)
+    if not attempt_list:
+        raise PrebuiltFallback("no prebuilt bundle attempts were available")
+
+    tried_fallback = False
+    for index, attempt in enumerate(attempt_list):
+        if index > 0:
+            tried_fallback = True
+            log(
+                "retrying CUDA prebuilt "
+                f"{attempt.name} install_kind={attempt.install_kind} "
+                f"runtime_line={attempt.runtime_line} coverage_class={attempt.coverage_class}"
+            )
+
+        staging_dir = create_install_staging_dir(install_dir)
+        quantized_path = work_dir / f"stories260K-q4-{index}.gguf"
+        if quantized_path.exists():
+            quantized_path.unlink()
+        try:
+            validate_prebuilt_choice(
+                attempt,
+                host,
+                staging_dir,
+                work_dir,
+                probe_path,
+                requested_tag=requested_tag,
+                llama_tag=llama_tag,
+                prebuilt_fallback_used=tried_fallback,
+                quantized_path=quantized_path,
+            )
+        except Exception as exc:
+            remove_tree(staging_dir)
+            prune_install_staging_root(install_dir)
+            if isinstance(exc, PrebuiltFallback):
+                attempt_error = exc
+            else:
+                attempt_error = PrebuiltFallback(
+                    f"candidate attempt failed before activation for {attempt.name}: {exc}"
+                )
+            if index == len(attempt_list) - 1:
+                raise attempt_error from exc
+            log(
+                "selected CUDA bundle failed before activation; trying next prebuilt fallback "
+                f"({textwrap.shorten(str(attempt_error), width=200, placeholder='...')})"
+            )
+            continue
+
+        return attempt, staging_dir, tried_fallback
+
+    raise PrebuiltFallback("no prebuilt bundle passed validation")
+
+
 def install_prebuilt(install_dir: Path, llama_tag: str, published_repo: str, published_release_tag: str) -> None:
     host = detect_host()
     choice: AssetChoice | None = None
-    cuda_attempts: list[AssetChoice] = []
     try:
         with install_lock(install_lock_path(install_dir)):
-            requested_tag = llama_tag
-            llama_tag = resolve_requested_install_tag(llama_tag, host, published_repo, published_release_tag)
-            if host.is_linux and host.is_x86_64 and host.has_usable_nvidia:
-                linux_cuda_selection = resolve_linux_cuda_choice(host, llama_tag, published_repo, published_release_tag)
-                cuda_attempts = linux_cuda_selection.attempts
-                choice = cuda_attempts[0]
-                log_lines(linux_cuda_selection.selection_log)
-            elif host.is_windows and host.is_x86_64 and host.has_usable_nvidia:
-                upstream_assets = github_release_assets(UPSTREAM_REPO, llama_tag)
-                cuda_attempts = resolve_windows_cuda_choices(host, llama_tag, upstream_assets)
-                if not cuda_attempts:
-                    raise PrebuiltFallback("no compatible Windows CUDA asset was found")
-                choice = cuda_attempts[0]
-                if choice.selection_log:
-                    log_lines(choice.selection_log)
-            else:
-                choice = resolve_asset_choice(host, llama_tag, published_repo, published_release_tag)
-                if choice.selection_log:
-                    log_lines(choice.selection_log)
+            requested_tag, llama_tag, attempts = resolve_install_attempts(
+                llama_tag,
+                host,
+                published_repo,
+                published_release_tag,
+            )
+            choice = attempts[0]
             log(f"selected {choice.name} ({choice.source_label}) for {host.system} {host.machine}")
             with tempfile.TemporaryDirectory(prefix="unsloth-llama-prebuilt-") as tmp:
                 work_dir = Path(tmp)
                 probe_path = work_dir / "stories260K.gguf"
                 download_validation_model(probe_path, validation_model_cache_path(install_dir))
-
-                tried_fallback = False
-                attempts = cuda_attempts if cuda_attempts else ([choice] if choice else [])
-                selected_staging_dir: Path | None = None
-                for index, attempt in enumerate(attempts):
-                    if index > 0:
-                        tried_fallback = True
-                        log(
-                            "retrying CUDA prebuilt "
-                            f"{attempt.name} install_kind={attempt.install_kind} "
-                            f"runtime_line={attempt.runtime_line} coverage_class={attempt.coverage_class}"
-                        )
-                    choice = attempt
-
-                    staging_dir = create_install_staging_dir(install_dir)
-                    quantized_path = work_dir / f"stories260K-q4-{index}.gguf"
-                    if quantized_path.exists():
-                        quantized_path.unlink()
-                    try:
-                        server_path, quantize_path = install_from_archives(choice, host, staging_dir, work_dir)
-                        preflight_linux_installed_binaries((server_path, quantize_path), staging_dir, host)
-                        ensure_repo_shape(staging_dir)
-                        metadata = {
-                            "requested_tag": requested_tag,
-                            "tag": llama_tag,
-                            "asset": choice.name,
-                            "source": choice.source_label,
-                            "bundle_profile": choice.bundle_profile,
-                            "runtime_line": choice.runtime_line,
-                            "coverage_class": choice.coverage_class,
-                            "prebuilt_fallback_used": tried_fallback,
-                            "installed_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                        }
-                        (staging_dir / "UNSLOTH_PREBUILT_INFO.json").write_text(json.dumps(metadata, indent=2) + "\n")
-                        validate_quantize(
-                            quantize_path,
-                            probe_path,
-                            quantized_path,
-                            staging_dir,
-                            host,
-                            runtime_line=choice.runtime_line,
-                        )
-                        validate_server(
-                            server_path,
-                            probe_path,
-                            host,
-                            staging_dir,
-                            runtime_line=choice.runtime_line,
-                        )
-                    except Exception as exc:
-                        remove_tree(staging_dir)
-                        prune_install_staging_root(install_dir)
-                        if isinstance(exc, PrebuiltFallback):
-                            attempt_error = exc
-                        else:
-                            attempt_error = PrebuiltFallback(
-                                f"candidate attempt failed before activation for {choice.name}: {exc}"
-                            )
-                        if index == len(attempts) - 1:
-                            raise attempt_error from exc
-                        log(
-                            "selected CUDA bundle failed before activation; trying next prebuilt fallback "
-                            f"({textwrap.shorten(str(exc), width=200, placeholder='...')})"
-                        )
-                        continue
-
-                    selected_staging_dir = staging_dir
-                    break
-                else:
-                    raise PrebuiltFallback("no CUDA prebuilt bundle passed validation")
-
-                if selected_staging_dir is None:
-                    raise PrebuiltFallback("validated prebuilt bundle was not staged")
+                choice, selected_staging_dir, _ = validate_prebuilt_attempts(
+                    attempts,
+                    host,
+                    install_dir,
+                    work_dir,
+                    probe_path,
+                    requested_tag=requested_tag,
+                    llama_tag=llama_tag,
+                )
                 activate_install_tree(selected_staging_dir, install_dir, host)
                 try:
                     ensure_converter_scripts(install_dir, llama_tag)

@@ -1252,9 +1252,26 @@ $LlamaCppDir = Join-Path $UnslothHome "llama.cpp"
 $NeedLlamaSourceBuild = $false
 $RequestedLlamaTag = if ($env:UNSLOTH_LLAMA_TAG) { $env:UNSLOTH_LLAMA_TAG } else { "latest" }
 $HelperReleaseRepo = if ($env:UNSLOTH_LLAMA_RELEASE_REPO) { $env:UNSLOTH_LLAMA_RELEASE_REPO } else { "unslothai/unsloth" }
-$ResolvedLlamaTag = (& python "$PSScriptRoot\install_llama_prebuilt.py" --resolve-install-tag $RequestedLlamaTag --published-repo $HelperReleaseRepo).Trim()
-if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($ResolvedLlamaTag)) {
-    throw "Failed to resolve llama.cpp release tag from '$RequestedLlamaTag'"
+$resolveOutput = & python "$PSScriptRoot\install_llama_prebuilt.py" --resolve-install-tag $RequestedLlamaTag --published-repo $HelperReleaseRepo 2>&1
+$resolveExit = $LASTEXITCODE
+$ResolvedLlamaTag = if ($resolveOutput) { ($resolveOutput | Select-Object -Last 1).ToString().Trim() } else { "" }
+if ($resolveExit -ne 0 -or [string]::IsNullOrWhiteSpace($ResolvedLlamaTag)) {
+    Write-Host ""
+    Write-Host "[WARN] Failed to resolve an installable prebuilt llama.cpp tag via $HelperReleaseRepo" -ForegroundColor Yellow
+    if ($resolveOutput) {
+        $resolveOutput | ForEach-Object { Write-Host $_ }
+    }
+    $fallbackOutput = & python "$PSScriptRoot\install_llama_prebuilt.py" --resolve-llama-tag $RequestedLlamaTag 2>$null
+    $fallbackExit = $LASTEXITCODE
+    $ResolvedLlamaTag = if ($fallbackExit -eq 0 -and $fallbackOutput) {
+        ($fallbackOutput | Select-Object -Last 1).ToString().Trim()
+    } elseif ($RequestedLlamaTag -eq "latest") {
+        "latest"
+    } else {
+        $RequestedLlamaTag
+    }
+    $NeedLlamaSourceBuild = $true
+    $SkipPrebuiltInstall = $true
 }
 
 Write-Host ""
@@ -1270,29 +1287,33 @@ if ($env:UNSLOTH_LLAMA_FORCE_COMPILE -eq "1") {
     if (Test-Path $LlamaCppDir) {
         Write-Host "Existing llama.cpp install detected -- validating staged prebuilt update before replacement" -ForegroundColor Gray
     }
-    $prebuiltArgs = @(
-        "$PSScriptRoot\install_llama_prebuilt.py",
-        "--install-dir", $LlamaCppDir,
-        "--llama-tag", $ResolvedLlamaTag,
-        "--published-repo", $HelperReleaseRepo
-    )
-    if ($env:UNSLOTH_LLAMA_RELEASE_TAG) {
-        $prebuiltArgs += @("--published-release-tag", $env:UNSLOTH_LLAMA_RELEASE_TAG)
-    }
-    $prevEAPPrebuilt = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    & python @prebuiltArgs
-    $prebuiltExit = $LASTEXITCODE
-    $ErrorActionPreference = $prevEAPPrebuilt
-
-    if ($prebuiltExit -eq 0) {
-        Write-Host "[OK] Prebuilt llama.cpp installed and validated" -ForegroundColor Green
+    if ($SkipPrebuiltInstall) {
+        Write-Host "[WARN] Skipping prebuilt install because prebuilt tag resolution failed -- falling back to source build" -ForegroundColor Yellow
     } else {
-        if (Test-Path $LlamaCppDir) {
-            Write-Host "[WARN] Prebuilt update failed; existing install was restored or cleaned before source build fallback" -ForegroundColor Yellow
+        $prebuiltArgs = @(
+            "$PSScriptRoot\install_llama_prebuilt.py",
+            "--install-dir", $LlamaCppDir,
+            "--llama-tag", $ResolvedLlamaTag,
+            "--published-repo", $HelperReleaseRepo
+        )
+        if ($env:UNSLOTH_LLAMA_RELEASE_TAG) {
+            $prebuiltArgs += @("--published-release-tag", $env:UNSLOTH_LLAMA_RELEASE_TAG)
         }
-        Write-Host "[WARN] Prebuilt llama.cpp path unavailable or failed validation -- falling back to source build" -ForegroundColor Yellow
-        $NeedLlamaSourceBuild = $true
+        $prevEAPPrebuilt = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        & python @prebuiltArgs
+        $prebuiltExit = $LASTEXITCODE
+        $ErrorActionPreference = $prevEAPPrebuilt
+
+        if ($prebuiltExit -eq 0) {
+            Write-Host "[OK] Prebuilt llama.cpp installed and validated" -ForegroundColor Green
+        } else {
+            if (Test-Path $LlamaCppDir) {
+                Write-Host "[WARN] Prebuilt update failed; existing install was restored or cleaned before source build fallback" -ForegroundColor Yellow
+            }
+            Write-Host "[WARN] Prebuilt llama.cpp path unavailable or failed validation -- falling back to source build" -ForegroundColor Yellow
+            $NeedLlamaSourceBuild = $true
+        }
     }
 }
 

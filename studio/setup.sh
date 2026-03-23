@@ -354,7 +354,38 @@ LLAMA_SERVER_BIN="$LLAMA_CPP_DIR/build/bin/llama-server"
 _NEED_LLAMA_SOURCE_BUILD=false
 _LLAMA_FORCE_COMPILE="${UNSLOTH_LLAMA_FORCE_COMPILE:-0}"
 _REQUESTED_LLAMA_TAG="${UNSLOTH_LLAMA_TAG:-latest}"
-_RESOLVED_LLAMA_TAG="$(python "$SCRIPT_DIR/install_llama_prebuilt.py" --resolve-install-tag "$_REQUESTED_LLAMA_TAG" --published-repo "${UNSLOTH_LLAMA_RELEASE_REPO:-unslothai/unsloth}")"
+_HELPER_RELEASE_REPO="${UNSLOTH_LLAMA_RELEASE_REPO:-unslothai/unsloth}"
+_RESOLVE_LLAMA_LOG="$(mktemp)"
+set +e
+python "$SCRIPT_DIR/install_llama_prebuilt.py" \
+    --resolve-install-tag "$_REQUESTED_LLAMA_TAG" \
+    --published-repo "$_HELPER_RELEASE_REPO" >"$_RESOLVE_LLAMA_LOG" 2>&1
+_RESOLVE_LLAMA_STATUS=$?
+set -e
+if [ "$_RESOLVE_LLAMA_STATUS" -eq 0 ]; then
+    _RESOLVED_LLAMA_TAG="$(tail -n 1 "$_RESOLVE_LLAMA_LOG" | tr -d '\r')"
+else
+    _RESOLVED_LLAMA_TAG=""
+fi
+if [ -z "$_RESOLVED_LLAMA_TAG" ]; then
+    echo ""
+    echo "⚠️  Failed to resolve an installable prebuilt llama.cpp tag via $_HELPER_RELEASE_REPO"
+    cat "$_RESOLVE_LLAMA_LOG" >&2 || true
+    set +e
+    _RESOLVED_LLAMA_TAG="$(python "$SCRIPT_DIR/install_llama_prebuilt.py" --resolve-llama-tag "$_REQUESTED_LLAMA_TAG" 2>/dev/null)"
+    _RESOLVE_UPSTREAM_STATUS=$?
+    set -e
+    if [ "$_RESOLVE_UPSTREAM_STATUS" -ne 0 ] || [ -z "$_RESOLVED_LLAMA_TAG" ]; then
+        if [ "$_REQUESTED_LLAMA_TAG" = "latest" ]; then
+            _RESOLVED_LLAMA_TAG="latest"
+        else
+            _RESOLVED_LLAMA_TAG="$_REQUESTED_LLAMA_TAG"
+        fi
+    fi
+    _NEED_LLAMA_SOURCE_BUILD=true
+    _SKIP_PREBUILT_INSTALL=true
+fi
+rm -f "$_RESOLVE_LLAMA_LOG"
 
 echo ""
 echo "Resolved llama.cpp release tag: $_RESOLVED_LLAMA_TAG"
@@ -369,28 +400,32 @@ else
     if [ -d "$LLAMA_CPP_DIR" ]; then
         echo "Existing llama.cpp install detected -- validating staged prebuilt update before replacement"
     fi
-    _PREBUILT_CMD=(
-        python "$SCRIPT_DIR/install_llama_prebuilt.py"
-        --install-dir "$LLAMA_CPP_DIR"
-        --llama-tag "$_RESOLVED_LLAMA_TAG"
-        --published-repo "${UNSLOTH_LLAMA_RELEASE_REPO:-unslothai/unsloth}"
-    )
-    if [ -n "${UNSLOTH_LLAMA_RELEASE_TAG:-}" ]; then
-        _PREBUILT_CMD+=(--published-release-tag "$UNSLOTH_LLAMA_RELEASE_TAG")
-    fi
-    set +e
-    "${_PREBUILT_CMD[@]}"
-    _PREBUILT_STATUS=$?
-    set -e
-
-    if [ "$_PREBUILT_STATUS" -eq 0 ]; then
-        echo "✅ Prebuilt llama.cpp installed and validated"
+    if [ "${_SKIP_PREBUILT_INSTALL:-false}" = true ]; then
+        echo "⚠️  Skipping prebuilt install because prebuilt tag resolution failed -- falling back to source build"
     else
-        if [ -d "$LLAMA_CPP_DIR" ]; then
-            echo "⚠️  Prebuilt update failed; existing install was restored or cleaned before source build fallback"
+        _PREBUILT_CMD=(
+            python "$SCRIPT_DIR/install_llama_prebuilt.py"
+            --install-dir "$LLAMA_CPP_DIR"
+            --llama-tag "$_RESOLVED_LLAMA_TAG"
+            --published-repo "$_HELPER_RELEASE_REPO"
+        )
+        if [ -n "${UNSLOTH_LLAMA_RELEASE_TAG:-}" ]; then
+            _PREBUILT_CMD+=(--published-release-tag "$UNSLOTH_LLAMA_RELEASE_TAG")
         fi
-        echo "⚠️  Prebuilt llama.cpp path unavailable or failed validation -- falling back to source build"
-        _NEED_LLAMA_SOURCE_BUILD=true
+        set +e
+        "${_PREBUILT_CMD[@]}"
+        _PREBUILT_STATUS=$?
+        set -e
+
+        if [ "$_PREBUILT_STATUS" -eq 0 ]; then
+            echo "✅ Prebuilt llama.cpp installed and validated"
+        else
+            if [ -d "$LLAMA_CPP_DIR" ]; then
+                echo "⚠️  Prebuilt update failed; existing install was restored or cleaned before source build fallback"
+            fi
+            echo "⚠️  Prebuilt llama.cpp path unavailable or failed validation -- falling back to source build"
+            _NEED_LLAMA_SOURCE_BUILD=true
+        fi
     fi
 fi
 

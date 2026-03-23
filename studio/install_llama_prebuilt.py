@@ -856,6 +856,14 @@ def pinned_published_release_bundle(repo: str, published_release_tag: str) -> Pu
     return bundle
 
 
+def install_tag_policy(host: HostInfo) -> str:
+    if host.is_linux and host.is_x86_64 and host.has_usable_nvidia:
+        return "published_linux_cuda"
+    if (host.is_windows and host.is_x86_64) or (host.is_macos and (host.is_arm64 or host.is_x86_64)):
+        return "upstream_native_latest"
+    return "upstream_compatible_scan"
+
+
 def resolve_requested_llama_tag(
     requested_tag: str | None,
 ) -> str:
@@ -872,7 +880,8 @@ def resolve_requested_install_tag(
 ) -> str:
     if requested_tag and requested_tag != "latest":
         return requested_tag
-    if host.is_linux and host.is_x86_64 and host.has_usable_nvidia:
+    policy = install_tag_policy(host)
+    if policy == "published_linux_cuda":
         if published_release_tag:
             bundle = pinned_published_release_bundle(published_repo, published_release_tag)
             if linux_cuda_choice_from_release(host, bundle) is None:
@@ -891,6 +900,8 @@ def resolve_requested_install_tag(
         raise PrebuiltFallback(
             f"no compatible published Linux CUDA release tag was found in {published_repo}"
         )
+    if policy == "upstream_native_latest":
+        return latest_upstream_release_tag()
     for release in iter_upstream_releases():
         tag = release.get("tag_name")
         if not isinstance(tag, str) or not tag:
@@ -1244,13 +1255,9 @@ def resolve_linux_cuda_choice(host: HostInfo, llama_tag: str, published_repo: st
     raise PrebuiltFallback("no compatible published Linux CUDA bundle was found")
 
 
-def resolve_asset_choice(host: HostInfo, llama_tag: str, published_repo: str, published_release_tag: str) -> AssetChoice:
+def resolve_upstream_asset_choice(host: HostInfo, llama_tag: str) -> AssetChoice:
     upstream_assets = github_release_assets(UPSTREAM_REPO, llama_tag)
-
     if host.is_linux and host.is_x86_64:
-        if host.has_usable_nvidia:
-            return resolve_linux_cuda_choice(host, llama_tag, published_repo, published_release_tag).primary
-
         upstream_name = f"llama-{llama_tag}-bin-ubuntu-x64.tar.gz"
         if upstream_name not in upstream_assets:
             raise PrebuiltFallback("upstream Linux CPU asset was not found")
@@ -1309,6 +1316,12 @@ def resolve_asset_choice(host: HostInfo, llama_tag: str, published_repo: str, pu
         )
 
     raise PrebuiltFallback(f"no prebuilt policy exists for {host.system} {host.machine}")
+
+
+def resolve_asset_choice(host: HostInfo, llama_tag: str, published_repo: str, published_release_tag: str) -> AssetChoice:
+    if host.is_linux and host.is_x86_64 and host.has_usable_nvidia:
+        return resolve_linux_cuda_choice(host, llama_tag, published_repo, published_release_tag).primary
+    return resolve_upstream_asset_choice(host, llama_tag)
 
 
 def extract_archive(archive_path: Path, destination: Path) -> None:

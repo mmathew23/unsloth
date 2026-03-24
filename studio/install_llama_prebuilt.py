@@ -247,6 +247,7 @@ class DownloadProgress:
         self.completed = False
         self.last_milestone_percent = -1
         self.last_milestone_bytes = 0
+        self.has_rendered_tty_progress = False
 
     def _render(self, downloaded_bytes: int, *, final: bool = False) -> str:
         elapsed = max(time.monotonic() - self.start_time, 1e-6)
@@ -273,6 +274,7 @@ class DownloadProgress:
             line = self._render(downloaded_bytes)
             self.stream.write("\r\033[K" + line)
             self.stream.flush()
+            self.has_rendered_tty_progress = True
             return
 
         should_emit = False
@@ -299,6 +301,8 @@ class DownloadProgress:
         self.completed = True
         line = self._render(downloaded_bytes, final=True)
         if self.is_tty:
+            if not self.has_rendered_tty_progress:
+                return
             self.stream.write("\r\033[K" + line + "\n")
         else:
             self.stream.write(line + "\n")
@@ -415,8 +419,12 @@ def download_file(url: str, destination: Path) -> None:
     raise last_exc
 
 
-def upstream_source_archive_url(tag: str) -> str:
-    return f"https://github.com/{UPSTREAM_REPO}/archive/refs/tags/{urllib.parse.quote(tag, safe='')}.tar.gz"
+def upstream_source_archive_urls(tag: str) -> list[str]:
+    encoded_tag = urllib.parse.quote(tag, safe="")
+    return [
+        f"https://codeload.github.com/{UPSTREAM_REPO}/tar.gz/refs/tags/{encoded_tag}",
+        f"https://github.com/{UPSTREAM_REPO}/archive/refs/tags/{encoded_tag}.tar.gz",
+    ]
 
 
 def github_release_assets(repo: str, tag: str) -> dict[str, str]:
@@ -1600,12 +1608,28 @@ def copy_directory_contents(source_dir: Path, destination: Path) -> None:
 
 def hydrate_source_tree(upstream_tag: str, install_dir: Path, work_dir: Path) -> None:
     archive_path = work_dir / f"llama.cpp-source-{upstream_tag}.tar.gz"
-    source_url = upstream_source_archive_url(upstream_tag)
+    source_urls = upstream_source_archive_urls(upstream_tag)
     extract_dir = Path(tempfile.mkdtemp(prefix="source-extract-", dir=work_dir))
 
     try:
         log(f"downloading llama.cpp source tree for upstream tag {upstream_tag}")
-        download_file(source_url, archive_path)
+        last_exc: Exception | None = None
+        downloaded = False
+        for index, source_url in enumerate(source_urls):
+            try:
+                if index > 0:
+                    log(f"retrying source tree download from fallback URL: {source_url}")
+                download_file(source_url, archive_path)
+                downloaded = True
+                break
+            except Exception as exc:
+                last_exc = exc
+                if index == len(source_urls) - 1:
+                    raise
+                log(f"source tree download failed from {source_url}: {exc}")
+        if not downloaded:
+            assert last_exc is not None
+            raise last_exc
         extract_archive(archive_path, extract_dir)
         source_root = extracted_archive_root(extract_dir)
         required_paths = [

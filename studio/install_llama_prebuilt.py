@@ -241,7 +241,9 @@ class DownloadProgress:
         self.total_bytes = total_bytes if total_bytes and total_bytes > 0 else None
         self.start_time = time.monotonic()
         self.last_emit = 0.0
-        self.is_tty = sys.stderr.isatty() and os.environ.get("TERM", "").lower() != "dumb"
+        term_ok = os.environ.get("TERM", "").lower() != "dumb"
+        self.stream = sys.stderr if sys.stderr.isatty() else sys.stdout if sys.stdout.isatty() else sys.stderr
+        self.is_tty = term_ok and self.stream.isatty()
         self.completed = False
         self.last_milestone_percent = -1
         self.last_milestone_bytes = 0
@@ -269,8 +271,8 @@ class DownloadProgress:
                 return
             self.last_emit = now
             line = self._render(downloaded_bytes)
-            sys.stderr.write("\r" + line.ljust(100))
-            sys.stderr.flush()
+            self.stream.write("\r\033[K" + line)
+            self.stream.flush()
             return
 
         should_emit = False
@@ -290,17 +292,17 @@ class DownloadProgress:
             return
 
         self.last_emit = now
-        sys.stderr.write(self._render(downloaded_bytes) + "\n")
-        sys.stderr.flush()
+        self.stream.write(self._render(downloaded_bytes) + "\n")
+        self.stream.flush()
 
     def finish(self, downloaded_bytes: int) -> None:
         self.completed = True
         line = self._render(downloaded_bytes, final=True)
         if self.is_tty:
-            sys.stderr.write("\r" + line.ljust(100) + "\n")
+            self.stream.write("\r\033[K" + line + "\n")
         else:
-            sys.stderr.write(line + "\n")
-        sys.stderr.flush()
+            self.stream.write(line + "\n")
+        self.stream.flush()
 
 
 def download_label_from_url(url: str) -> str:

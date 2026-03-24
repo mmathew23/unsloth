@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+"""Cross platform llama.cpp prebuilt installer for Unsloth Studio"""
+
 from __future__ import annotations
 
 import argparse
@@ -855,6 +857,14 @@ def parse_approved_release_checksums(
         raise RuntimeError(f"published checksum asset {DEFAULT_PUBLISHED_SHA256_ASSET} was not a JSON object")
     if payload.get("component") != "llama.cpp":
         raise RuntimeError(f"published checksum asset {DEFAULT_PUBLISHED_SHA256_ASSET} did not describe llama.cpp")
+    payload_release_tag = payload.get("release_tag")
+    if not isinstance(payload_release_tag, str) or not payload_release_tag:
+        raise RuntimeError(f"published checksum asset {DEFAULT_PUBLISHED_SHA256_ASSET} omitted release_tag")
+    if payload_release_tag != release_tag:
+        raise RuntimeError(
+            f"published checksum asset {DEFAULT_PUBLISHED_SHA256_ASSET} release_tag={payload_release_tag} "
+            f"did not match pinned release tag {release_tag}"
+        )
     upstream_tag = payload.get("upstream_tag")
     if not isinstance(upstream_tag, str) or not upstream_tag:
         raise RuntimeError(f"published checksum asset {DEFAULT_PUBLISHED_SHA256_ASSET} omitted upstream_tag")
@@ -1133,14 +1143,6 @@ def pinned_published_release_bundle(repo: str, published_release_tag: str) -> Pu
     return bundle
 
 
-def install_tag_policy(host: HostInfo) -> str:
-    if host.is_linux and host.is_x86_64 and host.has_usable_nvidia:
-        return "published_linux_cuda"
-    if (host.is_windows and host.is_x86_64) or (host.is_macos and (host.is_arm64 or host.is_x86_64)):
-        return "upstream_native_latest"
-    return "upstream_compatible_scan"
-
-
 def resolve_requested_llama_tag(
     requested_tag: str | None,
 ) -> str:
@@ -1151,8 +1153,6 @@ def resolve_requested_llama_tag(
 
 def resolve_requested_install_tag(
     requested_tag: str | None,
-    host: HostInfo,
-    published_repo: str,
     published_release_tag: str = "",
 ) -> str:
     approved_tag = APPROVED_PREBUILT_LLAMA_TAG
@@ -2670,7 +2670,7 @@ def resolve_install_attempts(
     published_release_tag: str,
 ) -> tuple[str, str, list[AssetChoice], ApprovedReleaseChecksums]:
     requested_tag = llama_tag
-    resolved_tag = resolve_requested_install_tag(llama_tag, host, published_repo, published_release_tag)
+    resolved_tag = resolve_requested_install_tag(llama_tag, published_release_tag)
     checksums = load_approved_release_checksums(published_repo, resolved_tag)
     require_approved_source_hash(checksums, resolved_tag)
 
@@ -2925,15 +2925,7 @@ def main() -> int:
         return EXIT_SUCCESS
 
     if args.resolve_install_tag is not None:
-        host = detect_host()
-        print(
-            resolve_requested_install_tag(
-                args.resolve_install_tag,
-                host,
-                args.published_repo,
-                args.published_release_tag or "",
-            )
-        )
+        print(resolve_requested_install_tag(args.resolve_install_tag, args.published_release_tag or ""))
         return EXIT_SUCCESS
 
     if not args.install_dir:

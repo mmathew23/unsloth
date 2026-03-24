@@ -36,7 +36,7 @@ EXIT_FALLBACK = 2
 EXIT_ERROR = 1
 
 DEFAULT_LLAMA_TAG = os.environ.get("UNSLOTH_LLAMA_TAG")
-DEFAULT_PUBLISHED_REPO = os.environ.get("UNSLOTH_LLAMA_RELEASE_REPO", "unslothai/unsloth")
+DEFAULT_PUBLISHED_REPO = os.environ.get("UNSLOTH_LLAMA_RELEASE_REPO", "unslothai/llama.cpp")
 DEFAULT_PUBLISHED_TAG = os.environ.get("UNSLOTH_LLAMA_RELEASE_TAG")
 DEFAULT_PUBLISHED_MANIFEST_ASSET = os.environ.get(
     "UNSLOTH_LLAMA_RELEASE_MANIFEST_ASSET", "llama-prebuilt-manifest.json"

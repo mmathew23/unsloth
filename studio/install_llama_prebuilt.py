@@ -223,19 +223,99 @@ def atomic_replace_from_tempfile(tmp_path: Path, destination: Path) -> None:
     os.replace(tmp_path, destination)
 
 
+def format_byte_count(num_bytes: float) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    value = float(num_bytes)
+    for unit in units:
+        if abs(value) < 1024.0 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024.0
+    return f"{num_bytes:.1f} B"
+
+
+class DownloadProgress:
+    def __init__(self, label: str, total_bytes: int | None) -> None:
+        self.label = label
+        self.total_bytes = total_bytes if total_bytes and total_bytes > 0 else None
+        self.start_time = time.monotonic()
+        self.last_emit = 0.0
+        self.is_tty = sys.stderr.isatty()
+        self.completed = False
+
+    def _render(self, downloaded_bytes: int, *, final: bool = False) -> str:
+        elapsed = max(time.monotonic() - self.start_time, 1e-6)
+        speed = downloaded_bytes / elapsed
+        speed_text = f"{format_byte_count(speed)}/s"
+        if self.total_bytes is not None:
+            percent = min(100.0, (downloaded_bytes / self.total_bytes) * 100.0)
+            return (
+                f"{self.label}: {percent:5.1f}% "
+                f"({format_byte_count(downloaded_bytes)}/{format_byte_count(self.total_bytes)}) "
+                f"at {speed_text}"
+            )
+        if final:
+            return f"{self.label}: {format_byte_count(downloaded_bytes)} downloaded at {speed_text}"
+        return f"{self.label}: {format_byte_count(downloaded_bytes)} downloaded at {speed_text}"
+
+    def update(self, downloaded_bytes: int) -> None:
+        now = time.monotonic()
+        min_interval = 0.2 if self.is_tty else 5.0
+        if not self.completed and (now - self.last_emit) < min_interval:
+            return
+        self.last_emit = now
+        line = self._render(downloaded_bytes)
+        if self.is_tty:
+            sys.stderr.write("\r" + line.ljust(100))
+        else:
+            sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+
+    def finish(self, downloaded_bytes: int) -> None:
+        self.completed = True
+        line = self._render(downloaded_bytes, final=True)
+        if self.is_tty:
+            sys.stderr.write("\r" + line.ljust(100) + "\n")
+        else:
+            sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+
+
+def download_label_from_url(url: str) -> str:
+    name = Path(urllib.parse.urlparse(url).path).name
+    return name or url
+
+
 def download_bytes(
     url: str,
     *,
     timeout: int = 120,
     attempts: int = HTTP_FETCH_ATTEMPTS,
     headers: dict[str, str] | None = None,
+    progress_label: str | None = None,
 ) -> bytes:
     last_exc: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
             request = urllib.request.Request(url, headers=headers or auth_headers(url))
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                return response.read()
+                total_bytes: int | None = None
+                content_length = response.headers.get("Content-Length")
+                if content_length and content_length.isdigit():
+                    total_bytes = int(content_length)
+                progress = DownloadProgress(progress_label, total_bytes) if progress_label else None
+                data = bytearray()
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+                    if progress is not None:
+                        progress.update(len(data))
+                if progress is not None:
+                    progress.finish(len(data))
+                return bytes(data)
         except Exception as exc:
             last_exc = exc
             if attempt >= attempts or not is_retryable_url_error(exc):
@@ -277,7 +357,20 @@ def download_file(url: str, destination: Path) -> None:
             ) as handle:
                 tmp_path = Path(handle.name)
                 with urllib.request.urlopen(request, timeout=120) as response:
-                    shutil.copyfileobj(response, handle, length=1024 * 1024)
+                    total_bytes: int | None = None
+                    content_length = response.headers.get("Content-Length")
+                    if content_length and content_length.isdigit():
+                        total_bytes = int(content_length)
+                    progress = DownloadProgress(f"Downloading {destination.name}", total_bytes)
+                    downloaded_bytes = 0
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        handle.write(chunk)
+                        downloaded_bytes += len(chunk)
+                        progress.update(downloaded_bytes)
+                    progress.finish(downloaded_bytes)
                 handle.flush()
                 os.fsync(handle.fileno())
             if not tmp_path.exists() or tmp_path.stat().st_size == 0:
@@ -1456,7 +1549,7 @@ def copy_globs(source_dir: Path, destination: Path, patterns: list[str], *, requ
 def ensure_converter_scripts(install_dir: Path, llama_tag: str) -> None:
     raw_base = f"https://raw.githubusercontent.com/ggml-org/llama.cpp/{llama_tag}"
     source_url = f"{raw_base}/convert_hf_to_gguf.py"
-    data = download_bytes(source_url)
+    data = download_bytes(source_url, progress_label=f"Downloading {download_label_from_url(source_url)}")
     if not data:
         raise RuntimeError(f"downloaded empty converter script from {source_url}")
     if b"import " not in data and b"def " not in data and b"#!/" not in data:
@@ -1877,7 +1970,12 @@ def download_validation_model(path: Path, cache_path: Path | None = None) -> Non
                 data = None
         if data is None:
             log("downloading tiny GGUF validation model")
-            data = validated_validation_model_bytes(download_bytes(TEST_MODEL_URL))
+            data = validated_validation_model_bytes(
+                download_bytes(
+                    TEST_MODEL_URL,
+                    progress_label=f"Downloading {download_label_from_url(TEST_MODEL_URL)}",
+                )
+            )
             if cache_path is not None:
                 atomic_write_bytes(cache_path, data)
         atomic_write_bytes(path, data)

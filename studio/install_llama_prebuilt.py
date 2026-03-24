@@ -35,11 +35,15 @@ EXIT_SUCCESS = 0
 EXIT_FALLBACK = 2
 EXIT_ERROR = 1
 
-DEFAULT_LLAMA_TAG = os.environ.get("UNSLOTH_LLAMA_TAG")
+APPROVED_PREBUILT_LLAMA_TAG = "b8508"
+DEFAULT_LLAMA_TAG = os.environ.get("UNSLOTH_LLAMA_TAG", APPROVED_PREBUILT_LLAMA_TAG)
 DEFAULT_PUBLISHED_REPO = os.environ.get("UNSLOTH_LLAMA_RELEASE_REPO", "unslothai/llama.cpp")
 DEFAULT_PUBLISHED_TAG = os.environ.get("UNSLOTH_LLAMA_RELEASE_TAG")
 DEFAULT_PUBLISHED_MANIFEST_ASSET = os.environ.get(
     "UNSLOTH_LLAMA_RELEASE_MANIFEST_ASSET", "llama-prebuilt-manifest.json"
+)
+DEFAULT_PUBLISHED_SHA256_ASSET = os.environ.get(
+    "UNSLOTH_LLAMA_RELEASE_SHA256_ASSET", "llama-prebuilt-sha256.json"
 )
 UPSTREAM_REPO = "ggml-org/llama.cpp"
 UPSTREAM_RELEASES_API = f"https://api.github.com/repos/{UPSTREAM_REPO}/releases/latest"
@@ -93,6 +97,7 @@ class AssetChoice:
     min_sm: int | None = None
     max_sm: int | None = None
     selection_log: list[str] | None = None
+    expected_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -135,6 +140,23 @@ class LinuxCudaSelection:
 class CudaRuntimePreference:
     runtime_line: str | None
     selection_log: list[str]
+
+
+@dataclass(frozen=True)
+class ApprovedArtifactHash:
+    asset_name: str
+    sha256: str
+    repo: str | None
+    kind: str | None
+
+
+@dataclass
+class ApprovedReleaseChecksums:
+    repo: str
+    release_tag: str
+    upstream_tag: str
+    source_commit: str | None
+    artifacts: dict[str, ApprovedArtifactHash]
 
 
 class PrebuiltFallback(RuntimeError):
@@ -222,6 +244,29 @@ def atomic_write_bytes(destination: Path, data: bytes) -> None:
 def atomic_replace_from_tempfile(tmp_path: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     os.replace(tmp_path, destination)
+
+
+def source_archive_logical_name(upstream_tag: str) -> str:
+    return f"llama.cpp-source-{upstream_tag}.tar.gz"
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def normalize_sha256_digest(value: str | None) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    lowered = value.lower()
+    if lowered.startswith("sha256:"):
+        lowered = lowered.split(":", 1)[1]
+    if len(lowered) != 64 or any(ch not in "0123456789abcdef" for ch in lowered):
+        return None
+    return lowered
 
 
 def format_byte_count(num_bytes: float) -> str:
@@ -424,6 +469,36 @@ def download_file(url: str, destination: Path) -> None:
             sleep_backoff(attempt)
     assert last_exc is not None
     raise last_exc
+
+
+def download_file_verified(
+    url: str,
+    destination: Path,
+    *,
+    expected_sha256: str,
+    label: str,
+) -> None:
+    normalized_expected = normalize_sha256_digest(expected_sha256)
+    if not normalized_expected:
+        raise PrebuiltFallback(f"{label} did not have a valid approved sha256")
+
+    for attempt in range(1, 3):
+        download_file(url, destination)
+        actual_sha256 = sha256_file(destination)
+        if actual_sha256 == normalized_expected:
+            log(f"verified {label} sha256={actual_sha256}")
+            return
+
+        log(
+            f"{label} checksum mismatch on attempt {attempt}/2: "
+            f"expected={normalized_expected} actual={actual_sha256}"
+        )
+        destination.unlink(missing_ok=True)
+        if attempt == 2:
+            raise PrebuiltFallback(
+                f"{label} checksum mismatch after retry: expected={normalized_expected} actual={actual_sha256}"
+            )
+        log(f"retrying {label} download after checksum mismatch")
 
 
 def upstream_source_archive_urls(tag: str) -> list[str]:
@@ -771,6 +846,77 @@ def parse_published_release_bundle(repo: str, release: dict[str, Any]) -> Publis
     )
 
 
+def parse_approved_release_checksums(
+    repo: str,
+    release_tag: str,
+    payload: Any,
+) -> ApprovedReleaseChecksums:
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"published checksum asset {DEFAULT_PUBLISHED_SHA256_ASSET} was not a JSON object")
+    if payload.get("component") != "llama.cpp":
+        raise RuntimeError(f"published checksum asset {DEFAULT_PUBLISHED_SHA256_ASSET} did not describe llama.cpp")
+    upstream_tag = payload.get("upstream_tag")
+    if not isinstance(upstream_tag, str) or not upstream_tag:
+        raise RuntimeError(f"published checksum asset {DEFAULT_PUBLISHED_SHA256_ASSET} omitted upstream_tag")
+    artifacts_payload = payload.get("artifacts")
+    if not isinstance(artifacts_payload, dict):
+        raise RuntimeError(f"published checksum asset {DEFAULT_PUBLISHED_SHA256_ASSET} omitted artifacts")
+
+    artifacts: dict[str, ApprovedArtifactHash] = {}
+    for asset_name, raw_entry in artifacts_payload.items():
+        if not isinstance(asset_name, str) or not asset_name:
+            raise RuntimeError("published checksum asset used a non-string artifact key")
+        if not isinstance(raw_entry, dict):
+            raise RuntimeError(f"published checksum entry for {asset_name} was not an object")
+        digest = normalize_sha256_digest(raw_entry.get("sha256"))
+        if not digest:
+            raise RuntimeError(f"published checksum entry for {asset_name} omitted a valid sha256")
+        repo_value = raw_entry.get("repo")
+        kind_value = raw_entry.get("kind")
+        artifacts[asset_name] = ApprovedArtifactHash(
+            asset_name=asset_name,
+            sha256=digest,
+            repo=repo_value if isinstance(repo_value, str) and repo_value else None,
+            kind=kind_value if isinstance(kind_value, str) and kind_value else None,
+        )
+
+    source_commit = payload.get("source_commit")
+    return ApprovedReleaseChecksums(
+        repo=repo,
+        release_tag=release_tag,
+        upstream_tag=upstream_tag,
+        source_commit=source_commit if isinstance(source_commit, str) and source_commit else None,
+        artifacts=artifacts,
+    )
+
+
+def load_approved_release_checksums(repo: str, release_tag: str) -> ApprovedReleaseChecksums:
+    try:
+        release = github_release(repo, release_tag)
+    except Exception as exc:
+        raise PrebuiltFallback(f"approved prebuilt release {repo}@{release_tag} was not available") from exc
+    assets = release_asset_map(release)
+    checksum_url = assets.get(DEFAULT_PUBLISHED_SHA256_ASSET)
+    if not checksum_url:
+        raise PrebuiltFallback(
+            f"approved prebuilt release {repo}@{release_tag} did not expose {DEFAULT_PUBLISHED_SHA256_ASSET}"
+        )
+    try:
+        payload = fetch_json(checksum_url)
+        checksums = parse_approved_release_checksums(repo, release_tag, payload)
+    except PrebuiltFallback:
+        raise
+    except Exception as exc:
+        raise PrebuiltFallback(
+            f"approved checksum asset {DEFAULT_PUBLISHED_SHA256_ASSET} in {repo}@{release_tag} was invalid"
+        ) from exc
+    if checksums.upstream_tag != release_tag:
+        raise PrebuiltFallback(
+            f"approved checksum asset upstream_tag={checksums.upstream_tag} did not match pinned tag {release_tag}"
+        )
+    return checksums
+
+
 def iter_published_release_bundles(repo: str, published_release_tag: str = "") -> Iterable[PublishedReleaseBundle]:
     releases = [github_release(repo, published_release_tag)] if published_release_tag else github_releases(repo)
     for release in releases:
@@ -1009,41 +1155,17 @@ def resolve_requested_install_tag(
     published_repo: str,
     published_release_tag: str = "",
 ) -> str:
-    if requested_tag and requested_tag != "latest":
-        return requested_tag
-    policy = install_tag_policy(host)
-    if policy == "published_linux_cuda":
-        if published_release_tag:
-            bundle = pinned_published_release_bundle(published_repo, published_release_tag)
-            if linux_cuda_choice_from_release(host, bundle) is None:
-                raise PrebuiltFallback(
-                    f"published release {published_repo}@{published_release_tag} "
-                    "did not contain a compatible Linux CUDA bundle for this host"
-                )
-            return bundle.upstream_tag
-        try:
-            published_tag = latest_published_linux_cuda_tag(host, published_repo)
-        except Exception as exc:
-            log(f"linux CUDA latest-tag lookup failed for {published_repo}: {exc}")
-        else:
-            if published_tag:
-                return published_tag
+    approved_tag = APPROVED_PREBUILT_LLAMA_TAG
+    normalized_requested = requested_tag or "latest"
+    if normalized_requested not in {"latest", approved_tag}:
         raise PrebuiltFallback(
-            f"no compatible published Linux CUDA release tag was found in {published_repo}"
+            f"prebuilt installs are pinned to approved release {approved_tag}; requested {normalized_requested}"
         )
-    if policy == "upstream_native_latest":
-        return latest_upstream_release_tag()
-    for release in iter_upstream_releases():
-        tag = release.get("tag_name")
-        if not isinstance(tag, str) or not tag:
-            continue
-        try:
-            resolve_asset_choice(host, tag, published_repo, published_release_tag)
-        except PrebuiltFallback:
-            continue
-        else:
-            return tag
-    raise PrebuiltFallback(f"no installable upstream llama.cpp release tag was found for {host.system} {host.machine}")
+    if published_release_tag and published_release_tag != approved_tag:
+        raise PrebuiltFallback(
+            f"prebuilt installs require published release tag {approved_tag}; requested {published_release_tag}"
+        )
+    return approved_tag
 
 
 def run_capture(
@@ -1613,7 +1735,13 @@ def copy_directory_contents(source_dir: Path, destination: Path) -> None:
             shutil.copy2(item, target)
 
 
-def hydrate_source_tree(upstream_tag: str, install_dir: Path, work_dir: Path) -> None:
+def hydrate_source_tree(
+    upstream_tag: str,
+    install_dir: Path,
+    work_dir: Path,
+    *,
+    expected_sha256: str,
+) -> None:
     archive_path = work_dir / f"llama.cpp-source-{upstream_tag}.tar.gz"
     source_urls = upstream_source_archive_urls(upstream_tag)
     extract_dir = Path(tempfile.mkdtemp(prefix="source-extract-", dir=work_dir))
@@ -1626,7 +1754,12 @@ def hydrate_source_tree(upstream_tag: str, install_dir: Path, work_dir: Path) ->
             try:
                 if index > 0:
                     log(f"retrying source tree download from fallback URL: {source_url}")
-                download_file(source_url, archive_path)
+                download_file_verified(
+                    source_url,
+                    archive_path,
+                    expected_sha256=expected_sha256,
+                    label=f"llama.cpp source tree for {upstream_tag}",
+                )
                 downloaded = True
                 break
             except Exception as exc:
@@ -1937,7 +2070,14 @@ def activate_install_tree(staging_dir: Path, install_dir: Path, host: HostInfo) 
 def install_from_archives(choice: AssetChoice, host: HostInfo, install_dir: Path, work_dir: Path) -> tuple[Path, Path]:
     main_archive = work_dir / choice.name
     log(f"downloading {choice.name} from {choice.source_label} release")
-    download_file(choice.url, main_archive)
+    if not choice.expected_sha256:
+        raise PrebuiltFallback(f"approved checksum was missing for selected asset {choice.name}")
+    download_file_verified(
+        choice.url,
+        main_archive,
+        expected_sha256=choice.expected_sha256,
+        label=f"prebuilt archive {choice.name}",
+    )
 
     install_dir.mkdir(parents=True, exist_ok=True)
     extract_dir = Path(tempfile.mkdtemp(prefix="extract-", dir=work_dir))
@@ -2491,36 +2631,71 @@ def collect_system_report(host: HostInfo, choice: AssetChoice | None, install_di
     return "\n".join(lines)
 
 
+def apply_approved_hashes(
+    attempts: Iterable[AssetChoice],
+    checksums: ApprovedReleaseChecksums,
+) -> list[AssetChoice]:
+    approved_attempts: list[AssetChoice] = []
+    missing_assets: list[str] = []
+    for attempt in attempts:
+        approved = checksums.artifacts.get(attempt.name)
+        if approved is None:
+            missing_assets.append(attempt.name)
+            continue
+        attempt.expected_sha256 = approved.sha256
+        approved_attempts.append(attempt)
+    if not approved_attempts:
+        missing_text = ", ".join(missing_assets) if missing_assets else "none"
+        raise PrebuiltFallback(
+            "approved checksum asset did not contain the selected prebuilt archive(s): "
+            f"{missing_text}"
+        )
+    return approved_attempts
+
+
+def require_approved_source_hash(checksums: ApprovedReleaseChecksums, llama_tag: str) -> ApprovedArtifactHash:
+    source_asset_name = source_archive_logical_name(llama_tag)
+    approved_source = checksums.artifacts.get(source_asset_name)
+    if approved_source is None:
+        raise PrebuiltFallback(
+            f"approved checksum asset did not contain source archive {source_asset_name}"
+        )
+    return approved_source
+
+
 def resolve_install_attempts(
     llama_tag: str,
     host: HostInfo,
     published_repo: str,
     published_release_tag: str,
-) -> tuple[str, str, list[AssetChoice]]:
+) -> tuple[str, str, list[AssetChoice], ApprovedReleaseChecksums]:
     requested_tag = llama_tag
     resolved_tag = resolve_requested_install_tag(llama_tag, host, published_repo, published_release_tag)
+    checksums = load_approved_release_checksums(published_repo, resolved_tag)
+    require_approved_source_hash(checksums, resolved_tag)
 
     if host.is_linux and host.is_x86_64 and host.has_usable_nvidia:
         linux_cuda_selection = resolve_linux_cuda_choice(host, resolved_tag, published_repo, published_release_tag)
-        attempts = linux_cuda_selection.attempts
+        attempts = apply_approved_hashes(linux_cuda_selection.attempts, checksums)
         if not attempts:
             raise PrebuiltFallback("no compatible Linux CUDA asset was found")
         log_lines(linux_cuda_selection.selection_log)
-        return requested_tag, resolved_tag, attempts
+        return requested_tag, resolved_tag, attempts, checksums
 
     if host.is_windows and host.is_x86_64 and host.has_usable_nvidia:
         upstream_assets = github_release_assets(UPSTREAM_REPO, resolved_tag)
-        attempts = resolve_windows_cuda_choices(host, resolved_tag, upstream_assets)
+        attempts = apply_approved_hashes(resolve_windows_cuda_choices(host, resolved_tag, upstream_assets), checksums)
         if not attempts:
             raise PrebuiltFallback("no compatible Windows CUDA asset was found")
         if attempts[0].selection_log:
             log_lines(attempts[0].selection_log)
-        return requested_tag, resolved_tag, attempts
+        return requested_tag, resolved_tag, attempts, checksums
 
     choice = resolve_asset_choice(host, resolved_tag, published_repo, published_release_tag)
+    approved_attempts = apply_approved_hashes([choice], checksums)
     if choice.selection_log:
         log_lines(choice.selection_log)
-    return requested_tag, resolved_tag, [choice]
+    return requested_tag, resolved_tag, approved_attempts, checksums
 
 
 def write_prebuilt_metadata(
@@ -2554,11 +2729,22 @@ def validate_prebuilt_choice(
     *,
     requested_tag: str,
     llama_tag: str,
+    approved_checksums: ApprovedReleaseChecksums,
     prebuilt_fallback_used: bool,
     quantized_path: Path,
 ) -> tuple[Path, Path]:
+    source_archive = approved_checksums.artifacts.get(source_archive_logical_name(llama_tag))
+    if source_archive is None:
+        raise PrebuiltFallback(
+            f"approved checksum asset did not contain source archive {source_archive_logical_name(llama_tag)}"
+        )
     log(f"hydrating upstream llama.cpp source for {llama_tag} into {install_dir}")
-    hydrate_source_tree(llama_tag, install_dir, work_dir)
+    hydrate_source_tree(
+        llama_tag,
+        install_dir,
+        work_dir,
+        expected_sha256=source_archive.sha256,
+    )
     log(f"overlaying prebuilt bundle {choice.name} into {install_dir}")
     server_path, quantize_path = install_from_archives(choice, host, install_dir, work_dir)
     preflight_linux_installed_binaries((server_path, quantize_path), install_dir, host)
@@ -2598,6 +2784,7 @@ def validate_prebuilt_attempts(
     *,
     requested_tag: str,
     llama_tag: str,
+    approved_checksums: ApprovedReleaseChecksums,
 ) -> tuple[AssetChoice, Path, bool]:
     attempt_list = list(attempts)
     if not attempt_list:
@@ -2626,6 +2813,7 @@ def validate_prebuilt_attempts(
                 probe_path,
                 requested_tag=requested_tag,
                 llama_tag=llama_tag,
+                approved_checksums=approved_checksums,
                 prebuilt_fallback_used=tried_fallback,
                 quantized_path=quantized_path,
             )
@@ -2660,7 +2848,7 @@ def install_prebuilt(install_dir: Path, llama_tag: str, published_repo: str, pub
                 log(f"existing llama.cpp install detected at {install_dir}; validating staged prebuilt update before replacement")
             else:
                 log(f"no existing llama.cpp install detected at {install_dir}; performing fresh prebuilt install")
-            requested_tag, llama_tag, attempts = resolve_install_attempts(
+            requested_tag, llama_tag, attempts, approved_checksums = resolve_install_attempts(
                 llama_tag,
                 host,
                 published_repo,
@@ -2680,6 +2868,7 @@ def install_prebuilt(install_dir: Path, llama_tag: str, published_repo: str, pub
                     probe_path,
                     requested_tag=requested_tag,
                     llama_tag=llama_tag,
+                    approved_checksums=approved_checksums,
                 )
                 activate_install_tree(selected_staging_dir, install_dir, host)
                 try:
@@ -2705,7 +2894,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--llama-tag",
         default=DEFAULT_LLAMA_TAG,
-        help="llama.cpp release tag. Defaults to the latest upstream release tag.",
+        help=f"llama.cpp release tag. Prebuilt installs are pinned to the approved tag {APPROVED_PREBUILT_LLAMA_TAG}.",
     )
     parser.add_argument("--published-repo", default=DEFAULT_PUBLISHED_REPO, help="Published bundle repository")
     parser.add_argument(

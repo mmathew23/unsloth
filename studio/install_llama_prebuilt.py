@@ -310,7 +310,7 @@ class DownloadProgress:
         if self.is_tty:
             if not self.has_rendered_tty_progress:
                 return
-            self.stream.write("\r\033[K" + line + "\n")
+            self.stream.write("\r\033[K")
         else:
             self.stream.write(line + "\n")
         self.stream.flush()

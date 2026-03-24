@@ -241,8 +241,10 @@ class DownloadProgress:
         self.total_bytes = total_bytes if total_bytes and total_bytes > 0 else None
         self.start_time = time.monotonic()
         self.last_emit = 0.0
-        self.is_tty = sys.stderr.isatty()
+        self.is_tty = sys.stderr.isatty() and os.environ.get("TERM", "").lower() != "dumb"
         self.completed = False
+        self.last_milestone_percent = -1
+        self.last_milestone_bytes = 0
 
     def _render(self, downloaded_bytes: int, *, final: bool = False) -> str:
         elapsed = max(time.monotonic() - self.start_time, 1e-6)
@@ -261,15 +263,34 @@ class DownloadProgress:
 
     def update(self, downloaded_bytes: int) -> None:
         now = time.monotonic()
-        min_interval = 0.2 if self.is_tty else 5.0
-        if not self.completed and (now - self.last_emit) < min_interval:
-            return
-        self.last_emit = now
-        line = self._render(downloaded_bytes)
         if self.is_tty:
+            min_interval = 0.2
+            if not self.completed and (now - self.last_emit) < min_interval:
+                return
+            self.last_emit = now
+            line = self._render(downloaded_bytes)
             sys.stderr.write("\r" + line.ljust(100))
+            sys.stderr.flush()
+            return
+
+        should_emit = False
+        if self.total_bytes is not None:
+            percent = int((downloaded_bytes * 100) / max(self.total_bytes, 1))
+            milestone_percent = min((percent // 25) * 25, 100)
+            if milestone_percent > self.last_milestone_percent and milestone_percent < 100:
+                self.last_milestone_percent = milestone_percent
+                should_emit = True
         else:
-            sys.stderr.write(line + "\n")
+            byte_step = 25 * 1024 * 1024
+            if downloaded_bytes - self.last_milestone_bytes >= byte_step and (now - self.last_emit) >= 5.0:
+                self.last_milestone_bytes = downloaded_bytes
+                should_emit = True
+
+        if not should_emit:
+            return
+
+        self.last_emit = now
+        sys.stderr.write(self._render(downloaded_bytes) + "\n")
         sys.stderr.flush()
 
     def finish(self, downloaded_bytes: int) -> None:

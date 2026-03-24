@@ -55,6 +55,7 @@ HTTP_FETCH_ATTEMPTS = 4
 HTTP_FETCH_BASE_DELAY_SECONDS = 0.75
 SERVER_PORT_BIND_ATTEMPTS = 3
 SERVER_BIND_RETRY_WINDOW_SECONDS = 5.0
+TTY_PROGRESS_START_DELAY_SECONDS = 0.5
 
 
 @dataclass
@@ -267,8 +268,14 @@ class DownloadProgress:
     def update(self, downloaded_bytes: int) -> None:
         now = time.monotonic()
         if self.is_tty:
+            elapsed = now - self.start_time
+            if not self.has_rendered_tty_progress:
+                if self.total_bytes is not None and downloaded_bytes >= self.total_bytes:
+                    return
+                if elapsed < TTY_PROGRESS_START_DELAY_SECONDS:
+                    return
             min_interval = 0.2
-            if not self.completed and (now - self.last_emit) < min_interval:
+            if self.has_rendered_tty_progress and not self.completed and (now - self.last_emit) < min_interval:
                 return
             self.last_emit = now
             line = self._render(downloaded_bytes)

@@ -323,8 +323,8 @@ class UnslothTrainer:
             "gradient_accumulation_steps": gradient_accumulation_steps,
             "warmup_steps": warmup_steps_val if warmup_steps_val is not None else 5,
             "learning_rate": learning_rate,
-            "fp16": not is_bfloat16_supported(),
-            "bf16": is_bfloat16_supported(),
+            "fp16": False if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1" else not is_bfloat16_supported(),
+            "bf16": False if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1" else is_bfloat16_supported(),
             "logging_steps": 1,
             "optim": optim_value,
             "weight_decay": weight_decay,
@@ -3007,8 +3007,8 @@ class UnslothTrainer:
                     "num_epochs", 3
                 ),  # Default to epochs
                 "learning_rate": lr_value,
-                "fp16": not is_bfloat16_supported(),
-                "bf16": is_bfloat16_supported(),
+                "fp16": False if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1" else not is_bfloat16_supported(),
+                "bf16": False if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1" else is_bfloat16_supported(),
                 "logging_steps": 1,
                 "weight_decay": training_args.get("weight_decay", 0.01),
                 "seed": training_args.get("random_seed", 3407),

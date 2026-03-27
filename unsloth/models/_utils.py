@@ -1995,6 +1995,30 @@ def patch_gradient_accumulation_fix(Trainer):
             "if False:",
         )
 
+        # Transformers 5.x changed the GA division condition to a compound expression:
+        # `(not self.model_accepts_loss_kwargs or num_items_in_batch is None) and self.compute_loss_func is None`
+        # followed by `loss = loss / self.current_gradient_accumulation_steps`
+        # Unsloth's fused loss pre-computes gradients expecting grad_output=1.0,
+        # so we must prevent any division of loss before backward.
+        function = re.sub(
+            r"if\s*\(?\s*not self\.model_accepts_loss_kwargs\b.*?:",
+            "if False:",
+            function,
+            flags=re.DOTALL,
+        )
+
+        # Counteract accelerate's backward() which unconditionally does
+        # `loss = loss / self.gradient_accumulation_steps` (accelerator.py).
+        # Unsloth's fused loss pre-computes gradients expecting grad_output=1.0,
+        # so we multiply by GA steps before backward to cancel accelerate's division.
+        # In transformers 4.x this was done via `loss *= self.args.gradient_accumulation_steps`
+        # but that line was removed in transformers 5.x.
+        function = function.replace(
+            "self.accelerator.backward(loss, **kwargs)",
+            "loss = loss * self.args.gradient_accumulation_steps\n"
+            "        self.accelerator.backward(loss, **kwargs)",
+        )
+
         # Fix when num_items_in_batch is nothing
         # https://github.com/huggingface/transformers/pull/35207
         function = re.sub(

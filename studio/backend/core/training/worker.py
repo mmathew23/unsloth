@@ -338,6 +338,33 @@ def _activate_transformers_version(model_name: str) -> None:
         logger.info("Using default transformers (4.57.x) for %s", model_name)
 
 
+class _TeeWriter:
+    """Duplicate writes to multiple streams (e.g. stdout + log file)."""
+    def __init__(self, *streams):
+        self.streams = streams
+    def write(self, data):
+        for s in self.streams:
+            try:
+                s.write(data)
+            except Exception:
+                pass
+    def flush(self):
+        for s in self.streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+
+def _dev_debug_log_path() -> str:
+    """Return the debug log path: /content/ on Colab, else ~/.unsloth/studio/."""
+    if os.path.exists("/content"):
+        return "/content/unsloth_studio_debug.log"
+    log_dir = os.path.expanduser("~/.unsloth/studio")
+    os.makedirs(log_dir, exist_ok = True)
+    return os.path.join(log_dir, "debug.log")
+
+
 def run_training_process(
     *,
     event_queue: Any,
@@ -351,15 +378,30 @@ def run_training_process(
         stop_queue: mp.Queue for receiving stop commands from parent.
         config: Training configuration dict with all parameters.
     """
+    _is_dev = os.environ.get("UNSLOTH_STUDIO_DEV") == "1"
+
+    # Dev mode: tee stdout/stderr to a debug log file
+    _dev_log_file = None
+    if _is_dev:
+        try:
+            _dev_log_path = _dev_debug_log_path()
+            _dev_log_file = open(_dev_log_path, "a", buffering = 1)
+            sys.stdout = _TeeWriter(sys.__stdout__, _dev_log_file)
+            sys.stderr = _TeeWriter(sys.__stderr__, _dev_log_file)
+            _dev_log_file.write(f"\n{'='*60}\nDEV MODE: Training worker started\n{'='*60}\n")
+        except Exception:
+            pass  # Fall back to normal streams
+
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    os.environ["PYTHONWARNINGS"] = (
-        "ignore"  # Suppress warnings at C-level before imports
-    )
+    if not _is_dev:
+        os.environ["PYTHONWARNINGS"] = (
+            "ignore"  # Suppress warnings at C-level before imports
+        )
 
     import warnings
     from loggers.config import LogConfig
 
-    if os.getenv("ENVIRONMENT_TYPE", "production") == "production":
+    if os.getenv("ENVIRONMENT_TYPE", "production") == "production" and not _is_dev:
         warnings.filterwarnings("ignore")
 
     LogConfig.setup_logging(

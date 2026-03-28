@@ -795,6 +795,15 @@ class UnslothTrainer:
             if self.should_stop:
                 return False
 
+            # Dev mode: log compilation cache status and dtype info
+            if os.environ.get("UNSLOTH_STUDIO_DEV") == "1":
+                _cache = os.path.join(os.getcwd(), "unsloth_compiled_cache")
+                _files = [f for f in os.listdir(_cache) if f.endswith('.py')] if os.path.exists(_cache) else []
+                _model_files = [f for f in _files if 'compiled_module' in f]
+                logger.info(f"[DEV] Compiled cache: {len(_files)} files, model modules: {_model_files}")
+                logger.info(f"[DEV] UNSLOTH_FORCE_FLOAT32={os.environ.get('UNSLOTH_FORCE_FLOAT32', 'not set')}")
+                logger.info(f"[DEV] model.config.torch_dtype={getattr(self.model.config, 'torch_dtype', 'N/A')}")
+
             if full_finetuning:
                 # Enable training mode for full fine-tuning
                 # This ensures all model parameters are trainable; otherwise, they might be frozen.
@@ -3379,8 +3388,17 @@ class UnslothTrainer:
         except Exception as e:
             import traceback
 
+            tb = traceback.format_exc()
             logger.error(f"Training error: {e}")
-            logger.error(f"Full traceback:\n{traceback.format_exc()}")
+            logger.error(f"Full traceback:\n{tb}")
+            if os.environ.get("UNSLOTH_STUDIO_DEV") == "1":
+                _debug_path = "/content/unsloth_studio_debug.log" if os.path.exists("/content") else os.path.expanduser("~/.unsloth/studio/debug.log")
+                try:
+                    os.makedirs(os.path.dirname(_debug_path), exist_ok = True)
+                    with open(_debug_path, "a") as f:
+                        f.write(f"\n{'='*60}\nTRAINING ERROR\n{'='*60}\n{tb}\n")
+                except Exception:
+                    pass
             self._update_progress(is_training = False, error = str(e))
 
         finally:

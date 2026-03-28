@@ -10,7 +10,8 @@ import sys
 from pathlib import Path as _Path
 
 # Suppress annoying C-level dependency warnings globally
-os.environ["PYTHONWARNINGS"] = "ignore"
+if os.environ.get("UNSLOTH_STUDIO_DEV") != "1":
+    os.environ["PYTHONWARNINGS"] = "ignore"
 
 # Ensure backend dir is on sys.path so _platform_compat is importable when
 # main.py is launched directly (e.g. `uvicorn main:app`).
@@ -28,7 +29,7 @@ import warnings
 from contextlib import asynccontextmanager
 
 # Suppress annoying dependency warnings in production
-if os.getenv("ENVIRONMENT_TYPE", "production") == "production":
+if os.getenv("ENVIRONMENT_TYPE", "production") == "production" and os.environ.get("UNSLOTH_STUDIO_DEV") != "1":
     warnings.filterwarnings("ignore")
     # Alternatively, you can be more specific:
     # warnings.filterwarnings("ignore", category=DeprecationWarning)

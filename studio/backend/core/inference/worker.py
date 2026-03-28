@@ -485,15 +485,18 @@ def run_inference_process(
         cancel_event: mp.Event shared with parent — set by parent to cancel generation.
         config: Initial configuration dict with model info.
     """
+    _is_dev = os.environ.get("UNSLOTH_STUDIO_DEV") == "1"
+
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    os.environ["PYTHONWARNINGS"] = (
-        "ignore"  # Suppress warnings at C-level before imports
-    )
+    if not _is_dev:
+        os.environ["PYTHONWARNINGS"] = (
+            "ignore"  # Suppress warnings at C-level before imports
+        )
 
     import warnings
     from loggers.config import LogConfig
 
-    if os.getenv("ENVIRONMENT_TYPE", "production") == "production":
+    if os.getenv("ENVIRONMENT_TYPE", "production") == "production" and not _is_dev:
         warnings.filterwarnings("ignore")
 
     LogConfig.setup_logging(

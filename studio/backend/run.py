@@ -11,7 +11,8 @@ import sys
 from pathlib import Path
 
 # Suppress annoying C-level dependency warnings globally (e.g. SwigPyPacked)
-os.environ["PYTHONWARNINGS"] = "ignore"
+if os.environ.get("UNSLOTH_STUDIO_DEV") != "1":
+    os.environ["PYTHONWARNINGS"] = "ignore"
 
 # Add the backend directory to Python path early so local modules are importable
 backend_dir = Path(__file__).parent

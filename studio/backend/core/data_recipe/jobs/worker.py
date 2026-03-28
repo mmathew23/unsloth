@@ -77,14 +77,16 @@ def run_job_process(
     """
     import os
 
-    os.environ["PYTHONWARNINGS"] = (
-        "ignore"  # Suppress warnings at C-level before imports
-    )
+    _is_dev = os.environ.get("UNSLOTH_STUDIO_DEV") == "1"
+    if not _is_dev:
+        os.environ["PYTHONWARNINGS"] = (
+            "ignore"  # Suppress warnings at C-level before imports
+        )
 
     import warnings
     from loggers.config import LogConfig
 
-    if os.getenv("ENVIRONMENT_TYPE", "production") == "production":
+    if os.getenv("ENVIRONMENT_TYPE", "production") == "production" and not _is_dev:
         warnings.filterwarnings("ignore")
 
     LogConfig.setup_logging(

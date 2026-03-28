@@ -74,15 +74,23 @@ def show_link(port: int = 8888):
     display(HTML(html))
 
 
-def start(port: int = 8888):
+def start(port: int = 8888, dev: bool = False):
     """
     Start Unsloth Studio server in Colab and display the URL.
 
     Usage:
         from colab import start
-        start()
+        start()           # Normal mode
+        start(dev=True)   # Dev mode -- unsuppresses all output, logs to file
     """
+    import os
     import sys
+
+    if dev:
+        os.environ["ENVIRONMENT_TYPE"] = "development"
+        os.environ["UNSLOTH_ENABLE_LOGGING"] = "1"
+        os.environ["LOG_LEVEL"] = "DEBUG"
+        os.environ["UNSLOTH_STUDIO_DEV"] = "1"
 
     logger.info("🦥 Starting Unsloth Studio...")
 
@@ -98,8 +106,8 @@ def start(port: int = 8888):
         return
 
     logger.info("   Starting server...")
-    # Start server silently
-    run_server(host = "0.0.0.0", port = port, frontend_path = frontend_path, silent = True)
+    # Start server silently (unless dev mode)
+    run_server(host = "0.0.0.0", port = port, frontend_path = frontend_path, silent = not dev)
 
     logger.info("   Server started!")
 

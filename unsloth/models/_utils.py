@@ -2010,12 +2010,14 @@ def patch_gradient_accumulation_fix(Trainer):
         # Counteract accelerate's backward() which unconditionally does
         # `loss = loss / self.gradient_accumulation_steps` (accelerator.py).
         # Unsloth's fused loss pre-computes gradients expecting grad_output=1.0,
-        # so we multiply by GA steps before backward to cancel accelerate's division.
-        # In transformers 4.x this was done via `loss *= self.args.gradient_accumulation_steps`
-        # but that line was removed in transformers 5.x.
+        # so we multiply by accelerator's GA steps before backward to cancel the division.
+        # In transformers 5.x+, accelerator.gradient_accumulation_steps equals the actual
+        # GA value. In older versions, it's 1 (Trainer handles scaling itself), so the
+        # multiply is a no-op. This replaces the old `loss *= self.args.gradient_accumulation_steps`
+        # which was removed in transformers 4.55+ / PR #39659.
         function = function.replace(
             "self.accelerator.backward(loss, **kwargs)",
-            "loss = loss * self.args.gradient_accumulation_steps\n"
+            "loss = loss * self.accelerator.gradient_accumulation_steps\n"
             "        self.accelerator.backward(loss, **kwargs)",
         )
 

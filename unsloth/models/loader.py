@@ -1464,6 +1464,23 @@ class FastModel(FastBaseModel):
             **kwargs,
         )
 
+        # Safety net: ensure no bfloat16 params/buffers remain when FORCE_FLOAT32
+        # is active. patch_model_and_tokenizer should handle this, but some
+        # architecture-specific modules or post-load hooks may re-introduce bf16.
+        # Also upcast numerically sensitive params (A_log, dt_bias in GDN layers)
+        # to float32 to prevent gradient overflow in fp16 training.
+        if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
+            for name, param in model.named_parameters():
+                if param.dtype == torch.bfloat16:
+                    param.data = param.data.to(torch.float16)
+                # GDN decay/timestep params need float32 for numerical stability
+                # in both forward (exp overflow) and backward (gradient overflow)
+                elif "A_log" in name or "dt_bias" in name:
+                    param.data = param.data.to(torch.float32)
+            for name, buffer in model.named_buffers():
+                if buffer.dtype == torch.bfloat16:
+                    buffer.data = buffer.data.to(torch.float16)
+
         if resize_model_vocab is not None:
             model.resize_token_embeddings(resize_model_vocab)
 

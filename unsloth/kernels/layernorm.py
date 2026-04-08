@@ -13,13 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import triton
-import triton.language as tl
 import torch
+from ._backend_registry import dispatch_kernel, register_kernel_backend
+from ._optional_triton import HAS_TRITON, tl, triton
 from .utils import calculate_settings, torch_gpu_device
-from unsloth_zoo.patching_utils import (
-    patch_layernorm,
-)
 
 
 @triton.jit
@@ -180,6 +177,39 @@ def fast_layernorm(layernorm, X):
     )
     out = Fast_Layernorm.apply(X, W, bias, eps)
     return out
+
+
+def _fast_layernorm_triton(X, W, b, eps):
+    return Fast_Layernorm.apply(X, W, b, eps)
+
+
+if HAS_TRITON:
+    register_kernel_backend("unsloth.layernorm", "triton", _fast_layernorm_triton)
+
+
+def fast_layernorm(layernorm, X, *, backend = None):
+    assert layernorm.elementwise_affine is True
+    W = layernorm.weight
+    bias = layernorm.bias
+    eps = (
+        layernorm.variance_epsilon
+        if hasattr(layernorm, "variance_epsilon")
+        else layernorm.eps
+    )
+    return dispatch_kernel(
+        "unsloth.layernorm",
+        X,
+        W,
+        bias,
+        eps,
+        backend = backend,
+    )
+
+
+def patch_layernorm():
+    from unsloth_zoo.patching_utils import patch_layernorm as _patch_layernorm
+
+    return _patch_layernorm()
 
 
 def test_layernorm(

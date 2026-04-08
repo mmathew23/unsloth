@@ -50,7 +50,10 @@ from unsloth_zoo.peft_utils import (
 )
 from transformers.models.llama.modeling_llama import logger
 from transformers import __version__ as transformers_version
-from triton import __version__ as triton_version
+try:
+    from triton import __version__ as triton_version
+except ModuleNotFoundError:
+    triton_version = "not-installed"
 from unsloth_zoo.utils import _get_dtype
 from unsloth_zoo.hf_utils import (
     dtype_from_config,

@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import triton
-import triton.language as tl
 import torch
+from ._backend_registry import dispatch_kernel, register_kernel_backend
+from ._optional_triton import HAS_TRITON, tl, triton
 from .utils import calculate_settings, torch_gpu_device
 
 # signed int32 max is 2**31-1 so num_elements cannot exceed 2**31
@@ -141,3 +141,25 @@ def swiglu_DWf_DW_dfg_kernel(DW, e, g):
             LONG_INDEXING = 0 if n_elements <= INT32_SAFETY_BUFFER else 1,
         )
     return DW, e, g
+
+
+_triton_swiglu_fg_kernel = swiglu_fg_kernel
+if HAS_TRITON:
+    register_kernel_backend("unsloth.swiglu_fg", "triton", _triton_swiglu_fg_kernel)
+
+
+def swiglu_fg_kernel(e, g, *, backend = None):
+    return dispatch_kernel("unsloth.swiglu_fg", e, g, backend = backend)
+
+
+_triton_swiglu_DWf_DW_dfg_kernel = swiglu_DWf_DW_dfg_kernel
+if HAS_TRITON:
+    register_kernel_backend(
+        "unsloth.swiglu_bwd",
+        "triton",
+        _triton_swiglu_DWf_DW_dfg_kernel,
+    )
+
+
+def swiglu_DWf_DW_dfg_kernel(DW, e, g, *, backend = None):
+    return dispatch_kernel("unsloth.swiglu_bwd", DW, e, g, backend = backend)

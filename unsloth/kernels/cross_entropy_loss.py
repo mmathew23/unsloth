@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import triton
-import triton.language as tl
 import torch
+from ._backend_registry import dispatch_kernel, register_kernel_backend
+from ._optional_triton import HAS_TRITON, tl, triton
 from .utils import (
     calculate_settings,
     MAX_FUSED_SIZE,
@@ -450,6 +450,35 @@ def fast_cross_entropy_loss(
     if torch.is_tensor(n_items):
         n_items = n_items.to(device)
     return loss.sum() / n_items
+
+
+_triton_fast_cross_entropy_loss = fast_cross_entropy_loss
+if HAS_TRITON:
+    register_kernel_backend(
+        "unsloth.cross_entropy_loss",
+        "triton",
+        _triton_fast_cross_entropy_loss,
+    )
+
+
+def fast_cross_entropy_loss(
+    logits,
+    labels,
+    logit_softcapping = 0,
+    logit_scaling = 0,
+    n_items = None,
+    *,
+    backend = None,
+):
+    return dispatch_kernel(
+        "unsloth.cross_entropy_loss",
+        logits,
+        labels,
+        logit_softcapping,
+        logit_scaling,
+        n_items,
+        backend = backend,
+    )
 
 
 if (Version(torch.__version__) < Version("2.4.0")) and not hasattr(

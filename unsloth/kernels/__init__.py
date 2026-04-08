@@ -12,6 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from ._backend_registry import (
+    clear_kernel_backend_overrides,
+    describe_kernel_backends,
+    ensure_backend_loaded,
+    get_kernel_backend,
+    get_kernel_backend_state,
+    get_kernel_impl,
+    get_registered_kernel_backends,
+    is_kernel_backend_available,
+    kernel_backend_context,
+    register_kernel_backend,
+    register_impl,
+    set_kernel_backend,
+    set_kernel_backend_for_op,
+    set_kernel_backends,
+)
 from .cross_entropy_loss import (
     fast_cross_entropy_loss,
     post_patch_loss_function,

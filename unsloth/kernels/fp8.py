@@ -14,10 +14,10 @@
 import os
 import torch
 import torch.nn as nn
-import triton
-import triton.language as tl
 from torch.nn import functional as F
 import math
+from ._backend_registry import dispatch_kernel, get_kernel_backend, register_kernel_backend
+from ._optional_triton import HAS_TRITON, tl, triton
 from unsloth_zoo.utils import Version
 from unsloth_zoo.log import logger
 from unsloth_zoo.temporary_patches.common import torch_compile
@@ -94,7 +94,40 @@ def weight_dequant_block(
     return y
 
 
-def weight_dequant(x: torch.Tensor, s: torch.Tensor, dtype = torch.bfloat16):
+_triton_weight_dequant_block = weight_dequant_block
+if HAS_TRITON:
+    register_kernel_backend(
+        "unsloth.weight_dequant",
+        "triton",
+        _triton_weight_dequant_block,
+    )
+
+
+def weight_dequant_block(
+    x: torch.Tensor,
+    s: torch.Tensor,
+    block_size: int = 128,
+    dtype = torch.bfloat16,
+    *,
+    backend = None,
+) -> torch.Tensor:
+    return dispatch_kernel(
+        "unsloth.weight_dequant",
+        x,
+        s,
+        block_size,
+        dtype,
+        backend = backend,
+    )
+
+
+def weight_dequant(
+    x: torch.Tensor,
+    s: torch.Tensor,
+    dtype = torch.bfloat16,
+    *,
+    backend = None,
+):
     # Per-tensor scale: single value for entire weight matrix
     if s.numel() == 1:
         return x.to(dtype) * s.view(1, 1).to(dtype)
@@ -111,7 +144,7 @@ def weight_dequant(x: torch.Tensor, s: torch.Tensor, dtype = torch.bfloat16):
         return y
     # Block quantized weight: scale shape is (ceil(m/block_m), ceil(n/block_n))
     else:
-        return weight_dequant_block(x, s, dtype = dtype)
+        return weight_dequant_block(x, s, dtype = dtype, backend = backend)
 
 
 # Copied from https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/inference/kernel.py
@@ -145,6 +178,25 @@ def act_quant(
 
     act_quant_kernel[grid](x, y, s, BLOCK_SIZE = block_size)
     return y, s
+
+
+_triton_act_quant = act_quant
+if HAS_TRITON:
+    register_kernel_backend("unsloth.act_quant", "triton", _triton_act_quant)
+
+
+def act_quant(
+    x: torch.Tensor,
+    block_size: int = 128,
+    *,
+    backend = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return dispatch_kernel(
+        "unsloth.act_quant",
+        x,
+        block_size,
+        backend = backend,
+    )
 
 
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/quantization/fp8_kernel.py
@@ -299,6 +351,14 @@ def w8a8_block_fp8_matmul_triton(
     return C
 
 
+if HAS_TRITON:
+    register_kernel_backend(
+        "unsloth.w8a8_block_fp8_matmul",
+        "triton",
+        w8a8_block_fp8_matmul_triton,
+    )
+
+
 def torchao_block_matmul(
     act_q: torch.Tensor,
     weight_q: torch.Tensor,
@@ -320,11 +380,46 @@ def torchao_block_matmul(
 # Note that older versions of fbgemm (<=1.3.0) cause numerical imprecisions resulting in NaNs especially when X has high values in it.
 # So our preference order is fbgemm (>=1.4.0) > torchao > triton. All of these have similar outputs/losses. Never use fbgemm (<=1.3.0) for block quantized FP8 matmul.
 # This torchao FP8 matmul seems to be ~3x faster than the w8a8_block_fp8_matmul_triton. Though torchao is 15-30% slower than fbgemm implementation (on H100 GPUs).
-fp8_block_matmul = (
-    torchao_block_matmul
-    if torchao_blockwise_gemm is not None
-    else w8a8_block_fp8_matmul_triton
-)
+def fp8_block_matmul(
+    act_q: torch.Tensor,
+    weight_q: torch.Tensor,
+    act_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    block_size: tuple[int, int],
+    output_dtype: torch.dtype = torch.bfloat16,
+    *,
+    backend = None,
+):
+    if backend is None and get_kernel_backend(
+        "unsloth.w8a8_block_fp8_matmul"
+    ) == "triton":
+        if torchao_blockwise_gemm is not None:
+            return torchao_block_matmul(
+                act_q,
+                weight_q,
+                act_scale,
+                weight_scale,
+                block_size,
+                output_dtype = output_dtype,
+            )
+        return w8a8_block_fp8_matmul_triton(
+            act_q,
+            weight_q,
+            act_scale,
+            weight_scale,
+            block_size,
+            output_dtype = output_dtype,
+        )
+    return dispatch_kernel(
+        "unsloth.w8a8_block_fp8_matmul",
+        act_q,
+        weight_q,
+        act_scale,
+        weight_scale,
+        block_size,
+        output_dtype,
+        backend = backend,
+    )
 
 
 class FP8BlockQuantLinear(torch.autograd.Function):
@@ -597,7 +692,7 @@ except:
 
 
 @torch_compile
-def fp8_linear(X, weight, weight_scale, bias = None):
+def fp8_linear(X, weight, weight_scale, bias = None, *, backend = None):
     # Per-tensor quantization: single scalar scale for entire weight
     # Block quantized FP8: 2D scale tensor with multiple columns
     if weight_scale.numel() == 1 or (

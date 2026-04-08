@@ -223,82 +223,90 @@ elif DEVICE_TYPE == "xpu":
 
 # For Gradio HF Spaces?
 # if "SPACE_AUTHOR_NAME" not in os.environ and "SPACE_REPO_NAME" not in os.environ:
-import triton
+try:
+    import triton
+except ModuleNotFoundError:
+    triton = None
 
 if DEVICE_TYPE == "cuda":
-    libcuda_dirs = lambda: None
-    if Version(triton.__version__) >= Version("3.0.0"):
+    if triton is not None:
+        libcuda_dirs = lambda: None
+        if Version(triton.__version__) >= Version("3.0.0"):
+            try:
+                from triton.backends.nvidia.driver import libcuda_dirs
+            except:
+                pass
+        else:
+            from triton.common.build import libcuda_dirs
+
+        # Try loading bitsandbytes and triton
         try:
-            from triton.backends.nvidia.driver import libcuda_dirs
+            import bitsandbytes as bnb
         except:
-            pass
-    else:
-        from triton.common.build import libcuda_dirs
-
-    # Try loading bitsandbytes and triton
-    try:
-        import bitsandbytes as bnb
-    except:
-        print(
-            "Unsloth: `bitsandbytes` is not installed - 4bit QLoRA unallowed, but 16bit and full finetuning works!"
-        )
-        bnb = None
-    try:
-        cdequantize_blockwise_fp32 = bnb.functional.lib.cdequantize_blockwise_fp32
-        libcuda_dirs()
-    except:
-        warnings.warn("Unsloth: Running `ldconfig /usr/lib64-nvidia` to link CUDA.")
-
-        if os.path.exists("/usr/lib64-nvidia"):
-            os.system("ldconfig /usr/lib64-nvidia")
-        elif os.path.exists("/usr/local"):
-            # Sometimes bitsandbytes cannot be linked properly in Runpod for example
-            possible_cudas = (
-                subprocess.check_output(["ls", "-al", "/usr/local"])
-                .decode("utf-8")
-                .split("\n")
+            print(
+                "Unsloth: `bitsandbytes` is not installed - 4bit QLoRA unallowed, but 16bit and full finetuning works!"
             )
-            find_cuda = re.compile(r"[\s](cuda\-[\d\.]{2,})$")
-            possible_cudas = [find_cuda.search(x) for x in possible_cudas]
-            possible_cudas = [x.group(1) for x in possible_cudas if x is not None]
-
-            # Try linking cuda folder, or everything in local
-            if len(possible_cudas) == 0:
-                os.system("ldconfig /usr/local/")
-            else:
-                find_number = re.compile(r"([\d\.]{2,})")
-                latest_cuda = np.argsort(
-                    [float(find_number.search(x).group(1)) for x in possible_cudas]
-                )[::-1][0]
-                latest_cuda = possible_cudas[latest_cuda]
-                os.system(f"ldconfig /usr/local/{latest_cuda}")
-                del find_number, latest_cuda
-            del possible_cudas, find_cuda
-
-        if bnb is not None:
-            importlib.reload(bnb)
-        importlib.reload(triton)
+            bnb = None
         try:
-            libcuda_dirs = lambda: None
-            if Version(triton.__version__) >= Version("3.0.0"):
-                try:
-                    from triton.backends.nvidia.driver import libcuda_dirs
-                except:
-                    pass
-            else:
-                from triton.common.build import libcuda_dirs
             cdequantize_blockwise_fp32 = bnb.functional.lib.cdequantize_blockwise_fp32
             libcuda_dirs()
         except:
-            warnings.warn(
-                "Unsloth: CUDA is not linked properly.\n"
-                "Try running `python -m bitsandbytes` then `python -m xformers.info`\n"
-                "We tried running `ldconfig /usr/lib64-nvidia` ourselves, but it didn't work.\n"
-                "You need to run in your terminal `sudo ldconfig /usr/lib64-nvidia` yourself, then import Unsloth.\n"
-                "Also try `sudo ldconfig /usr/local/cuda-xx.x` - find the latest cuda version.\n"
-                "Unsloth will still run for now, but maybe it might crash - let's hope it works!"
-            )
-    del libcuda_dirs
+            warnings.warn("Unsloth: Running `ldconfig /usr/lib64-nvidia` to link CUDA.")
+
+            if os.path.exists("/usr/lib64-nvidia"):
+                os.system("ldconfig /usr/lib64-nvidia")
+            elif os.path.exists("/usr/local"):
+                # Sometimes bitsandbytes cannot be linked properly in Runpod for example
+                possible_cudas = (
+                    subprocess.check_output(["ls", "-al", "/usr/local"])
+                    .decode("utf-8")
+                    .split("\n")
+                )
+                find_cuda = re.compile(r"[\s](cuda\-[\d\.]{2,})$")
+                possible_cudas = [find_cuda.search(x) for x in possible_cudas]
+                possible_cudas = [x.group(1) for x in possible_cudas if x is not None]
+
+                # Try linking cuda folder, or everything in local
+                if len(possible_cudas) == 0:
+                    os.system("ldconfig /usr/local/")
+                else:
+                    find_number = re.compile(r"([\d\.]{2,})")
+                    latest_cuda = np.argsort(
+                        [float(find_number.search(x).group(1)) for x in possible_cudas]
+                    )[::-1][0]
+                    latest_cuda = possible_cudas[latest_cuda]
+                    os.system(f"ldconfig /usr/local/{latest_cuda}")
+                    del find_number, latest_cuda
+                del possible_cudas, find_cuda
+
+            if bnb is not None:
+                importlib.reload(bnb)
+            importlib.reload(triton)
+            try:
+                libcuda_dirs = lambda: None
+                if Version(triton.__version__) >= Version("3.0.0"):
+                    try:
+                        from triton.backends.nvidia.driver import libcuda_dirs
+                    except:
+                        pass
+                else:
+                    from triton.common.build import libcuda_dirs
+                cdequantize_blockwise_fp32 = bnb.functional.lib.cdequantize_blockwise_fp32
+                libcuda_dirs()
+            except:
+                warnings.warn(
+                    "Unsloth: CUDA is not linked properly.\n"
+                    "Try running `python -m bitsandbytes` then `python -m xformers.info`\n"
+                    "We tried running `ldconfig /usr/lib64-nvidia` ourselves, but it didn't work.\n"
+                    "You need to run in your terminal `sudo ldconfig /usr/lib64-nvidia` yourself, then import Unsloth.\n"
+                    "Also try `sudo ldconfig /usr/local/cuda-xx.x` - find the latest cuda version.\n"
+                    "Unsloth will still run for now, but maybe it might crash - let's hope it works!"
+                )
+        del libcuda_dirs
+    else:
+        warnings.warn(
+            "Unsloth: Triton is not installed. Triton-backed kernels are unavailable; use CuTile or other non-Triton backends."
+        )
 elif DEVICE_TYPE == "hip":
     # NO-OP for rocm device
     pass
@@ -308,23 +316,25 @@ elif DEVICE_TYPE == "xpu":
     # TODO: check triton for intel installed properly.
     pass
 
-from .models import *
-from .models import __version__
-from .save import *
-from .chat_templates import *
-from .tokenizer_utils import *
-from .trainer import *
+if os.environ.get("UNSLOTH_SKIP_MODEL_IMPORTS", "0") != "1":
+    from .models import *
+    from .models import __version__
+    from .save import *
+    from .chat_templates import *
+    from .tokenizer_utils import *
+    from .trainer import *
 
-# Export dataprep utilities for CLI and downstream users
-from .dataprep.raw_text import RawTextDataLoader, TextPreprocessor
-from unsloth_zoo.rl_environments import (
-    check_python_modules,
-    create_locked_down_function,
-    execute_with_time_limit,
-    Benchmarker,
-    is_port_open,
-    launch_openenv,
-)
+    # Export dataprep utilities for CLI and downstream users
+    from .dataprep.raw_text import RawTextDataLoader, TextPreprocessor
+    from unsloth_zoo.rl_environments import (
+        check_python_modules,
+        create_locked_down_function,
+        execute_with_time_limit,
+        Benchmarker,
+        is_port_open,
+        launch_openenv,
+    )
 
-# Patch TRL trainers for backwards compatibility
-_patch_trl_trainer()
+if os.environ.get("UNSLOTH_SKIP_MODEL_IMPORTS", "0") != "1":
+    # Patch TRL trainers for backwards compatibility
+    _patch_trl_trainer()

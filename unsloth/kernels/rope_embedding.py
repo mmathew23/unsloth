@@ -13,10 +13,10 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-import triton
-import triton.language as tl
 import torch
 from ..device_type import DEVICE_COUNT
+from ._backend_registry import dispatch_kernel, register_kernel_backend
+from ._optional_triton import HAS_TRITON, tl, triton
 from .utils import calculate_settings, torch_gpu_device, torch_device_stream
 
 
@@ -297,6 +297,39 @@ def fast_rope_embedding(
         K_out = Fast_RoPE_Embedding.apply(
             K.transpose(1, 2).contiguous(), cos, sin
         ).transpose(1, 2)
+    if DEVICE_COUNT > 1:
+        torch_device_stream(Q.device).synchronize()
+    return Q_out, K_out
+
+
+_triton_fast_rope_embedding = fast_rope_embedding
+if HAS_TRITON:
+    register_kernel_backend(
+        "unsloth.rope_embedding_qk",
+        "triton",
+        _triton_fast_rope_embedding,
+    )
+
+
+@torch.compiler.disable
+def fast_rope_embedding(
+    Q,
+    K,
+    cos,
+    sin,
+    rope_embedding_indices = None,
+    *,
+    backend = None,
+):
+    Q_out, K_out = dispatch_kernel(
+        "unsloth.rope_embedding_qk",
+        Q,
+        K,
+        cos,
+        sin,
+        rope_embedding_indices,
+        backend = backend,
+    )
     if DEVICE_COUNT > 1:
         torch_device_stream(Q.device).synchronize()
     return Q_out, K_out

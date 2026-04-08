@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import triton
-import triton.language as tl
 import torch
+from ._backend_registry import dispatch_kernel, register_kernel_backend
+from ._optional_triton import HAS_TRITON, tl, triton
 from .utils import (
     calculate_settings,
     triton_tanh,
@@ -288,3 +288,77 @@ def geglu_approx_backward_kernel(DW, e, g):
             LONG_INDEXING = 0 if n_elements <= INT32_SAFETY_BUFFER else 1,
         )
     return DW, e, g
+
+
+_triton_geglu_exact_forward_kernel = geglu_exact_forward_kernel
+if HAS_TRITON:
+    register_kernel_backend(
+        "unsloth.geglu_exact_forward",
+        "triton",
+        _triton_geglu_exact_forward_kernel,
+    )
+
+
+def geglu_exact_forward_kernel(gate, up, *, backend = None):
+    return dispatch_kernel(
+        "unsloth.geglu_exact_forward",
+        gate,
+        up,
+        backend = backend,
+    )
+
+
+_triton_geglu_exact_backward_kernel = geglu_exact_backward_kernel
+if HAS_TRITON:
+    register_kernel_backend(
+        "unsloth.geglu_exact_backward",
+        "triton",
+        _triton_geglu_exact_backward_kernel,
+    )
+
+
+def geglu_exact_backward_kernel(DW, e, g, *, backend = None):
+    return dispatch_kernel(
+        "unsloth.geglu_exact_backward",
+        DW,
+        e,
+        g,
+        backend = backend,
+    )
+
+
+_triton_geglu_approx_forward_kernel = geglu_approx_forward_kernel
+if HAS_TRITON:
+    register_kernel_backend(
+        "unsloth.geglu_approx_forward",
+        "triton",
+        _triton_geglu_approx_forward_kernel,
+    )
+
+
+def geglu_approx_forward_kernel(gate, up, *, backend = None):
+    return dispatch_kernel(
+        "unsloth.geglu_approx_forward",
+        gate,
+        up,
+        backend = backend,
+    )
+
+
+_triton_geglu_approx_backward_kernel = geglu_approx_backward_kernel
+if HAS_TRITON:
+    register_kernel_backend(
+        "unsloth.geglu_approx_backward",
+        "triton",
+        _triton_geglu_approx_backward_kernel,
+    )
+
+
+def geglu_approx_backward_kernel(DW, e, g, *, backend = None):
+    return dispatch_kernel(
+        "unsloth.geglu_approx_backward",
+        DW,
+        e,
+        g,
+        backend = backend,
+    )

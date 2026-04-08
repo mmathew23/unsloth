@@ -12,14 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib
-import triton
 import ctypes
+import functools
+import importlib
+from typing import Optional
+
+from ._optional_triton import HAS_TRITON, tl, triton
 
 MAX_FUSED_SIZE: int = 65536
 next_power_of_2 = triton.next_power_of_2
-import functools
-from typing import Optional
 
 from ..device_type import (
     is_hip,
@@ -29,8 +30,6 @@ from ..device_type import (
     DEVICE_COUNT,
     ALLOW_PREQUANTIZED_MODELS,
 )
-from .fp8 import weight_dequant, fp8_linear
-import functools
 
 # torch.cuda.amp.custom_fwd is deprecated >= 2.4
 import torch
@@ -55,11 +54,21 @@ if DEVICE_TYPE == "xpu":
     torch_amp_custom_bwd = torch.amp.custom_bwd(device_type = "xpu")
 
 
-# tl.math.tanh now is libdevice.tanh
-import triton
-import triton.language as tl
+def _fp8_module():
+    from . import fp8 as fp8_module
 
-if Version(triton.__version__) >= Version("3.0.0"):
+    return fp8_module
+
+
+def weight_dequant(*args, **kwargs):
+    return _fp8_module().weight_dequant(*args, **kwargs)
+
+
+def fp8_linear(*args, **kwargs):
+    return _fp8_module().fp8_linear(*args, **kwargs)
+
+
+if HAS_TRITON and Version(triton.__version__) >= Version("3.0.0"):
     if DEVICE_TYPE == "xpu":
         triton_tanh = tl.extra.intel.libdevice.tanh
     else:
@@ -78,6 +87,8 @@ else:
 
 @functools.lru_cache(1)
 def is_cdna():
+    if not HAS_TRITON:
+        return False
     return is_hip() and triton.runtime.driver.active.get_current_target().arch in (
         "gfx940",
         "gfx941",
@@ -89,6 +100,8 @@ def is_cdna():
 @functools.lru_cache(1)
 def is_rdna():
     """Detect ROCm-supported RDNA consumer/workstation GPUs (RDNA3, RDNA4)."""
+    if not HAS_TRITON:
+        return False
     return is_hip() and triton.runtime.driver.active.get_current_target().arch in (
         "gfx1100",
         "gfx1101",
@@ -361,14 +374,21 @@ def _maybe_fake_quantize_activations(
 if DEVICE_TYPE == "xpu" and HAS_XPU_STREAM:
 
     @torch.inference_mode
-    def fast_dequantize(W, quant_state = None, out = None, use_global_buffer = False):
+    def fast_dequantize(
+        W,
+        quant_state = None,
+        out = None,
+        use_global_buffer = False,
+        *,
+        backend = None,
+    ):
         # TODO: After adding XPU BNB support, check this function
         if isinstance(W, Float8Tensor):
             return W.dequantize()
         if quant_state is None:
             return W
         if W.dtype == torch.float8_e4m3fn:
-            return weight_dequant(W, quant_state)
+            return weight_dequant(W, quant_state, backend = backend)
         if type(quant_state) is not list:
             # New quant_state as a class
             # https://github.com/TimDettmers/bitsandbytes/pull/763/files
@@ -470,13 +490,20 @@ if DEVICE_TYPE == "xpu" and HAS_XPU_STREAM:
 elif DEVICE_TYPE in ("cuda", "hip") and HAS_CUDA_STREAM:
 
     @torch.inference_mode
-    def fast_dequantize(W, quant_state = None, out = None, use_global_buffer = False):
+    def fast_dequantize(
+        W,
+        quant_state = None,
+        out = None,
+        use_global_buffer = False,
+        *,
+        backend = None,
+    ):
         if isinstance(W, Float8Tensor):
             return W.dequantize()
         if quant_state is None:
             return W
         if W.dtype == torch.float8_e4m3fn:
-            return weight_dequant(W, quant_state)
+            return weight_dequant(W, quant_state, backend = backend)
         if type(quant_state) is not list:
             # New quant_state as a class
             # https://github.com/TimDettmers/bitsandbytes/pull/763/files
@@ -582,13 +609,20 @@ elif DEVICE_TYPE in ("cuda", "hip") and HAS_CUDA_STREAM:
 else:
 
     @torch.inference_mode
-    def fast_dequantize(W, quant_state = None, out = None, use_global_buffer = False):
+    def fast_dequantize(
+        W,
+        quant_state = None,
+        out = None,
+        use_global_buffer = False,
+        *,
+        backend = None,
+    ):
         if isinstance(W, Float8Tensor):
             return W.dequantize()
         if quant_state is None:
             return W
         if W.dtype == torch.float8_e4m3fn:
-            return weight_dequant(W, quant_state)
+            return weight_dequant(W, quant_state, backend = backend)
         if type(quant_state) is not list:
             # New quant_state as a class
             # https://github.com/TimDettmers/bitsandbytes/pull/763/files
@@ -965,20 +999,25 @@ else:
     pass
 
 
-def fast_linear_forward(proj, X, temp_lora = None, out = None):
+def fast_linear_forward(proj, X, temp_lora = None, out = None, *, backend = None):
     W, W_quant, lora_A, lora_B, lora_S, bias = get_lora_parameters_bias(proj)
     bsz, q_len, in_dim = X.shape
     if q_len != 1:
-        return matmul_lora(X, W, W_quant, lora_A, lora_B, lora_S)
+        return matmul_lora(X, W, W_quant, lora_A, lora_B, lora_S, backend = backend)
 
     if W_quant is None:
         out = torch_matmul(X, W.t(), out = out)
     elif W.dtype == torch.float8_e4m3fn:
-        out = fp8_linear(X, W, W_quant, bias)
+        out = fp8_linear(X, W, W_quant, bias, backend = backend)
     elif bsz == 1 and q_len == 1:
         out = fast_gemv(X, W, W_quant, out = out)
     else:
-        W = fast_dequantize(W.t(), W_quant, use_global_buffer = True)
+        W = fast_dequantize(
+            W.t(),
+            W_quant,
+            use_global_buffer = True,
+            backend = backend,
+        )
         out = torch_matmul(X, W, out = out)
 
     # Add in LoRA weights
@@ -1008,7 +1047,7 @@ def fast_linear_forward(proj, X, temp_lora = None, out = None):
     return out
 
 
-def matmul_lora(X, W, W_quant, A, B, s, out = None):
+def matmul_lora(X, W, W_quant, A, B, s, out = None, *, backend = None):
     dtype = X.dtype
 
     if X.dim() == 3:
@@ -1029,9 +1068,9 @@ def matmul_lora(X, W, W_quant, A, B, s, out = None):
             W = W.contiguous()
         out = torch_matmul(X, W.t(), out = out)
     elif W.dtype == torch.float8_e4m3fn:
-        out = fp8_linear(X, W, W_quant)
+        out = fp8_linear(X, W, W_quant, backend = backend)
     else:
-        W = fast_dequantize(W, W_quant, use_global_buffer = True)
+        W = fast_dequantize(W, W_quant, use_global_buffer = True, backend = backend)
         out = torch_matmul(X, W.t(), out = out)
     if W_quant is not None:
         del W

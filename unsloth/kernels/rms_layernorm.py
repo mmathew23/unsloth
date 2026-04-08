@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import triton
-import triton.language as tl
 import torch
+from ._backend_registry import dispatch_kernel, register_kernel_backend
+from ._optional_triton import HAS_TRITON, tl, triton
 from .utils import calculate_settings, torch_gpu_device
 
 
@@ -245,6 +245,47 @@ def fast_rms_layernorm(layernorm, X: torch.Tensor, gemma: bool = False):
     )
     out = Fast_RMS_Layernorm.apply(X, W, eps, gemma)
     return out
+
+
+def _fast_rms_layernorm_triton(
+    X: torch.Tensor,
+    W: torch.Tensor,
+    eps: float,
+    gemma: bool = False,
+):
+    return Fast_RMS_Layernorm.apply(X, W, eps, gemma)
+
+
+if HAS_TRITON:
+    register_kernel_backend(
+        "unsloth.rms_layernorm",
+        "triton",
+        _fast_rms_layernorm_triton,
+    )
+
+
+@torch.compiler.disable
+def fast_rms_layernorm(
+    layernorm,
+    X: torch.Tensor,
+    gemma: bool = False,
+    *,
+    backend = None,
+):
+    W: torch.Tensor = layernorm.weight
+    eps: float = (
+        layernorm.variance_epsilon
+        if hasattr(layernorm, "variance_epsilon")
+        else layernorm.eps
+    )
+    return dispatch_kernel(
+        "unsloth.rms_layernorm",
+        X,
+        W,
+        eps,
+        gemma,
+        backend = backend,
+    )
 
 
 from transformers.models.llama.modeling_llama import LlamaRMSNorm

@@ -55,6 +55,8 @@ def _rope_embedding_QK_ct(
     rope_embedding_indices,  # (batch * seq_len,) int32, or dummy (1,)
     seqlen: ConstInt,
     head_dim: ConstInt,
+    cos_row_stride: ConstInt,
+    sin_row_stride: ConstInt,
     n_heads_Q: ConstInt,
     n_heads_K: ConstInt,
     BACKWARD_PASS: ConstInt,
@@ -84,9 +86,10 @@ def _rope_embedding_QK_ct(
         rot_position = ct.gather(rope_embedding_indices, (bid_row,), padding_value=0).item()
 
     # Load cos/sin via 1D gather (matching single-tensor kernel pattern)
-    cs_base = rot_position * half_head_dim
-    cos_row = ct.gather(cos, cs_base + col_offsets, check_bounds=not NO_PADDING, padding_value=0)
-    sin_row = ct.gather(sin, cs_base + col_offsets, check_bounds=not NO_PADDING, padding_value=0)
+    cos_base = rot_position * cos_row_stride
+    sin_base = rot_position * sin_row_stride
+    cos_row = ct.gather(cos, cos_base + col_offsets, check_bounds=not NO_PADDING, padding_value=0)
+    sin_row = ct.gather(sin, sin_base + col_offsets, check_bounds=not NO_PADDING, padding_value=0)
 
     if BACKWARD_PASS:
         sin_row = -sin_row
@@ -96,8 +99,16 @@ def _rope_embedding_QK_ct(
     q0 = ct.gather(Q_in, q_base + col_offsets, check_bounds=not NO_PADDING, padding_value=0)
     q1 = ct.gather(Q_in, q_base + half_head_dim + col_offsets, check_bounds=not NO_PADDING, padding_value=0)
 
+    if Q_in.dtype != cos.dtype:
+        q0 = ct.astype(q0, cos.dtype)
+        q1 = ct.astype(q1, cos.dtype)
+
     new_q0 = q0 * cos_row - q1 * sin_row
     new_q1 = q1 * cos_row + q0 * sin_row
+
+    if Q_in.dtype != cos.dtype:
+        new_q0 = ct.astype(new_q0, Q_in.dtype)
+        new_q1 = ct.astype(new_q1, Q_in.dtype)
 
     ct.scatter(Q_out, q_base + col_offsets, new_q0, check_bounds=not NO_PADDING)
     ct.scatter(Q_out, q_base + half_head_dim + col_offsets, new_q1, check_bounds=not NO_PADDING)
@@ -108,8 +119,16 @@ def _rope_embedding_QK_ct(
         k0 = ct.gather(K_in, k_base + col_offsets, check_bounds=not NO_PADDING, padding_value=0)
         k1 = ct.gather(K_in, k_base + half_head_dim + col_offsets, check_bounds=not NO_PADDING, padding_value=0)
 
+        if K_in.dtype != cos.dtype:
+            k0 = ct.astype(k0, cos.dtype)
+            k1 = ct.astype(k1, cos.dtype)
+
         new_k0 = k0 * cos_row - k1 * sin_row
         new_k1 = k1 * cos_row + k0 * sin_row
+
+        if K_in.dtype != cos.dtype:
+            new_k0 = ct.astype(new_k0, K_in.dtype)
+            new_k1 = ct.astype(new_k1, K_in.dtype)
 
         ct.scatter(K_out, k_base + col_offsets, new_k0, check_bounds=not NO_PADDING)
         ct.scatter(K_out, k_base + half_head_dim + col_offsets, new_k1, check_bounds=not NO_PADDING)
@@ -302,6 +321,8 @@ class _Fast_RoPE_Embedding_QK_CT(torch.autograd.Function):
             sin = sin.unsqueeze(0)
         cos = cos.contiguous()
         sin = sin.contiguous()
+        cos_row_stride = cos.stride(0)
+        sin_row_stride = sin.stride(0)
 
         TILE_HD = calculate_settings(half_head_dim)
         no_padding = int(TILE_HD == half_head_dim)
@@ -332,6 +353,8 @@ class _Fast_RoPE_Embedding_QK_CT(torch.autograd.Function):
                 rope_ptr,
                 seq_len,
                 head_dim,
+                cos_row_stride,
+                sin_row_stride,
                 n_heads_Q,
                 n_heads_K,
                 0,  # BACKWARD_PASS = False
@@ -348,6 +371,8 @@ class _Fast_RoPE_Embedding_QK_CT(torch.autograd.Function):
         ctx.has_indices = has_indices
         ctx.cos = cos
         ctx.sin = sin
+        ctx.cos_row_stride = cos_row_stride
+        ctx.sin_row_stride = sin_row_stride
         ctx.rope_indices = rope_ptr if has_indices else None
         ctx.seq_len = seq_len
         ctx.n_heads_Q = n_heads_Q
@@ -387,6 +412,8 @@ class _Fast_RoPE_Embedding_QK_CT(torch.autograd.Function):
                 rope_ptr,
                 ctx.seq_len,
                 head_dim,
+                ctx.cos_row_stride,
+                ctx.sin_row_stride,
                 ctx.n_heads_Q,
                 ctx.n_heads_K,
                 1,  # BACKWARD_PASS = True

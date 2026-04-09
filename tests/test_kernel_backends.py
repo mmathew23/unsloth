@@ -23,6 +23,7 @@ from unsloth.kernels import (
     set_kernel_backend_for_op,
 )
 from unsloth.kernels.layernorm import fast_layernorm
+from unsloth.kernels.rope_embedding import fast_rope_embedding
 from unsloth.kernels.swiglu import swiglu_fg_kernel
 
 
@@ -143,6 +144,59 @@ class KernelBackendTests(unittest.TestCase):
             msg = completed.stdout + completed.stderr,
         )
 
+    def test_cutile_rope_handles_mixed_precision_inputs_without_triton_imports(self):
+        script = textwrap.dedent(
+            f"""
+            import builtins
+            import os
+            import sys
+            from pathlib import Path
+
+            root = Path({str(ROOT)!r})
+            for repo in (root / "unsloth", root / "unsloth_zoo"):
+                sys.path.insert(0, str(repo))
+
+            os.environ["UNSLOTH_IS_PRESENT"] = "1"
+            os.environ["UNSLOTH_KERNEL_BACKEND"] = "cutile"
+
+            real_import = builtins.__import__
+            def blocked(name, globals=None, locals=None, fromlist=(), level=0):
+                if name == "triton" or name.startswith("triton."):
+                    raise ModuleNotFoundError("triton blocked for test")
+                return real_import(name, globals, locals, fromlist, level)
+
+            builtins.__import__ = blocked
+
+            import torch
+            from unsloth.kernels.rope_embedding import fast_rope_embedding
+
+            q = torch.randn(2, 4, 9, 32, device="cuda", dtype=torch.bfloat16)
+            k = torch.randn(2, 2, 9, 32, device="cuda", dtype=torch.bfloat16)
+            cos = torch.randn(9, 32, device="cuda", dtype=torch.float32)
+            sin = torch.randn(9, 32, device="cuda", dtype=torch.float32)
+
+            q_out, k_out = fast_rope_embedding(q, k, cos, sin, backend="cutile")
+
+            assert q_out.dtype == q.dtype
+            assert k_out.dtype == k.dtype
+            assert q_out.shape == q.shape
+            assert k_out.shape == k.shape
+            assert torch.isfinite(q_out.float()).all()
+            assert torch.isfinite(k_out.float()).all()
+            """
+        )
+        env = os.environ.copy()
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            env = env,
+            capture_output = True,
+            text = True,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg = completed.stdout + completed.stderr,
+        )
 
 if __name__ == "__main__":
     unittest.main()

@@ -2141,9 +2141,50 @@ def patch_gradient_accumulation_fix(Trainer):
     if not getattr(Trainer, "_unsloth_init_wrapped_for_accelerate_gas", False):
         _original_trainer_init = Trainer.__init__
 
+        def _unsloth_model_uses_unsloth_compiled_forward(model):
+            """Return True iff the innermost HF class's forward was installed
+            by unsloth's compiler into `unsloth_compiled_cache/`. Mirrors the
+            gate used in `vision.py` near line 1149.
+
+            This is the same per-class signal we use to decide whether to
+            call `force_accepts_loss_kwargs(model)`. The two MUST agree:
+            if we don't force, we MUST NOT clamp the accelerator either,
+            because doing so would silently break the HF-native gradient
+            accumulation path that the model is now relying on (e.g. for
+            `trust_remote_code=True` models whose remote forward catches
+            `num_items_in_batch` in `**kwargs` but never uses it).
+            """
+            m = model
+            for _ in range(8):
+                if hasattr(m, "base_model"):
+                    m = m.base_model
+                elif hasattr(m, "model"):
+                    m = m.model
+                else:
+                    break
+            try:
+                co_filename = getattr(
+                    getattr(type(m).forward, "__code__", None),
+                    "co_filename", "",
+                )
+                return "unsloth_compiled_cache" in co_filename
+            except Exception:
+                return False
+
         def _unsloth_trainer_init(self, *args, **kwargs):
             _original_trainer_init(self, *args, **kwargs)
             try:
+                # Only clamp accelerator.gradient_accumulation_steps when the
+                # attached model is on the unsloth fused-CE path. Otherwise
+                # leave HF's native accelerator behavior in place — including
+                # the transformers 5.0-5.5 accelerator `/GA` (which is what
+                # makes gradients correct for stock HF and trust_remote_code
+                # models on those versions).
+                model = getattr(self, "model", None)
+                if model is None:
+                    return
+                if not _unsloth_model_uses_unsloth_compiled_forward(model):
+                    return
                 accelerator = getattr(self, "accelerator", None)
                 if accelerator is not None and getattr(accelerator, "gradient_accumulation_steps", 1) > 1:
                     accelerator.gradient_accumulation_steps = 1

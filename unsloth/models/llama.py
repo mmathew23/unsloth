@@ -1237,7 +1237,7 @@ def LlamaModel_fast_forward(
                 mask,
                 attention_mask,
                 position_ids,
-                use_reentrant = True,
+                use_reentrant = getattr(self, "_gradient_checkpointing_use_reentrant", True),
                 preserve_rng_state = False,
             )
             hidden_states = layer_outputs[0]

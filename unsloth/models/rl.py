@@ -18,6 +18,7 @@ __all__ = [
 ]
 
 import torch
+import contextlib
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 import inspect
 import os
@@ -63,6 +64,7 @@ except Exception:
 from trl import __version__ as trl_version_raw
 from importlib.metadata import version as importlib_version
 from unsloth_zoo.utils import Version
+from unsloth_zoo.training_utils import configure_activation_offloading_checkpointing
 
 try:
     trl_version = Version(trl_version_raw)
@@ -145,6 +147,69 @@ def _patch_resume_from_checkpoint_memory(trainer_class):
 
     _unsloth_train_with_resume_guard._unsloth_resume_guard = True
     trainer_class.train = _unsloth_train_with_resume_guard
+
+
+def _maybe_enable_trl_activation_offloading(trainer) -> None:
+    args = getattr(trainer, "args", None)
+    model = getattr(trainer, "model", None)
+    if args is None or model is None:
+        return
+    if not getattr(args, "activation_offloading", False):
+        return
+
+    gradient_checkpointing_kwargs = getattr(args, "gradient_checkpointing_kwargs", None) or {}
+    if getattr(args, "gradient_checkpointing", False):
+        gradient_checkpointing_kwargs.setdefault("use_reentrant", False)
+        args.gradient_checkpointing_kwargs = gradient_checkpointing_kwargs
+        configure_activation_offloading_checkpointing(
+            model,
+            gradient_checkpointing = True,
+            gradient_checkpointing_kwargs = gradient_checkpointing_kwargs,
+        )
+
+    if hasattr(trainer, "maybe_activation_offload_context"):
+        return
+
+    try:
+        from trl.models import get_act_offloading_ctx_manager
+    except Exception:
+        try:
+            from trl.models.activation_offloading import get_act_offloading_ctx_manager
+        except Exception:
+            return
+
+    trainer.maybe_activation_offload_context = get_act_offloading_ctx_manager(model = model)
+pass
+
+
+def _patch_grpo_activation_offloading(trainer_class, config_class):
+    if getattr(trainer_class, "_unsloth_activation_offloading_patched", False):
+        return
+
+    original_config_init = config_class.__init__
+
+    def config_init(self, *args, **kwargs):
+        activation_offloading = kwargs.pop("activation_offloading", False)
+        original_config_init(self, *args, **kwargs)
+        self.activation_offloading = activation_offloading
+
+    original_trainer_init = trainer_class.__init__
+
+    def trainer_init(self, *args, **kwargs):
+        original_trainer_init(self, *args, **kwargs)
+        _maybe_enable_trl_activation_offloading(self)
+
+    original_training_step = trainer_class.training_step
+
+    def training_step(self, *args, **kwargs):
+        with getattr(self, "maybe_activation_offload_context", contextlib.nullcontext()):
+            return original_training_step(self, *args, **kwargs)
+
+    config_class.__init__ = config_init
+    trainer_class.__init__ = trainer_init
+    trainer_class.training_step = training_step
+    trainer_class._unsloth_activation_offloading_patched = True
+pass
 
 
 def PatchRL(FastLanguageModel):
@@ -1567,8 +1632,10 @@ def _patch_trl_rl_trainers(trainer_file = "grpo_trainer"):
         overwrite = False,
     )
     patched_trainer = getattr(created_module, f"Unsloth{RLTrainer_name}")
+    patched_config = getattr(created_module, f"Unsloth{RLConfig_name}")
     if trainer_file == "grpo_trainer":
         _patch_resume_from_checkpoint_memory(patched_trainer)
+        _patch_grpo_activation_offloading(patched_trainer, patched_config)
 
     # Patch Trainer
     exec(

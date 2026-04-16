@@ -31,6 +31,7 @@ from unsloth.utils import (
     enable_sample_packing,
 )
 from unsloth_zoo.training_utils import (
+    configure_activation_offloading_checkpointing,
     unsloth_train as _unsloth_train,
 )
 from unsloth_zoo.vision_utils import (
@@ -59,6 +60,39 @@ PADDING_FREE_BLOCKLIST = {
     "gemma2",  # - gemma2:  Uses slow_attention_softcapping which has torch.compile issues
     "gpt_oss",  # - gpt_oss: Uses Flex Attention which doesn't handle padding_free correctly
 }
+
+
+def _maybe_enable_trl_activation_offloading(trainer) -> None:
+    args = getattr(trainer, "args", None)
+    model = getattr(trainer, "model", None)
+    if args is None or model is None:
+        return
+    if not getattr(args, "activation_offloading", False):
+        return
+
+    gradient_checkpointing_kwargs = getattr(args, "gradient_checkpointing_kwargs", None) or {}
+    if getattr(args, "gradient_checkpointing", False):
+        gradient_checkpointing_kwargs.setdefault("use_reentrant", False)
+        args.gradient_checkpointing_kwargs = gradient_checkpointing_kwargs
+        configure_activation_offloading_checkpointing(
+            model,
+            gradient_checkpointing = True,
+            gradient_checkpointing_kwargs = gradient_checkpointing_kwargs,
+        )
+
+    if hasattr(trainer, "maybe_activation_offload_context"):
+        return
+
+    try:
+        from trl.models import get_act_offloading_ctx_manager
+    except Exception:
+        try:
+            from trl.models.activation_offloading import get_act_offloading_ctx_manager
+        except Exception:
+            return
+
+    trainer.maybe_activation_offload_context = get_act_offloading_ctx_manager(model = model)
+pass
 
 
 def _should_pack(config) -> bool:
@@ -450,6 +484,7 @@ def _backwards_compatible_trainer(trainer_class, config_class):
             kwargs = trainer_kwargs
             kwargs["args"] = config
         original_init(self, *args, **kwargs)
+        _maybe_enable_trl_activation_offloading(self)
 
     return new_init
 

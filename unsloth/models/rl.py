@@ -64,7 +64,7 @@ except Exception:
 from trl import __version__ as trl_version_raw
 from importlib.metadata import version as importlib_version
 from unsloth_zoo.utils import Version
-from unsloth_zoo.training_utils import configure_activation_offloading_checkpointing
+from unsloth_zoo.training_utils import maybe_enable_trl_activation_offloading
 
 try:
     trl_version = Version(trl_version_raw)
@@ -149,39 +149,6 @@ def _patch_resume_from_checkpoint_memory(trainer_class):
     trainer_class.train = _unsloth_train_with_resume_guard
 
 
-def _maybe_enable_trl_activation_offloading(trainer) -> None:
-    args = getattr(trainer, "args", None)
-    model = getattr(trainer, "model", None)
-    if args is None or model is None:
-        return
-    if not getattr(args, "activation_offloading", False):
-        return
-
-    gradient_checkpointing_kwargs = getattr(args, "gradient_checkpointing_kwargs", None) or {}
-    if getattr(args, "gradient_checkpointing", False):
-        gradient_checkpointing_kwargs.setdefault("use_reentrant", False)
-        args.gradient_checkpointing_kwargs = gradient_checkpointing_kwargs
-        configure_activation_offloading_checkpointing(
-            model,
-            gradient_checkpointing = True,
-            gradient_checkpointing_kwargs = gradient_checkpointing_kwargs,
-        )
-
-    if hasattr(trainer, "maybe_activation_offload_context"):
-        return
-
-    try:
-        from trl.models import get_act_offloading_ctx_manager
-    except Exception:
-        try:
-            from trl.models.activation_offloading import get_act_offloading_ctx_manager
-        except Exception:
-            return
-
-    trainer.maybe_activation_offload_context = get_act_offloading_ctx_manager(model = model)
-pass
-
-
 def _patch_grpo_activation_offloading(trainer_class, config_class):
     if getattr(trainer_class, "_unsloth_activation_offloading_patched", False):
         return
@@ -197,7 +164,7 @@ def _patch_grpo_activation_offloading(trainer_class, config_class):
 
     def trainer_init(self, *args, **kwargs):
         original_trainer_init(self, *args, **kwargs)
-        _maybe_enable_trl_activation_offloading(self)
+        maybe_enable_trl_activation_offloading(self)
 
     original_training_step = trainer_class.training_step
 

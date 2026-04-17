@@ -165,6 +165,30 @@ def _patch_grpo_activation_offloading(trainer_class, config_class):
     def trainer_init(self, *args, **kwargs):
         original_trainer_init(self, *args, **kwargs)
         maybe_enable_trl_activation_offloading(self)
+        # Informational note: on GRPO the activation surface is usually small
+        # (decoder forward inside _compute_loss, gradient checkpointing on)
+        # relative to the vLLM slab + weights + optimizer state, so AO at
+        # default configs is closer to net-neutral than to the SFT wins. The
+        # default `use_streams=False` from `resolve_ao_kwargs` keeps AO from
+        # regressing reserved memory, but users should not expect large
+        # savings here — increase `max_completion_length` / batch size before
+        # relying on AO to shrink peak memory.
+        if (
+            getattr(getattr(self, "args", None), "activation_offloading", False)
+            and int(os.environ.get("RANK", "0") or 0) == 0
+            and os.environ.get("UNSLOTH_AO_QUIET", "") not in ("1", "true", "True")
+        ):
+            try:
+                print(
+                    "[unsloth] activation_offloading=True on a GRPO trainer — "
+                    "expected savings are small at default configs. See "
+                    "activation_offloading.resolve_ao_kwargs for the "
+                    "use_streams=False default; override with "
+                    "UNSLOTH_AO_USE_STREAMS=1 / silence with UNSLOTH_AO_QUIET=1.",
+                    flush=True,
+                )
+            except Exception:
+                pass
 
     original_training_step = trainer_class.training_step
 

@@ -203,6 +203,177 @@ def _patch_grpo_activation_offloading(trainer_class, config_class):
 pass
 
 
+def _patch_grpo_debug_mode(trainer_class, config_class):
+    """Install GRPO apples-to-apples debug-mode hooks on `trainer_class`.
+
+    When `UNSLOTH_GRPO_DEBUG_FIXED_LENGTH` is set, the trainer will:
+      * Force a deterministic 1-token real generation (HF + paged paths via
+        generation_config; vLLM via grpo_update_SamplingParams in zoo).
+      * Discard that token and overwrite every per-sequence `completion_ids`
+        with `fill_token_id * target_length` inside `_generate`.
+      * Coerce `vllm_importance_sampling_correction=False` and
+        `mask_truncated_completions=False` so the invariants hold.
+    """
+    if getattr(trainer_class, "_unsloth_grpo_debug_patched", False):
+        return
+
+    _debug_env_length = RL_REPLACEMENTS.get("_debug_env_length")
+    _debug_fill_token_id = RL_REPLACEMENTS.get("_debug_fill_token_id")
+    if _debug_env_length is None or _debug_fill_token_id is None:
+        return
+
+    original_trainer_init = trainer_class.__init__
+
+    def trainer_init_debug(self, *args, **kwargs):
+        original_trainer_init(self, *args, **kwargs)
+        target_length = _debug_env_length()
+        if target_length is None:
+            self._unsloth_grpo_debug = None
+            return
+
+        tokenizer = getattr(self, "processing_class", None) or getattr(
+            self, "tokenizer", None
+        )
+        if tokenizer is None:
+            return
+        try:
+            fill_token_id = _debug_fill_token_id(tokenizer)
+        except Exception as e:
+            if int(os.environ.get("RANK", "0") or 0) == 0:
+                print(
+                    f"[unsloth] GRPO debug mode could not resolve fill token: {e}; "
+                    f"debug mode NOT active.",
+                    flush=True,
+                )
+            self._unsloth_grpo_debug = None
+            return
+
+        self._unsloth_grpo_debug = {
+            "target_length": int(target_length),
+            "fill_token_id": int(fill_token_id),
+        }
+
+        # HF / transformers-paged path: set generation_config if present
+        # (TRL 1.0 only sets this when not using vLLM).
+        gen_cfg = getattr(self, "generation_config", None)
+        if gen_cfg is not None:
+            try:
+                gen_cfg.max_new_tokens = 1
+                gen_cfg.min_new_tokens = 1
+                gen_cfg.do_sample = False
+                gen_cfg.top_p = 1.0
+                gen_cfg.top_k = 0
+            except Exception:
+                pass
+        # Mirror to self.generation_kwargs (HF path reuses this dict per call).
+        gkw = getattr(self, "generation_kwargs", None)
+        if isinstance(gkw, dict):
+            gkw["max_new_tokens"] = 1
+            gkw["min_new_tokens"] = 1
+        # vLLM generator carries its own generation_kwargs that take
+        # precedence over `max_tokens=max_completion_length` because
+        # vllm_generation.py seeds the per-call dict THEN updates with
+        # `self.generation_kwargs`. Force 1-token generation here.
+        vllm_gen = getattr(self, "vllm_generation", None)
+        if vllm_gen is not None:
+            existing = getattr(vllm_gen, "generation_kwargs", None) or {}
+            try:
+                merged = dict(existing)
+            except Exception:
+                merged = {}
+            merged["max_tokens"] = 1
+            merged.setdefault("min_tokens", 1)
+            try:
+                vllm_gen.generation_kwargs = merged
+            except Exception:
+                pass
+
+        trainer_args = getattr(self, "args", None)
+        warned_is = False
+        warned_mask = False
+        if trainer_args is not None:
+            if getattr(trainer_args, "vllm_importance_sampling_correction", False):
+                warned_is = True
+            try:
+                trainer_args.vllm_importance_sampling_correction = False
+            except Exception:
+                pass
+            if getattr(trainer_args, "mask_truncated_completions", False):
+                warned_mask = True
+            try:
+                trainer_args.mask_truncated_completions = False
+            except Exception:
+                pass
+
+        is_rank0 = int(os.environ.get("RANK", "0") or 0) == 0
+        quiet = os.environ.get("UNSLOTH_GRPO_DEBUG_QUIET", "") in ("1", "true", "True")
+        if is_rank0 and not quiet:
+            try:
+                decoded = tokenizer.decode(
+                    [fill_token_id], skip_special_tokens=False
+                )
+            except Exception:
+                decoded = "?"
+            print(
+                f"[unsloth] GRPO debug mode ON: target_length={target_length} "
+                f"fill_token_id={fill_token_id} ({decoded!r}) — "
+                f"IS-correction DISABLED, mask_truncated_completions DISABLED",
+                flush=True,
+            )
+            if warned_is:
+                print(
+                    "[unsloth] GRPO debug mode: coerced "
+                    "vllm_importance_sampling_correction=False "
+                    "(was True) because overwritten completion ids invalidate "
+                    "the IS ratio.",
+                    flush=True,
+                )
+            if warned_mask:
+                print(
+                    "[unsloth] GRPO debug mode: coerced "
+                    "mask_truncated_completions=False (was True) so fill-token "
+                    "completions are not masked out.",
+                    flush=True,
+                )
+
+    # Wrap `_generate_single_turn` -- TRL's common 2-tuple funnel where all
+    # three generation paths (vLLM, HF generate, transformers-paged) return
+    # `(completion_ids, logprobs)` before the outer `_generate` method packs
+    # them into a 7-tuple. Hooking here is simpler than unpacking TRL's
+    # per-version outer return shape.
+    original_gen_single = getattr(trainer_class, "_generate_single_turn", None)
+    if original_gen_single is None:
+        trainer_class.__init__ = trainer_init_debug
+        trainer_class._unsloth_grpo_debug_patched = True
+        return
+
+    _apply_override = RL_REPLACEMENTS.get("_apply_debug_completion_override")
+
+    def unsloth_debug_generate_single_turn(self, *args, **kwargs):
+        completion_ids, sampling_per_token_logps = original_gen_single(
+            self, *args, **kwargs
+        )
+        dbg = getattr(self, "_unsloth_grpo_debug", None)
+        if dbg is None or _apply_override is None:
+            return completion_ids, sampling_per_token_logps
+        target_length = dbg["target_length"]
+        fill_token_id = dbg["fill_token_id"]
+        new_ids, new_logps = _apply_override(
+            completion_ids,
+            sampling_per_token_logps,
+            target_length,
+            fill_token_id,
+        )
+        if new_logps is None:
+            return new_ids, sampling_per_token_logps
+        return new_ids, new_logps
+
+    trainer_class.__init__ = trainer_init_debug
+    trainer_class._generate_single_turn = unsloth_debug_generate_single_turn
+    trainer_class._unsloth_grpo_debug_patched = True
+pass
+
+
 def PatchRL(FastLanguageModel):
     try:
         from trl.models.utils import unwrap_model_for_generation
@@ -1627,6 +1798,7 @@ def _patch_trl_rl_trainers(trainer_file = "grpo_trainer"):
     if trainer_file == "grpo_trainer":
         _patch_resume_from_checkpoint_memory(patched_trainer)
         _patch_grpo_activation_offloading(patched_trainer, patched_config)
+        _patch_grpo_debug_mode(patched_trainer, patched_config)
 
     # Patch Trainer
     exec(

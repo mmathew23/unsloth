@@ -311,6 +311,90 @@ if HAS_TRITON:
     )
 
 
+def _prepare_rope_cache(cos, sin, head_dim, batch, seq_len, rope_embedding_indices, device):
+    cos = cos.squeeze().to(device = device)
+    sin = sin.squeeze().to(device = device)
+    half_head_dim = head_dim // 2
+    if cos.shape[-1] == head_dim:
+        cos = cos[..., :half_head_dim]
+        sin = sin[..., :half_head_dim]
+    elif cos.shape[-1] != half_head_dim:
+        raise ValueError(
+            f"RoPE cache has incompatible last dimension {cos.shape[-1]} for head_dim={head_dim}"
+        )
+
+    if rope_embedding_indices is None:
+        return (
+            cos[:seq_len].unsqueeze(0).unsqueeze(0),
+            sin[:seq_len].unsqueeze(0).unsqueeze(0),
+        )
+
+    rope_embedding_indices = rope_embedding_indices.reshape(batch, seq_len).to(
+        device = device,
+        dtype = torch.long,
+    )
+    cos = cos.index_select(0, rope_embedding_indices.reshape(-1)).view(
+        batch, seq_len, half_head_dim
+    )
+    sin = sin.index_select(0, rope_embedding_indices.reshape(-1)).view(
+        batch, seq_len, half_head_dim
+    )
+    return cos.unsqueeze(1), sin.unsqueeze(1)
+
+
+def _apply_rope_eager(X, cos, sin):
+    head_dim = X.shape[-1]
+    half_head_dim = head_dim // 2
+    X0 = X[..., :half_head_dim]
+    X1 = X[..., half_head_dim : 2 * half_head_dim]
+    compute_dtype = torch.promote_types(X.dtype, cos.dtype)
+    X0 = X0.to(dtype = compute_dtype)
+    X1 = X1.to(dtype = compute_dtype)
+    cos = cos.to(dtype = compute_dtype)
+    sin = sin.to(dtype = compute_dtype)
+    rotated_0 = X0 * cos - X1 * sin
+    rotated_1 = X1 * cos + X0 * sin
+    output = torch.cat(
+        (
+            rotated_0.to(dtype = X.dtype),
+            rotated_1.to(dtype = X.dtype),
+            X[..., 2 * half_head_dim :],
+        ),
+        dim = -1,
+    )
+    return output
+
+
+def _fast_rope_embedding_eager(
+    Q,
+    K,
+    cos,
+    sin,
+    rope_embedding_indices = None,
+):
+    batch, _, seq_len, head_dim = Q.shape
+    cos, sin = _prepare_rope_cache(
+        cos,
+        sin,
+        head_dim,
+        batch,
+        seq_len,
+        rope_embedding_indices,
+        Q.device,
+    )
+    return (
+        _apply_rope_eager(Q, cos, sin),
+        _apply_rope_eager(K, cos, sin),
+    )
+
+
+register_kernel_backend(
+    "unsloth.rope_embedding_qk",
+    "eager",
+    _fast_rope_embedding_eager,
+)
+
+
 @torch.compiler.disable
 def fast_rope_embedding(
     Q,

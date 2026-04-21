@@ -264,6 +264,27 @@ if HAS_TRITON:
     )
 
 
+def _fast_rms_layernorm_eager(
+    X: torch.Tensor,
+    W: torch.Tensor,
+    eps: float,
+    gemma: bool = False,
+):
+    X_float = X.float()
+    W_float = W.float()
+    inv_var = torch.rsqrt(X_float.square().mean(dim = -1, keepdim = True) + eps)
+    output = X_float * inv_var
+    output = output * (W_float + 1.0 if gemma else W_float)
+    return output.to(dtype = X.dtype)
+
+
+register_kernel_backend(
+    "unsloth.rms_layernorm",
+    "eager",
+    _fast_rms_layernorm_eager,
+)
+
+
 @torch.compiler.disable
 def fast_rms_layernorm(
     layernorm,
@@ -309,6 +330,13 @@ except:
 
 
 def patch_rms_layernorm():
+    try:
+        from ._backend_registry import get_kernel_backend
+
+        if get_kernel_backend("unsloth.rms_layernorm") == "eager":
+            return
+    except Exception:
+        pass
     import transformers.models.llama.modeling_llama
 
     transformers.models.llama.modeling_llama.LlamaRMSNorm = Unsloth_LlamaRMSNorm

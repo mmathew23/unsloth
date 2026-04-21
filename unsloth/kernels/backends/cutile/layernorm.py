@@ -194,7 +194,7 @@ class _Fast_Layernorm_CT(torch.autograd.Function):
     def forward(ctx, X, W, b, eps):
         shape = X.shape
         dim = shape[-1]
-        X = X.view(-1, dim)
+        X = X.reshape(-1, dim)
         n_rows, n_cols = X.shape
         TILE_N = calculate_settings(n_cols)
 
@@ -215,13 +215,13 @@ class _Fast_Layernorm_CT(torch.autograd.Function):
         ctx.eps = eps
         ctx.TILE_N = TILE_N
         ctx.save_for_backward(X, W, r, mu)
-        return Y.view(*shape)
+        return Y.reshape(*shape)
 
     @staticmethod
     def backward(ctx, dY):
         shape = dY.shape
         dim = shape[-1]
-        dY = dY.view(-1, dim)
+        dY = dY.reshape(-1, dim)
         X, W, r, mu = ctx.saved_tensors
         n_rows, n_cols = dY.shape
 
@@ -240,7 +240,7 @@ class _Fast_Layernorm_CT(torch.autograd.Function):
             search_space=autotune_configs,
         )
 
-        return dX.view(*shape), None, None, None, None
+        return dX.reshape(*shape), None, None, None, None
 
 
 @register_impl("unsloth.layernorm", backend="cutile")

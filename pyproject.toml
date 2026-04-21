@@ -92,6 +92,11 @@ huggingface = [
     "torchvision",
     "unsloth[triton]",
 ]
+cutile = [
+    "unsloth[huggingfacenotorch]",
+    "unsloth_zoo[cutile]>=2026.4.3",
+    "torchvision",
+]
 windows = [
     "unsloth[huggingface]",
     "bitsandbytes>=0.45.5,!=0.46.0,!=0.48.0 ; (sys_platform == 'win32')",

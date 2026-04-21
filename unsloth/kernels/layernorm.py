@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import torch
+import torch.nn.functional as F
 from ._backend_registry import dispatch_kernel, register_kernel_backend
 from ._optional_triton import HAS_TRITON, tl, triton
 from .utils import calculate_settings, torch_gpu_device
@@ -110,7 +111,7 @@ class Fast_Layernorm(torch.autograd.Function):
     def forward(ctx, X, W, b, eps):
         shape = X.shape
         dim = shape[-1]
-        X = X.view(-1, dim)
+        X = X.reshape(-1, dim)
         n_rows, n_cols = X.shape
         BLOCK_SIZE, num_warps = calculate_settings(n_cols)
         device = X.device
@@ -137,13 +138,13 @@ class Fast_Layernorm(torch.autograd.Function):
         ctx.BLOCK_SIZE = BLOCK_SIZE
         ctx.num_warps = num_warps
         ctx.save_for_backward(X, W, b, r, mu)
-        return Y.view(*shape)
+        return Y.reshape(*shape)
 
     @staticmethod
     def backward(ctx, dY):
         shape = dY.shape
         dim = shape[-1]
-        dY = dY.view(-1, dim)
+        dY = dY.reshape(-1, dim)
         X, W, b, r, mu = ctx.saved_tensors
         n_rows, n_cols = dY.shape
 
@@ -162,7 +163,7 @@ class Fast_Layernorm(torch.autograd.Function):
                 BLOCK_SIZE = ctx.BLOCK_SIZE,
                 num_warps = ctx.num_warps,
             )
-        dX = dY.view(*shape)
+        dX = dY.reshape(*shape)
         return dX, None, None, None, None
 
 
@@ -187,6 +188,13 @@ if HAS_TRITON:
     register_kernel_backend("unsloth.layernorm", "triton", _fast_layernorm_triton)
 
 
+def _fast_layernorm_eager(X, W, b, eps):
+    return F.layer_norm(X, W.shape, W, b, eps)
+
+
+register_kernel_backend("unsloth.layernorm", "eager", _fast_layernorm_eager)
+
+
 def fast_layernorm(layernorm, X, *, backend = None):
     assert layernorm.elementwise_affine is True
     W = layernorm.weight
@@ -207,6 +215,13 @@ def fast_layernorm(layernorm, X, *, backend = None):
 
 
 def patch_layernorm():
+    try:
+        from ._backend_registry import get_kernel_backend
+
+        if get_kernel_backend("unsloth.layernorm") == "eager":
+            return
+    except Exception:
+        pass
     from unsloth_zoo.patching_utils import patch_layernorm as _patch_layernorm
 
     return _patch_layernorm()

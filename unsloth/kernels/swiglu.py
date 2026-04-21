@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import torch
+import torch.nn.functional as F
 from ._backend_registry import dispatch_kernel, register_kernel_backend
 from ._optional_triton import HAS_TRITON, tl, triton
 from .utils import calculate_settings, torch_gpu_device
@@ -148,6 +149,13 @@ if HAS_TRITON:
     register_kernel_backend("unsloth.swiglu_fg", "triton", _triton_swiglu_fg_kernel)
 
 
+def _swiglu_fg_eager(e, g):
+    return F.silu(e) * g
+
+
+register_kernel_backend("unsloth.swiglu_fg", "eager", _swiglu_fg_eager)
+
+
 def swiglu_fg_kernel(e, g, *, backend = None):
     return dispatch_kernel("unsloth.swiglu_fg", e, g, backend = backend)
 
@@ -159,6 +167,19 @@ if HAS_TRITON:
         "triton",
         _triton_swiglu_DWf_DW_dfg_kernel,
     )
+
+
+def _swiglu_DWf_DW_dfg_eager(DW, e, g):
+    e_float = e.float()
+    sig = torch.sigmoid(e_float)
+    f = (e_float * sig).to(dtype = DW.dtype)
+    h = f * g
+    df = DW * f
+    de = (DW * g).float() * sig * (1.0 + e_float * (1.0 - sig))
+    return h, df, de.to(dtype = DW.dtype)
+
+
+register_kernel_backend("unsloth.swiglu_bwd", "eager", _swiglu_DWf_DW_dfg_eager)
 
 
 def swiglu_DWf_DW_dfg_kernel(DW, e, g, *, backend = None):

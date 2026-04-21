@@ -103,6 +103,36 @@ if HAS_TRITON:
     )
 
 
+def _weight_dequant_block_eager(
+    x: torch.Tensor,
+    s: torch.Tensor,
+    block_size: int = 128,
+    dtype = torch.bfloat16,
+) -> torch.Tensor:
+    if not x.is_contiguous():
+        x = x.contiguous()
+    if not s.is_contiguous():
+        s = s.contiguous()
+    M, N = x.shape
+    expected_shape = (math.ceil(M / block_size), math.ceil(N / block_size))
+    if s.shape == expected_shape[::-1]:
+        s = s.t().contiguous()
+    elif s.shape != expected_shape:
+        raise ValueError(
+            f"Scale shape {s.shape} is incompatible with weight shape {x.shape} and block size {block_size}"
+        )
+    row_scales = torch.repeat_interleave(s, block_size, dim = 0)[:M]
+    full_scales = torch.repeat_interleave(row_scales, block_size, dim = 1)[:, :N]
+    return x.to(dtype = dtype) * full_scales.to(dtype = dtype)
+
+
+register_kernel_backend(
+    "unsloth.weight_dequant",
+    "eager",
+    _weight_dequant_block_eager,
+)
+
+
 def weight_dequant_block(
     x: torch.Tensor,
     s: torch.Tensor,
@@ -424,7 +454,7 @@ def fp8_block_matmul(
 
 class FP8BlockQuantLinear(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, X, weight, weight_scale):
+    def forward(ctx, X, weight, weight_scale, backend = None):
         m, n = weight.shape
 
         # Save original scale for backward (before any transformation)
@@ -460,7 +490,7 @@ class FP8BlockQuantLinear(torch.autograd.Function):
             weight = weight.contiguous()
 
         # Quantize input and run FP8 matmul
-        qinput, scale = act_quant(X, block_size[1])
+        qinput, scale = act_quant(X, block_size[1], backend = backend)
         output = fp8_block_matmul(
             qinput,
             weight,
@@ -468,27 +498,34 @@ class FP8BlockQuantLinear(torch.autograd.Function):
             weight_scale,
             block_size,
             output_dtype = X.dtype,
+            backend = backend,
         )
         ctx.weight = weight
         ctx.weight_scale = original_weight_scale  # Save original for backward
+        ctx.backend = backend
         return output.to(X.dtype)
 
     @staticmethod
     def backward(ctx, grad_output):
-        W_deq = weight_dequant(ctx.weight, ctx.weight_scale)
+        W_deq = weight_dequant(
+            ctx.weight,
+            ctx.weight_scale,
+            dtype = grad_output.dtype,
+            backend = ctx.backend,
+        )
         grad_X = torch_matmul(grad_output, W_deq)
         del W_deq
-        return grad_X, None, None
+        return grad_X, None, None, None
 
 
 @torch_compile
-def fp8_torch_block_quant_forward(X, weight, weight_scale):
-    return FP8BlockQuantLinear.apply(X, weight, weight_scale)
+def fp8_torch_block_quant_forward(X, weight, weight_scale, *, backend = None):
+    return FP8BlockQuantLinear.apply(X, weight, weight_scale, backend)
 
 
 class FbgemmFp8Linear_matmul(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight, weight_scale, bias = None):
+    def forward(ctx, x, weight, weight_scale, bias = None, backend = None):
         if weight.shape[0] == weight_scale.shape[0] and (
             weight.shape[0] % 8 == 0 and weight.shape[1] % 8 == 0
         ):
@@ -532,7 +569,12 @@ class FbgemmFp8Linear_matmul(torch.autograd.Function):
             # The transpose case is generally noticed in backward pass when we do dY@W instead of @W.T as we do for forward.
             # The shape case, I noticed to happen in MLP of Qwen 2.5 VL 7B where the gate proj is of shape (3420, 1280) and 3420/8=427.5
 
-            W_deq = weight_dequant(weight, weight_scale).T
+            W_deq = weight_dequant(
+                weight,
+                weight_scale,
+                dtype = x.dtype,
+                backend = backend,
+            ).T
             output = torch_matmul(x, W_deq)
             del W_deq
         else:
@@ -542,24 +584,30 @@ class FbgemmFp8Linear_matmul(torch.autograd.Function):
 
         ctx.weight = weight
         ctx.weight_scale = weight_scale
+        ctx.backend = backend
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        W_deq = weight_dequant(ctx.weight, ctx.weight_scale)
+        W_deq = weight_dequant(
+            ctx.weight,
+            ctx.weight_scale,
+            dtype = grad_output.dtype,
+            backend = ctx.backend,
+        )
         grad_X = torch_matmul(grad_output, W_deq)
         del W_deq
-        return grad_X, None, None, None, None
+        return grad_X, None, None, None, None, None
 
 
 @torch_compile
-def fbgemm_fp8_linear(X, weight, weight_scale, bias = None):
-    return FbgemmFp8Linear_matmul.apply(X, weight, weight_scale, bias)
+def fbgemm_fp8_linear(X, weight, weight_scale, bias = None, *, backend = None):
+    return FbgemmFp8Linear_matmul.apply(X, weight, weight_scale, bias, backend)
 
 
 class FP8_fbgemm_block_linear(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, X, weight, weight_scale, bias = None):
+    def forward(ctx, X, weight, weight_scale, bias = None, backend = None):
         orig_shape = X.shape
         X = X.view(-1, X.shape[-1])
 
@@ -599,19 +647,25 @@ class FP8_fbgemm_block_linear(torch.autograd.Function):
         ctx.weight = weight
         ctx.weight_scale = weight_scale
         ctx.block_size = [bs_m, bs_n, bs_k]
+        ctx.backend = backend
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        W_deq = weight_dequant(ctx.weight, ctx.weight_scale)
+        W_deq = weight_dequant(
+            ctx.weight,
+            ctx.weight_scale,
+            dtype = grad_output.dtype,
+            backend = ctx.backend,
+        )
         grad_X = torch_matmul(grad_output, W_deq)
         del W_deq
-        return grad_X, None, None, None, None
+        return grad_X, None, None, None, None, None
 
 
 @torch_compile
-def fp8_fbgemm_block_linear(X, weight, weight_scale, bias = None):
-    return FP8_fbgemm_block_linear.apply(X, weight, weight_scale, bias)
+def fp8_fbgemm_block_linear(X, weight, weight_scale, bias = None, *, backend = None):
+    return FP8_fbgemm_block_linear.apply(X, weight, weight_scale, bias, backend)
 
 
 def test_has_fbgemm():
@@ -662,6 +716,19 @@ def test_has_fbgemm():
     return has_fbgemm
 
 
+def _fp8_linear_eager(X, weight, weight_scale, bias = None):
+    W_deq = weight_dequant(
+        weight,
+        weight_scale,
+        dtype = X.dtype,
+        backend = "eager",
+    )
+    output = torch_matmul(X, W_deq.t())
+    if bias is not None:
+        output = output + bias
+    return output
+
+
 fp8_block_quant_linear = fp8_torch_block_quant_forward
 if "UNSLOTH_HAS_FBGEMM" not in os.environ:
     os.environ["UNSLOTH_HAS_FBGEMM"] = "0"
@@ -693,15 +760,43 @@ except:
 
 @torch_compile
 def fp8_linear(X, weight, weight_scale, bias = None, *, backend = None):
+    resolved_backend = get_kernel_backend(
+        "unsloth.w8a8_block_fp8_matmul",
+        backend = backend,
+    )
     # Per-tensor quantization: single scalar scale for entire weight
     # Block quantized FP8: 2D scale tensor with multiple columns
     if weight_scale.numel() == 1 or (
         weight_scale.ndim == 2 and weight_scale.shape[1] > 1
     ):
-        out = fp8_block_quant_linear(X, weight, weight_scale)
+        if resolved_backend == "eager":
+            out = _fp8_linear_eager(X, weight, weight_scale, bias)
+        elif resolved_backend == "triton":
+            out = fp8_block_quant_linear(
+                X,
+                weight,
+                weight_scale,
+                backend = resolved_backend,
+            )
+        else:
+            out = fp8_torch_block_quant_forward(
+                X,
+                weight,
+                weight_scale,
+                backend = resolved_backend,
+            )
     # Row/channel quantized FP8: 2D scale with shape (n, 1)
     else:
-        out = fbgemm_fp8_linear(X, weight, weight_scale, bias)
+        if resolved_backend == "eager":
+            out = _fp8_linear_eager(X, weight, weight_scale, bias)
+        else:
+            out = fbgemm_fp8_linear(
+                X,
+                weight,
+                weight_scale,
+                bias,
+                backend = resolved_backend,
+            )
     return out
 
 

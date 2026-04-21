@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import torch
+import torch.nn.functional as F
 from ._backend_registry import dispatch_kernel, register_kernel_backend
 from ._optional_triton import HAS_TRITON, tl, triton
 from .utils import (
@@ -299,6 +300,17 @@ if HAS_TRITON:
     )
 
 
+def _geglu_exact_forward_eager(gate, up):
+    return F.gelu(gate, approximate = "none") * up
+
+
+register_kernel_backend(
+    "unsloth.geglu_exact_forward",
+    "eager",
+    _geglu_exact_forward_eager,
+)
+
+
 def geglu_exact_forward_kernel(gate, up, *, backend = None):
     return dispatch_kernel(
         "unsloth.geglu_exact_forward",
@@ -315,6 +327,24 @@ if HAS_TRITON:
         "triton",
         _triton_geglu_exact_backward_kernel,
     )
+
+
+def _geglu_exact_backward_eager(DW, e, g):
+    e_float = e.float()
+    f = F.gelu(e_float, approximate = "none").to(dtype = DW.dtype)
+    h = f * g
+    df = DW * f
+    f_partial = 0.5 * (torch.erf(0.7071067811865476 * e_float) + 1.0)
+    df_de = f_partial + 0.3989422804014327 * e_float * torch.exp(-0.5 * e_float.square())
+    de = (DW * g).float() * df_de
+    return h, df, de.to(dtype = DW.dtype)
+
+
+register_kernel_backend(
+    "unsloth.geglu_exact_backward",
+    "eager",
+    _geglu_exact_backward_eager,
+)
 
 
 def geglu_exact_backward_kernel(DW, e, g, *, backend = None):
@@ -336,6 +366,17 @@ if HAS_TRITON:
     )
 
 
+def _geglu_approx_forward_eager(gate, up):
+    return F.gelu(gate, approximate = "tanh") * up
+
+
+register_kernel_backend(
+    "unsloth.geglu_approx_forward",
+    "eager",
+    _geglu_approx_forward_eager,
+)
+
+
 def geglu_approx_forward_kernel(gate, up, *, backend = None):
     return dispatch_kernel(
         "unsloth.geglu_approx_forward",
@@ -352,6 +393,29 @@ if HAS_TRITON:
         "triton",
         _triton_geglu_approx_backward_kernel,
     )
+
+
+def _geglu_approx_backward_eager(DW, e, g):
+    e_float = e.float()
+    s = 0.7978845608028654
+    a = s * e_float
+    b = a * 0.044715 * e_float.square()
+    T = 1.0 + torch.tanh(a + b)
+    T2 = 0.5 * T
+    Q2 = -T2 * (T - 2.0) * (a + 3.0 * b)
+    df_de = T2 + Q2
+    f = (T2 * e_float).to(dtype = DW.dtype)
+    h = f * g
+    df = DW * f
+    de = (DW * g).float() * df_de
+    return h, df, de.to(dtype = DW.dtype)
+
+
+register_kernel_backend(
+    "unsloth.geglu_approx_backward",
+    "eager",
+    _geglu_approx_backward_eager,
+)
 
 
 def geglu_approx_backward_kernel(DW, e, g, *, backend = None):

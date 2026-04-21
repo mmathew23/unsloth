@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import torch
+import torch.nn.functional as F
 from ._backend_registry import dispatch_kernel, register_kernel_backend
 from ._optional_triton import HAS_TRITON, tl, triton
 from .utils import (
@@ -461,6 +462,44 @@ if HAS_TRITON:
     )
 
 
+def _fast_cross_entropy_loss_eager(
+    logits,
+    labels,
+    logit_softcapping = 0,
+    logit_scaling = 0,
+    n_items = None,
+):
+    batch, seq_len, vocab_size = logits.shape
+    assert labels.shape == (batch, seq_len)
+    logits = logits.view(batch * seq_len, vocab_size)
+    labels = labels.view(-1)
+
+    if logit_scaling != 0:
+        logits = logits * logit_scaling
+    if logit_softcapping != 0:
+        logits = logit_softcapping * torch.tanh(logits / logit_softcapping)
+    logits = logits.float()
+
+    loss = F.cross_entropy(
+        logits,
+        labels,
+        ignore_index = -100,
+        reduction = "sum",
+    )
+    if n_items is None:
+        n_items = torch.count_nonzero(labels != -100)
+    if torch.is_tensor(n_items):
+        n_items = n_items.to(loss.device)
+    return loss / n_items
+
+
+register_kernel_backend(
+    "unsloth.cross_entropy_loss",
+    "eager",
+    _fast_cross_entropy_loss_eager,
+)
+
+
 def fast_cross_entropy_loss(
     logits,
     labels,
@@ -489,4 +528,11 @@ if (Version(torch.__version__) < Version("2.4.0")) and not hasattr(
 
 # Patch CE Losses in transformers
 def patch_loss_functions(torch_compile = True):
+    try:
+        from ._backend_registry import get_kernel_backend
+
+        if get_kernel_backend("unsloth.cross_entropy_loss") == "eager":
+            return
+    except Exception:
+        pass
     _patch_loss_functions(fast_cross_entropy_loss, torch_compile = torch_compile)

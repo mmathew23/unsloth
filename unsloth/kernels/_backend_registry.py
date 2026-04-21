@@ -2,11 +2,14 @@ import contextlib
 import importlib
 import importlib.util
 import os
+import sys
 import threading
 import warnings
+from types import ModuleType
 from typing import Any, Callable
 
 DEFAULT_KERNEL_BACKEND = "triton"
+EAGER_KERNEL_BACKEND = "eager"
 GLOBAL_BACKEND_ENV = "UNSLOTH_KERNEL_BACKEND"
 OVERRIDES_ENV = "UNSLOTH_KERNEL_BACKEND_OVERRIDES"
 STRICT_ENV = "UNSLOTH_KERNEL_BACKEND_STRICT"
@@ -182,6 +185,23 @@ def _warn_fallback_once(kernel_name: str, requested_backend: str, fallback_backe
     )
 
 
+def _candidate_backends(
+    preferred_backend: str,
+    fallback_backend: str,
+) -> list[str]:
+    candidates: list[str] = []
+    for backend_name in (
+        preferred_backend,
+        fallback_backend,
+        EAGER_KERNEL_BACKEND,
+    ):
+        normalized = _normalize_backend_name(backend_name)
+        if normalized is None or normalized in candidates:
+            continue
+        candidates.append(normalized)
+    return candidates
+
+
 def get_kernel_backend(
     name: str,
     *,
@@ -191,6 +211,7 @@ def get_kernel_backend(
     kernel_name = _normalize_kernel_name(name)
     preferred_backend = _get_requested_backend(kernel_name, backend = backend)
     fallback_backend_name = _normalize_backend_name(fallback_backend) or DEFAULT_KERNEL_BACKEND
+    available_backends = sorted(_REGISTRY.get(kernel_name, {}))
 
     available, reason = is_kernel_backend_available(preferred_backend)
     if available:
@@ -198,19 +219,26 @@ def get_kernel_backend(
         if preferred_backend in _REGISTRY.get(kernel_name, {}):
             return preferred_backend
 
-    if _strict_mode_enabled() and preferred_backend != fallback_backend_name:
+    if _strict_mode_enabled():
         detail = f": {reason}" if reason else ""
         raise RuntimeError(
             f"Kernel backend '{preferred_backend}' is unavailable for '{kernel_name}'{detail}"
         )
 
-    ensure_backend_loaded(fallback_backend_name)
-    if fallback_backend_name in _REGISTRY.get(kernel_name, {}):
-        if preferred_backend != fallback_backend_name:
-            _warn_fallback_once(kernel_name, preferred_backend, fallback_backend_name)
-        return fallback_backend_name
+    for candidate_backend in _candidate_backends(
+        preferred_backend,
+        fallback_backend_name,
+    ):
+        if candidate_backend == preferred_backend:
+            continue
+        candidate_available, _ = is_kernel_backend_available(candidate_backend)
+        if not candidate_available:
+            continue
+        ensure_backend_loaded(candidate_backend)
+        if candidate_backend in _REGISTRY.get(kernel_name, {}):
+            _warn_fallback_once(kernel_name, preferred_backend, candidate_backend)
+            return candidate_backend
 
-    available_backends = sorted(_REGISTRY.get(kernel_name, {}))
     raise NotImplementedError(
         f"No registered implementation for '{kernel_name}'. Available backends: {available_backends}"
     )
@@ -309,6 +337,7 @@ def get_kernel_backend_state() -> dict[str, Any]:
     env_overrides = _parse_env_overrides(os.environ.get(OVERRIDES_ENV))
     return {
         "default_backend": DEFAULT_KERNEL_BACKEND,
+        "eager_backend": EAGER_KERNEL_BACKEND,
         "env_global_backend": _normalize_backend_name(os.environ.get(GLOBAL_BACKEND_ENV)),
         "env_overrides": dict(sorted(env_overrides.items())),
         "runtime_global_backend": _GLOBAL_BACKEND_OVERRIDE,
@@ -325,6 +354,7 @@ def describe_kernel_backends() -> dict[str, Any]:
 
     backend_names = {
         DEFAULT_KERNEL_BACKEND,
+        EAGER_KERNEL_BACKEND,
         *(_BUILTIN_LOADERS.keys()),
         *(backend for backends in _REGISTRY.values() for backend in backends.keys()),
     }
@@ -343,6 +373,38 @@ def describe_kernel_backends() -> dict[str, Any]:
 
 
 def _load_cutile_backend() -> None:
+    if importlib.util.find_spec("cuda.tile_experimental") is None:
+        import cuda.tile as ct
+
+        tile_experimental = ModuleType("cuda.tile_experimental")
+
+        def autotune_launch(
+            stream,
+            *,
+            grid_fn,
+            kernel,
+            args_fn,
+            hints_fn = None,
+            search_space = None,
+        ):
+            config = None
+            if search_space is not None:
+                configs = search_space() if callable(search_space) else search_space
+                config = next(iter(configs), None)
+            grid = grid_fn(config)
+            args = args_fn(config)
+            # Older/newer cuda.tile Python bindings differ on whether launch
+            # accepts occupancy-like keyword hints. The compatibility shim uses
+            # the first autotune candidate and launches without keyword hints.
+            return ct.launch(stream, grid, kernel, args)
+
+        def clear_autotune_cache():
+            return None
+
+        tile_experimental.autotune_launch = autotune_launch
+        tile_experimental.clear_autotune_cache = clear_autotune_cache
+        sys.modules["cuda.tile_experimental"] = tile_experimental
+
     importlib.import_module("unsloth.kernels.backends.cutile")
 
 
@@ -351,10 +413,6 @@ def _check_cutile_backend() -> tuple[bool, str | None]:
         importlib.import_module("cuda.tile")
     except Exception as exc:
         return False, f"Missing cuda.tile: {exc}"
-    try:
-        importlib.import_module("cuda.tile_experimental")
-    except Exception as exc:
-        return False, f"Missing cuda.tile_experimental: {exc}"
     return True, None
 
 

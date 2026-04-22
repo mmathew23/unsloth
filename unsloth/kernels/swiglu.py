@@ -145,8 +145,6 @@ def swiglu_DWf_DW_dfg_kernel(DW, e, g):
 
 
 _triton_swiglu_fg_kernel = swiglu_fg_kernel
-if HAS_TRITON:
-    register_kernel_backend("unsloth.swiglu_fg", "triton", _triton_swiglu_fg_kernel)
 
 
 def _swiglu_fg_eager(e, g):
@@ -161,12 +159,6 @@ def swiglu_fg_kernel(e, g, *, backend = None):
 
 
 _triton_swiglu_DWf_DW_dfg_kernel = swiglu_DWf_DW_dfg_kernel
-if HAS_TRITON:
-    register_kernel_backend(
-        "unsloth.swiglu_bwd",
-        "triton",
-        _triton_swiglu_DWf_DW_dfg_kernel,
-    )
 
 
 def _swiglu_DWf_DW_dfg_eager(DW, e, g):

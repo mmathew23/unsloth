@@ -292,12 +292,6 @@ def geglu_approx_backward_kernel(DW, e, g):
 
 
 _triton_geglu_exact_forward_kernel = geglu_exact_forward_kernel
-if HAS_TRITON:
-    register_kernel_backend(
-        "unsloth.geglu_exact_forward",
-        "triton",
-        _triton_geglu_exact_forward_kernel,
-    )
 
 
 def _geglu_exact_forward_eager(gate, up):
@@ -321,12 +315,6 @@ def geglu_exact_forward_kernel(gate, up, *, backend = None):
 
 
 _triton_geglu_exact_backward_kernel = geglu_exact_backward_kernel
-if HAS_TRITON:
-    register_kernel_backend(
-        "unsloth.geglu_exact_backward",
-        "triton",
-        _triton_geglu_exact_backward_kernel,
-    )
 
 
 def _geglu_exact_backward_eager(DW, e, g):
@@ -358,12 +346,6 @@ def geglu_exact_backward_kernel(DW, e, g, *, backend = None):
 
 
 _triton_geglu_approx_forward_kernel = geglu_approx_forward_kernel
-if HAS_TRITON:
-    register_kernel_backend(
-        "unsloth.geglu_approx_forward",
-        "triton",
-        _triton_geglu_approx_forward_kernel,
-    )
 
 
 def _geglu_approx_forward_eager(gate, up):
@@ -387,12 +369,6 @@ def geglu_approx_forward_kernel(gate, up, *, backend = None):
 
 
 _triton_geglu_approx_backward_kernel = geglu_approx_backward_kernel
-if HAS_TRITON:
-    register_kernel_backend(
-        "unsloth.geglu_approx_backward",
-        "triton",
-        _triton_geglu_approx_backward_kernel,
-    )
 
 
 def _geglu_approx_backward_eager(DW, e, g):

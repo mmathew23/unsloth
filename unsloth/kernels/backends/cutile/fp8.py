@@ -21,7 +21,7 @@ import cuda.tile as ct
 import torch
 from cuda.tile._numeric_semantics import RoundingMode as RMd
 
-from ..._backend_registry import register_impl
+from ._adapter import register_impl
 
 from .ct_ops import autotune_configs
 from .ct_ops import next_power_of_2

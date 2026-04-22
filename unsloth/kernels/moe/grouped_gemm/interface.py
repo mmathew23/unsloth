@@ -19,6 +19,10 @@ from .kernels.forward import (
     _autotuned_grouped_gemm_forward_kernel,
     _grouped_gemm_forward_kernel,
 )
+from .kernels.autotuning import (
+    DEFAULT_K_BLOCK_SIZES,
+    DEFAULT_N_BLOCK_SIZES,
+)
 from .kernels.tuning import (
     KernelConfigBackward_dW,
     KernelConfigBackward_dX,
@@ -90,6 +94,7 @@ def _is_tracing(*tensors):
 
 
 _per_device_alloc_fns = {}
+_WARNED_SHAPE_FALLBACKS = set()
 
 
 def get_per_device_per_stream_alloc_fn(device):
@@ -110,6 +115,89 @@ def get_per_device_per_stream_alloc_fn(device):
 
         _per_device_alloc_fns[device] = alloc_fn
     return _per_device_alloc_fns[device]
+
+
+def _largest_supported_tile(dim: int) -> int | None:
+    for block in (32, 16, 8):
+        if dim >= block and dim % block == 0:
+            return block
+    return None
+
+
+def _autotune_supports_shape(N: int, K: int) -> bool:
+    k_supported = any(K >= block and K % block == 0 for block in DEFAULT_K_BLOCK_SIZES)
+    n_supported = any(N >= block and N % block == 0 for block in DEFAULT_N_BLOCK_SIZES)
+    return k_supported and n_supported
+
+
+def _shape_compatible_manual_configs(
+    *,
+    N: int,
+    K: int,
+    permute_x: bool,
+    permute_y: bool,
+):
+    block_n = _largest_supported_tile(N)
+    block_k = _largest_supported_tile(K)
+    if block_n is None or block_k is None:
+        return None
+
+    common_kwargs = {
+        "BLOCK_SIZE_M": 32,
+        "BLOCK_SIZE_N": block_n,
+        "BLOCK_SIZE_K": block_k,
+        "num_warps": 4,
+        "num_stages": 2,
+        "permute_x": permute_x,
+        "permute_y": permute_y,
+    }
+    return (
+        KernelConfigForward(**common_kwargs),
+        KernelConfigBackward_dX(**common_kwargs),
+        KernelConfigBackward_dW(**common_kwargs),
+    )
+
+
+def _maybe_disable_autotune_for_small_shape(
+    *,
+    N: int,
+    K: int,
+    permute_x: bool,
+    permute_y: bool,
+    autotune: bool,
+    kernel_config_fwd,
+    kernel_config_bwd_dX,
+    kernel_config_bwd_dW,
+):
+    if not autotune:
+        return autotune, kernel_config_fwd, kernel_config_bwd_dX, kernel_config_bwd_dW
+    if kernel_config_fwd is not None or kernel_config_bwd_dX is not None or kernel_config_bwd_dW is not None:
+        return autotune, kernel_config_fwd, kernel_config_bwd_dX, kernel_config_bwd_dW
+    if _autotune_supports_shape(N, K):
+        return autotune, kernel_config_fwd, kernel_config_bwd_dX, kernel_config_bwd_dW
+
+    configs = _shape_compatible_manual_configs(
+        N = N,
+        K = K,
+        permute_x = permute_x,
+        permute_y = permute_y,
+    )
+    if configs is None:
+        return autotune, kernel_config_fwd, kernel_config_bwd_dX, kernel_config_bwd_dW
+
+    key = (N, K, permute_x, permute_y)
+    if key not in _WARNED_SHAPE_FALLBACKS:
+        _WARNED_SHAPE_FALLBACKS.add(key)
+        warnings.warn(
+            (
+                "grouped_gemm Triton autotune has no compatible default tile for "
+                f"N={N}, K={K}; using a shape-compatible manual config instead."
+            ),
+            RuntimeWarning,
+            stacklevel = 3,
+        )
+    kernel_config_fwd, kernel_config_bwd_dX, kernel_config_bwd_dW = configs
+    return False, kernel_config_fwd, kernel_config_bwd_dX, kernel_config_bwd_dW
 
 
 def log_kernel_info(
@@ -1021,6 +1109,55 @@ def grouped_gemm(
     X = X.view(-1, X.shape[-1])
     m_sizes = m_sizes.view(-1)
     gather_indices = gather_indices.view(-1)
+    N = W.shape[1]
+    K = W.shape[2]
+    autotune, kernel_config_fwd, kernel_config_bwd_dX, kernel_config_bwd_dW = (
+        _maybe_disable_autotune_for_small_shape(
+            N = N,
+            K = K,
+            permute_x = permute_x,
+            permute_y = permute_y,
+            autotune = autotune,
+            kernel_config_fwd = kernel_config_fwd,
+            kernel_config_bwd_dX = kernel_config_bwd_dX,
+            kernel_config_bwd_dW = kernel_config_bwd_dW,
+        )
+    )
+
+    if not autotune:
+        assert (
+            kernel_config_fwd is not None
+        ), "kernel_config_fwd must be provided if autotune is False"
+
+        check_valid_config_fwd(
+            permute_x,
+            permute_y,
+            use_tma_load_x = kernel_config_fwd.use_tma_load_x,
+            use_tma_load_w = kernel_config_fwd.use_tma_load_w,
+            use_tma_store = kernel_config_fwd.use_tma_store,
+            fuse_mul_post = fuse_mul_post,
+            is_first_gemm = is_first_gemm,
+        )
+        if kernel_config_bwd_dW is not None and not dX_only:
+            check_valid_config_bwd_dW(
+                permute_x,
+                permute_y,
+                use_tma_load_dY = kernel_config_bwd_dW.use_tma_load_dy,
+                use_tma_load_x = kernel_config_bwd_dW.use_tma_load_x,
+                use_tma_store = kernel_config_bwd_dW.use_tma_store,
+                fuse_mul_post = fuse_mul_post,
+                is_first_gemm = is_first_gemm,
+            )
+        if kernel_config_bwd_dX is not None and not dW_only:
+            check_valid_config_bwd_dX(
+                permute_x,
+                permute_y,
+                use_tma_load_dY = kernel_config_bwd_dX.use_tma_load_dy,
+                use_tma_load_w = kernel_config_bwd_dX.use_tma_load_w,
+                use_tma_store = kernel_config_bwd_dX.use_tma_store,
+                fuse_mul_post = fuse_mul_post,
+                is_first_gemm = is_first_gemm,
+            )
 
     return GroupedGemm.apply(
         X,

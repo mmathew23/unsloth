@@ -454,12 +454,6 @@ def fast_cross_entropy_loss(
 
 
 _triton_fast_cross_entropy_loss = fast_cross_entropy_loss
-if HAS_TRITON:
-    register_kernel_backend(
-        "unsloth.cross_entropy_loss",
-        "triton",
-        _triton_fast_cross_entropy_loss,
-    )
 
 
 def _fast_cross_entropy_loss_eager(

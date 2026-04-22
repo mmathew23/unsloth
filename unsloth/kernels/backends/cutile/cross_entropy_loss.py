@@ -21,7 +21,7 @@ import math
 import cuda.tile as ct
 import torch
 
-from ..._backend_registry import register_impl
+from ._adapter import register_impl
 
 from .ct_ops import MAX_FUSED_SIZE
 from .ct_ops import calculate_settings

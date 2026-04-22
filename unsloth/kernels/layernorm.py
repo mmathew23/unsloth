@@ -184,10 +184,6 @@ def _fast_layernorm_triton(X, W, b, eps):
     return Fast_Layernorm.apply(X, W, b, eps)
 
 
-if HAS_TRITON:
-    register_kernel_backend("unsloth.layernorm", "triton", _fast_layernorm_triton)
-
-
 def _fast_layernorm_eager(X, W, b, eps):
     return F.layer_norm(X, W.shape, W, b, eps)
 

@@ -51,6 +51,7 @@ from .geglu import (
     geglu_approx_forward_kernel,
     geglu_approx_backward_kernel,
 )
+from .grouped_gemm import grouped_gemm
 from .fast_lora import (
     get_lora_parameters,
     get_lora_parameters_bias,

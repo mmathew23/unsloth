@@ -303,12 +303,6 @@ def fast_rope_embedding(
 
 
 _triton_fast_rope_embedding = fast_rope_embedding
-if HAS_TRITON:
-    register_kernel_backend(
-        "unsloth.rope_embedding_qk",
-        "triton",
-        _triton_fast_rope_embedding,
-    )
 
 
 def _prepare_rope_cache(cos, sin, head_dim, batch, seq_len, rope_embedding_indices, device):

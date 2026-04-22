@@ -95,12 +95,6 @@ def weight_dequant_block(
 
 
 _triton_weight_dequant_block = weight_dequant_block
-if HAS_TRITON:
-    register_kernel_backend(
-        "unsloth.weight_dequant",
-        "triton",
-        _triton_weight_dequant_block,
-    )
 
 
 def _weight_dequant_block_eager(
@@ -211,8 +205,6 @@ def act_quant(
 
 
 _triton_act_quant = act_quant
-if HAS_TRITON:
-    register_kernel_backend("unsloth.act_quant", "triton", _triton_act_quant)
 
 
 def act_quant(
@@ -379,14 +371,6 @@ def w8a8_block_fp8_matmul_triton(
         GROUP_SIZE_M = 8,
     )
     return C
-
-
-if HAS_TRITON:
-    register_kernel_backend(
-        "unsloth.w8a8_block_fp8_matmul",
-        "triton",
-        w8a8_block_fp8_matmul_triton,
-    )
 
 
 def torchao_block_matmul(

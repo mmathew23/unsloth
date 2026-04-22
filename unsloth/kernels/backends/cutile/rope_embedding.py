@@ -38,7 +38,7 @@ import cuda.tile as ct
 import cuda.tile_experimental as ct_experimental
 import torch
 
-from ..._backend_registry import register_impl
+from ._adapter import register_impl
 
 from .ct_ops import autotune_configs
 from .ct_ops import calculate_settings

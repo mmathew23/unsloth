@@ -2,10 +2,8 @@ import contextlib
 import importlib
 import importlib.util
 import os
-import sys
 import threading
 import warnings
-from types import ModuleType
 from typing import Any, Callable
 
 DEFAULT_KERNEL_BACKEND = "triton"
@@ -20,6 +18,7 @@ BackendLoader = Callable[[], None]
 
 _REGISTRY: dict[str, dict[str, KernelImplementation]] = {}
 _BUILTIN_LOADERS: dict[str, BackendLoader] = {}
+_BACKEND_PACKAGES: dict[str, str] = {}
 _AVAILABILITY_CHECKS: dict[str, AvailabilityCheck] = {}
 _LOADED_BACKENDS: set[str] = set()
 _GLOBAL_BACKEND_OVERRIDE: str | None = None
@@ -111,6 +110,34 @@ def register_builtin_backend_loader(
             _AVAILABILITY_CHECKS[backend_name] = availability_check
 
 
+def register_backend_package(
+    backend: str,
+    package: str,
+    *,
+    availability_check: AvailabilityCheck | None = None,
+) -> None:
+    backend_name = _normalize_backend_name(backend)
+    if backend_name is None:
+        raise ValueError("Backend name must not be empty.")
+    package_name = str(package).strip()
+    if not package_name:
+        raise ValueError("Backend package must not be empty.")
+
+    def _load_package() -> None:
+        module = importlib.import_module(package_name)
+        load_backend = getattr(module, "load_backend", None)
+        if callable(load_backend):
+            load_backend()
+
+    with _LOCK:
+        _BACKEND_PACKAGES[backend_name] = package_name
+    register_builtin_backend_loader(
+        backend_name,
+        _load_package,
+        availability_check = availability_check,
+    )
+
+
 def ensure_backend_loaded(backend: str) -> None:
     backend_name = _normalize_backend_name(backend)
     if backend_name is None:
@@ -188,18 +215,41 @@ def _warn_fallback_once(kernel_name: str, requested_backend: str, fallback_backe
 def _candidate_backends(
     preferred_backend: str,
     fallback_backend: str,
+    *,
+    explicit_request: bool,
 ) -> list[str]:
     candidates: list[str] = []
-    for backend_name in (
-        preferred_backend,
-        fallback_backend,
-        EAGER_KERNEL_BACKEND,
-    ):
+    ordered_backends = [preferred_backend]
+    if not explicit_request:
+        ordered_backends.append(fallback_backend)
+    ordered_backends.append(EAGER_KERNEL_BACKEND)
+    for backend_name in ordered_backends:
         normalized = _normalize_backend_name(backend_name)
         if normalized is None or normalized in candidates:
             continue
         candidates.append(normalized)
     return candidates
+
+
+def _backend_status_for_kernel(
+    kernel_name: str,
+    backend_name: str,
+) -> tuple[bool, str | None]:
+    available, reason = is_kernel_backend_available(backend_name)
+    if not available:
+        return False, reason
+
+    try:
+        ensure_backend_loaded(backend_name)
+    except Exception as exc:
+        return False, f"Failed to load backend '{backend_name}': {exc}"
+
+    if backend_name not in _REGISTRY.get(kernel_name, {}):
+        return (
+            False,
+            f"Kernel '{kernel_name}' has no registered '{backend_name}' implementation.",
+        )
+    return True, None
 
 
 def get_kernel_backend(
@@ -209,15 +259,13 @@ def get_kernel_backend(
     fallback_backend: str = DEFAULT_KERNEL_BACKEND,
 ) -> str:
     kernel_name = _normalize_kernel_name(name)
+    explicit_backend = _normalize_backend_name(backend)
     preferred_backend = _get_requested_backend(kernel_name, backend = backend)
     fallback_backend_name = _normalize_backend_name(fallback_backend) or DEFAULT_KERNEL_BACKEND
     available_backends = sorted(_REGISTRY.get(kernel_name, {}))
-
-    available, reason = is_kernel_backend_available(preferred_backend)
+    available, reason = _backend_status_for_kernel(kernel_name, preferred_backend)
     if available:
-        ensure_backend_loaded(preferred_backend)
-        if preferred_backend in _REGISTRY.get(kernel_name, {}):
-            return preferred_backend
+        return preferred_backend
 
     if _strict_mode_enabled():
         detail = f": {reason}" if reason else ""
@@ -228,16 +276,15 @@ def get_kernel_backend(
     for candidate_backend in _candidate_backends(
         preferred_backend,
         fallback_backend_name,
+        explicit_request = explicit_backend is not None,
     ):
         if candidate_backend == preferred_backend:
             continue
-        candidate_available, _ = is_kernel_backend_available(candidate_backend)
+        candidate_available, _ = _backend_status_for_kernel(kernel_name, candidate_backend)
         if not candidate_available:
             continue
-        ensure_backend_loaded(candidate_backend)
-        if candidate_backend in _REGISTRY.get(kernel_name, {}):
-            _warn_fallback_once(kernel_name, preferred_backend, candidate_backend)
-            return candidate_backend
+        _warn_fallback_once(kernel_name, preferred_backend, candidate_backend)
+        return candidate_backend
 
     raise NotImplementedError(
         f"No registered implementation for '{kernel_name}'. Available backends: {available_backends}"
@@ -358,55 +405,35 @@ def describe_kernel_backends() -> dict[str, Any]:
         *(_BUILTIN_LOADERS.keys()),
         *(backend for backends in _REGISTRY.values() for backend in backends.keys()),
     }
+    backends = {}
+    for backend_name in sorted(backend_names):
+        available, reason = is_kernel_backend_available(backend_name)
+        registered_ops = [
+            kernel_name
+            for kernel_name, implementations in sorted(_REGISTRY.items())
+            if backend_name in implementations
+        ]
+        backends[backend_name] = {
+            "available": available,
+            "reason": reason,
+            "loaded": backend_name in _LOADED_BACKENDS,
+            "package": _BACKEND_PACKAGES.get(backend_name),
+            "registered_op_count": len(registered_ops),
+            "registered_ops": registered_ops,
+        }
     availability = {
         backend_name: {
-            "available": is_kernel_backend_available(backend_name)[0],
-            "reason": is_kernel_backend_available(backend_name)[1],
+            "available": data["available"],
+            "reason": data["reason"],
         }
-        for backend_name in sorted(backend_names)
+        for backend_name, data in backends.items()
     }
     return {
         "state": get_kernel_backend_state(),
         "availability": availability,
+        "backends": backends,
         "registry": get_registered_kernel_backends(),
     }
-
-
-def _load_cutile_backend() -> None:
-    if importlib.util.find_spec("cuda.tile_experimental") is None:
-        import cuda.tile as ct
-
-        tile_experimental = ModuleType("cuda.tile_experimental")
-
-        def autotune_launch(
-            stream,
-            *,
-            grid_fn,
-            kernel,
-            args_fn,
-            hints_fn = None,
-            search_space = None,
-        ):
-            config = None
-            if search_space is not None:
-                configs = search_space() if callable(search_space) else search_space
-                config = next(iter(configs), None)
-            grid = grid_fn(config)
-            args = args_fn(config)
-            # Older/newer cuda.tile Python bindings differ on whether launch
-            # accepts occupancy-like keyword hints. The compatibility shim uses
-            # the first autotune candidate and launches without keyword hints.
-            return ct.launch(stream, grid, kernel, args)
-
-        def clear_autotune_cache():
-            return None
-
-        tile_experimental.autotune_launch = autotune_launch
-        tile_experimental.clear_autotune_cache = clear_autotune_cache
-        sys.modules["cuda.tile_experimental"] = tile_experimental
-
-    importlib.import_module("unsloth.kernels.backends.cutile")
-
 
 def _check_cutile_backend() -> tuple[bool, str | None]:
     try:
@@ -416,8 +443,20 @@ def _check_cutile_backend() -> tuple[bool, str | None]:
     return True, None
 
 
-register_builtin_backend_loader(
+def _check_triton_backend() -> tuple[bool, str | None]:
+    if importlib.util.find_spec("triton") is None:
+        return False, "Triton is not installed."
+    return True, None
+
+
+register_backend_package(
+    "triton",
+    "unsloth.kernels.backends.triton",
+    availability_check = _check_triton_backend,
+)
+
+register_backend_package(
     "cutile",
-    _load_cutile_backend,
+    "unsloth.kernels.backends.cutile",
     availability_check = _check_cutile_backend,
 )

@@ -26,7 +26,14 @@ from unsloth.kernels.geglu import (
     geglu_exact_backward_kernel,
     geglu_exact_forward_kernel,
 )
+from unsloth.kernels.grouped_gemm import grouped_gemm
+from unsloth.kernels.moe.grouped_gemm.kernels.tuning import (
+    KernelConfigBackward_dW,
+    KernelConfigBackward_dX,
+    KernelConfigForward,
+)
 from unsloth.kernels.layernorm import fast_layernorm
+from unsloth.kernels.moe.grouped_gemm.reference.moe_ops import get_routing_indices
 from unsloth.kernels.rms_layernorm import fast_rms_layernorm
 from unsloth.kernels.rope_embedding import fast_rope_embedding
 from unsloth.kernels.swiglu import swiglu_DWf_DW_dfg_kernel, swiglu_fg_kernel
@@ -618,6 +625,206 @@ def test_cross_entropy_supported_dtypes(dtype: torch.dtype):
         loss.backward()
         _assert_close(f"cross entropy dtype={dtype} loss [{backend}]", loss, ref_loss)
         _assert_close(f"cross entropy dtype={dtype} grad [{backend}]", logits.grad, ref_grad)
+
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason = "CUDA backend comparison requires CUDA.")
+@pytest.mark.parametrize("dtype", LOW_PRECISION_DTYPES)
+def test_grouped_gemm_backend_numerics(dtype: torch.dtype):
+    _require_multiple_backends()
+    _set_seed()
+
+    x_base = torch.randn(4, 128, device = CUDA_DEVICE, dtype = dtype)
+    w_up_base = torch.randn(2, 128, 128, device = CUDA_DEVICE, dtype = dtype)
+    w_down_base = torch.randn(2, 128, 128, device = CUDA_DEVICE, dtype = dtype)
+    selected_experts = torch.tensor(
+        [[1, 0], [0, 1], [1, 1], [0, 0]],
+        device = CUDA_DEVICE,
+        dtype = torch.long,
+    )
+    m_sizes, gather_indices = get_routing_indices(selected_experts, 2)
+    m_sizes = m_sizes.to(device = CUDA_DEVICE, dtype = torch.int32)
+    gather_indices = gather_indices.to(device = CUDA_DEVICE, dtype = torch.int32)
+    first_gemm_fwd = KernelConfigForward(permute_x = True)
+    first_gemm_bwd_dx = KernelConfigBackward_dX(permute_x = True)
+    first_gemm_bwd_dw = KernelConfigBackward_dW(permute_x = True)
+    second_gemm_fwd = KernelConfigForward(permute_y = True)
+    second_gemm_bwd_dx = KernelConfigBackward_dX(permute_y = True)
+    second_gemm_bwd_dw = KernelConfigBackward_dW(permute_y = True)
+
+    ref_x = _clone_for_backend(x_base, requires_grad = True)
+    ref_w_up = _clone_for_backend(w_up_base, requires_grad = True)
+    ref_w_down = _clone_for_backend(w_down_base, requires_grad = True)
+    ref_up = grouped_gemm(
+        ref_x,
+        ref_w_up,
+        m_sizes,
+        topk = 2,
+        gather_indices = gather_indices,
+        permute_x = True,
+        kernel_config_fwd = first_gemm_fwd,
+        kernel_config_bwd_dX = first_gemm_bwd_dx,
+        kernel_config_bwd_dW = first_gemm_bwd_dw,
+        autotune = False,
+        backend = "eager",
+    )
+    ref_mid = torch.nn.functional.silu(ref_up)
+    ref_out = grouped_gemm(
+        ref_mid,
+        ref_w_down,
+        m_sizes,
+        topk = 2,
+        gather_indices = gather_indices,
+        permute_y = True,
+        kernel_config_fwd = second_gemm_fwd,
+        kernel_config_bwd_dX = second_gemm_bwd_dx,
+        kernel_config_bwd_dW = second_gemm_bwd_dw,
+        autotune = False,
+        is_first_gemm = False,
+        backend = "eager",
+    )
+    ref_loss = ref_out.float().square().mean()
+    ref_loss.backward()
+    ref_out_detached = ref_out.detach().clone()
+    ref_x_grad = ref_x.grad.detach().clone()
+    ref_w_up_grad = ref_w_up.grad.detach().clone()
+    ref_w_down_grad = ref_w_down.grad.detach().clone()
+
+    for backend in AVAILABLE_BACKENDS:
+        if backend == "eager":
+            continue
+        x = _clone_for_backend(x_base, requires_grad = True)
+        w_up = _clone_for_backend(w_up_base, requires_grad = True)
+        w_down = _clone_for_backend(w_down_base, requires_grad = True)
+        up = grouped_gemm(
+            x,
+            w_up,
+            m_sizes,
+            topk = 2,
+            gather_indices = gather_indices,
+            permute_x = True,
+            kernel_config_fwd = first_gemm_fwd,
+            kernel_config_bwd_dX = first_gemm_bwd_dx,
+            kernel_config_bwd_dW = first_gemm_bwd_dw,
+            autotune = False,
+            backend = backend,
+        )
+        mid = torch.nn.functional.silu(up)
+        out = grouped_gemm(
+            mid,
+            w_down,
+            m_sizes,
+            topk = 2,
+            gather_indices = gather_indices,
+            permute_y = True,
+            kernel_config_fwd = second_gemm_fwd,
+            kernel_config_bwd_dX = second_gemm_bwd_dx,
+            kernel_config_bwd_dW = second_gemm_bwd_dw,
+            autotune = False,
+            is_first_gemm = False,
+            backend = backend,
+        )
+        loss = out.float().square().mean()
+        loss.backward()
+        _assert_close(f"grouped_gemm dtype={dtype} output [{backend}]", out, ref_out_detached)
+        _assert_close(f"grouped_gemm dtype={dtype} x grad [{backend}]", x.grad, ref_x_grad)
+        _assert_close(f"grouped_gemm dtype={dtype} w_up grad [{backend}]", w_up.grad, ref_w_up_grad)
+        _assert_close(
+            f"grouped_gemm dtype={dtype} w_down grad [{backend}]",
+            w_down.grad,
+            ref_w_down_grad,
+        )
+
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason = "CUDA backend comparison requires CUDA.")
+def test_grouped_gemm_triton_small_glm4_dims():
+    available, reason = is_kernel_backend_available("triton")
+    if not available:
+        pytest.skip(reason or "Triton is unavailable.")
+    _set_seed()
+
+    x_base = torch.randn(4, 16, device = CUDA_DEVICE, dtype = torch.bfloat16)
+    w_up_base = torch.randn(4, 64, 16, device = CUDA_DEVICE, dtype = torch.bfloat16)
+    w_down_base = torch.randn(4, 16, 32, device = CUDA_DEVICE, dtype = torch.bfloat16)
+    selected_experts = torch.tensor(
+        [
+            [0, 1, 2, 3],
+            [1, 2, 3, 0],
+            [2, 3, 0, 1],
+            [3, 0, 1, 2],
+        ],
+        device = CUDA_DEVICE,
+        dtype = torch.long,
+    )
+    m_sizes, gather_indices = get_routing_indices(selected_experts, 4)
+    m_sizes = m_sizes.to(device = CUDA_DEVICE, dtype = torch.int32)
+    gather_indices = gather_indices.to(device = CUDA_DEVICE, dtype = torch.int32)
+
+    ref_x = _clone_for_backend(x_base, requires_grad = True)
+    ref_w_up = _clone_for_backend(w_up_base, requires_grad = True)
+    ref_w_down = _clone_for_backend(w_down_base, requires_grad = True)
+    ref_up = grouped_gemm(
+        ref_x,
+        ref_w_up,
+        m_sizes,
+        topk = 4,
+        gather_indices = gather_indices,
+        permute_x = True,
+        autotune = True,
+        backend = "eager",
+    )
+    ref_gate, ref_up_proj = ref_up.chunk(2, dim = -1)
+    ref_mid = torch.nn.functional.silu(ref_gate) * ref_up_proj
+    ref_out = grouped_gemm(
+        ref_mid,
+        ref_w_down,
+        m_sizes,
+        topk = 4,
+        gather_indices = gather_indices,
+        permute_y = True,
+        autotune = True,
+        is_first_gemm = False,
+        backend = "eager",
+    )
+    ref_loss = ref_out.float().square().mean()
+    ref_loss.backward()
+
+    tri_x = _clone_for_backend(x_base, requires_grad = True)
+    tri_w_up = _clone_for_backend(w_up_base, requires_grad = True)
+    tri_w_down = _clone_for_backend(w_down_base, requires_grad = True)
+    tri_up = grouped_gemm(
+        tri_x,
+        tri_w_up,
+        m_sizes,
+        topk = 4,
+        gather_indices = gather_indices,
+        permute_x = True,
+        autotune = True,
+        backend = "triton",
+    )
+    tri_gate, tri_up_proj = tri_up.chunk(2, dim = -1)
+    tri_mid = torch.nn.functional.silu(tri_gate) * tri_up_proj
+    tri_out = grouped_gemm(
+        tri_mid,
+        tri_w_down,
+        m_sizes,
+        topk = 4,
+        gather_indices = gather_indices,
+        permute_y = True,
+        autotune = True,
+        is_first_gemm = False,
+        backend = "triton",
+    )
+    tri_loss = tri_out.float().square().mean()
+    tri_loss.backward()
+
+    _assert_close("grouped_gemm tiny glm4 triton output", tri_out, ref_out.detach())
+    _assert_close("grouped_gemm tiny glm4 triton x grad", tri_x.grad, ref_x.grad)
+    _assert_close("grouped_gemm tiny glm4 triton w_up grad", tri_w_up.grad, ref_w_up.grad)
+    _assert_close(
+        "grouped_gemm tiny glm4 triton w_down grad",
+        tri_w_down.grad,
+        ref_w_down.grad,
+    )
 
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason = "CUDA backend comparison requires CUDA.")

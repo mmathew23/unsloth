@@ -28,6 +28,7 @@ from .mistral import FastMistralModel
 from .qwen2 import FastQwen2Model
 from .qwen3 import FastQwen3Model
 from .qwen3_moe import FastQwen3MoeModel
+from .glm4_moe import FastGLM47Model, FastGLM4MoeModel
 from .cohere import FastCohereModel
 from transformers import AutoConfig
 from transformers import __version__ as transformers_version
@@ -638,6 +639,10 @@ class FastLanguageModel(FastLlamaModel):
             dispatch_model = (
                 FastQwen3Model if model_type == "qwen3" else FastQwen3MoeModel
             )
+        elif model_type == "glm4_moe_lite":
+            dispatch_model = FastGLM47Model
+        elif model_type == "glm4_moe":
+            dispatch_model = FastGLM4MoeModel
         # elif model_type == "falcon_h1":
         #     dispatch_model = FastFalconH1Model
         #     if not SUPPORTS_FALCON_H1:

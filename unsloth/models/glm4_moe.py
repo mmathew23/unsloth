@@ -41,39 +41,10 @@ import torch
 import torch.nn.functional as F
 from typing import Optional, Tuple
 from ..kernels import fast_rms_layernorm
+from ..kernels.grouped_gemm import grouped_gemm
+from ..kernels.moe.grouped_gemm.reference.moe_ops import get_routing_indices
 
-# Import the grouped gemm utilities from unsloth kernels
-# The grouped_gemm module expects its parent directory to be in sys.path
-HAS_GROUPED_GEMM = False
-try:
-    import sys
-    import os
-
-    # Add the moe directory (parent of grouped_gemm) to sys.path
-    _moe_path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "kernels", "moe"
-    )
-    if _moe_path not in sys.path:
-        sys.path.insert(0, _moe_path)
-
-    # Import grouped_gemm package first to apply TMA compatibility shim
-    # This patches triton.language to support both old and new TMA API names
-    import grouped_gemm  # noqa: F401 - triggers TMA compatibility shim
-
-    from grouped_gemm.interface import grouped_gemm
-    from grouped_gemm.reference.moe_ops import (
-        get_routing_indices,
-        permute,
-        unpermute,
-    )
-
-    HAS_GROUPED_GEMM = True
-except ImportError as e:
-    import warnings
-
-    warnings.warn(
-        f"Grouped GEMM not available: {e}. MoE will use fallback implementation."
-    )
+HAS_GROUPED_GEMM = True
 
 
 # Import transformers GLM4 MoE Lite classes
@@ -90,9 +61,9 @@ try:
         Glm4MoeLiteRMSNorm,
     )
 
-    HAS_GLM4_MOE = True
+    HAS_GLM4_MOE_LITE = True
 except ImportError:
-    HAS_GLM4_MOE = False
+    HAS_GLM4_MOE_LITE = False
 
     # Create dummy classes for type checking
     class Glm4MoeLiteAttention:
@@ -120,10 +91,52 @@ except ImportError:
         pass
 
 
+try:
+    from transformers.models.glm4_moe.modeling_glm4_moe import (
+        Glm4MoeAttention,
+        Glm4MoeMoE,
+        Glm4MoeMLP,
+        Glm4MoeNaiveMoe,
+        Glm4MoeTopkRouter,
+        Glm4MoeDecoderLayer,
+        Glm4MoeModel,
+        Glm4MoeForCausalLM,
+        Glm4MoeRMSNorm,
+    )
+
+    HAS_GLM4_MOE = True
+except ImportError:
+    HAS_GLM4_MOE = False
+
+    class Glm4MoeAttention:
+        pass
+
+    class Glm4MoeMoE:
+        pass
+
+    class Glm4MoeMLP:
+        pass
+
+    class Glm4MoeNaiveMoe:
+        pass
+
+    class Glm4MoeTopkRouter:
+        pass
+
+    class Glm4MoeDecoderLayer:
+        pass
+
+    class Glm4MoeModel:
+        pass
+
+    class Glm4MoeForCausalLM:
+        pass
+
+
 torch_nn_functional_silu = torch.nn.functional.silu
 
 
-def Glm4MoeLiteMoE_fast_forward(self, hidden_states):
+def _glm4_moe_fast_forward(self, hidden_states):
     """
     Optimized MoE forward pass using grouped GEMM.
 
@@ -207,7 +220,7 @@ def Glm4MoeLiteMoE_fast_forward(self, hidden_states):
     return hidden_states.view(*orig_shape)
 
 
-def Glm4MoeLiteNaiveMoe_fast_forward(
+def _glm4_moe_naive_fast_forward(
     self,
     hidden_states: torch.Tensor,
     top_k_index: torch.Tensor,
@@ -309,6 +322,12 @@ def Glm4MoeLiteNaiveMoe_fast_forward(
     return final_hidden_states
 
 
+Glm4MoeLiteMoE_fast_forward = _glm4_moe_fast_forward
+Glm4MoeMoE_fast_forward = _glm4_moe_fast_forward
+Glm4MoeLiteNaiveMoe_fast_forward = _glm4_moe_naive_fast_forward
+Glm4MoeNaiveMoe_fast_forward = _glm4_moe_naive_fast_forward
+
+
 def Glm4MoeLiteDecoderLayer_fast_forward(
     self,
     hidden_states: torch.Tensor,
@@ -395,7 +414,7 @@ class FastGLM47Model(FastLlamaModel):
 
     @staticmethod
     def pre_patch():
-        if not HAS_GLM4_MOE:
+        if not HAS_GLM4_MOE_LITE:
             raise ImportError(
                 "Unsloth: GLM4 MoE Lite support requires transformers >= 5.0.0. "
                 "Please upgrade with: pip install --upgrade transformers"
@@ -444,6 +463,54 @@ class FastGLM47Model(FastLlamaModel):
             rope_scaling = rope_scaling,
             fix_tokenizer = fix_tokenizer,
             model_patcher = FastGLM47Model,
+            tokenizer_name = tokenizer_name,
+            trust_remote_code = trust_remote_code,
+            **kwargs,
+        )
+
+
+class FastGLM4MoeModel(FastLlamaModel):
+    @staticmethod
+    def pre_patch():
+        if not HAS_GLM4_MOE:
+            raise ImportError(
+                "Unsloth: GLM4 MoE support requires transformers >= 5.0.0. "
+                "Please upgrade with: pip install --upgrade transformers"
+            )
+
+        if HAS_GROUPED_GEMM:
+            Glm4MoeNaiveMoe.forward = Glm4MoeNaiveMoe_fast_forward
+            Glm4MoeMoE.forward = Glm4MoeMoE_fast_forward
+
+        return
+
+    @staticmethod
+    def from_pretrained(
+        model_name = "zai-org/GLM-4.5-Air",
+        max_seq_length = 4096,
+        dtype = None,
+        load_in_4bit = True,
+        token = None,
+        device_map = "sequential",
+        rope_scaling = None,
+        fix_tokenizer = True,
+        model_patcher = None,
+        tokenizer_name = None,
+        trust_remote_code = False,
+        **kwargs,
+    ):
+        kwargs.pop("unsloth_force_compile", None)
+
+        return FastLlamaModel.from_pretrained(
+            model_name = model_name,
+            max_seq_length = max_seq_length,
+            dtype = dtype,
+            load_in_4bit = load_in_4bit,
+            token = token,
+            device_map = device_map,
+            rope_scaling = rope_scaling,
+            fix_tokenizer = fix_tokenizer,
+            model_patcher = FastGLM4MoeModel,
             tokenizer_name = tokenizer_name,
             trust_remote_code = trust_remote_code,
             **kwargs,

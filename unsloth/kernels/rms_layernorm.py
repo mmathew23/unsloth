@@ -256,14 +256,6 @@ def _fast_rms_layernorm_triton(
     return Fast_RMS_Layernorm.apply(X, W, eps, gemma)
 
 
-if HAS_TRITON:
-    register_kernel_backend(
-        "unsloth.rms_layernorm",
-        "triton",
-        _fast_rms_layernorm_triton,
-    )
-
-
 def _fast_rms_layernorm_eager(
     X: torch.Tensor,
     W: torch.Tensor,

@@ -19,6 +19,7 @@ def permute(X: torch.Tensor, gather_indices: torch.Tensor, topk: int):
         [total_tokens, hidden_dim]
     """
     assert gather_indices.ndim == 1
+    gather_indices = gather_indices.to(dtype = torch.int64)
     X = X.view(-1, X.shape[-1])
     # Shortcut for topk == 1
     if topk == 1:
@@ -29,6 +30,7 @@ def permute(X: torch.Tensor, gather_indices: torch.Tensor, topk: int):
 
 def unpermute(X: torch.Tensor, gather_indices: torch.Tensor):
     X = X.view(-1, X.shape[-1]) if X.ndim > 2 else X
+    gather_indices = gather_indices.to(dtype = torch.int64)
     unpermuted = torch.empty_like(X)
     unpermuted.index_copy_(0, gather_indices, X)
     return unpermuted.view_as(X)
@@ -92,11 +94,9 @@ def get_routing_indices(
             Indices for unpermuting gathered inputs back to token order, shape ``(bs * seqlen * top_k,)``.
     """
     # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
-    token_counts_by_expert = torch.histc(
-        selected_experts.view(-1),
-        bins = num_experts,
-        min = 0,
-        max = num_experts,
+    token_counts_by_expert = torch.bincount(
+        selected_experts.view(-1).to(dtype = torch.int64),
+        minlength = num_experts,
     )
     # token_indices_experts_sorted shape (bs*slen*top_k,)
     gather_indices = torch.argsort(selected_experts.view(-1), stable = True)

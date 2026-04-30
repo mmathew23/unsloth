@@ -468,11 +468,13 @@ def _fast_cross_entropy_loss_eager(
     logits = logits.view(batch * seq_len, vocab_size)
     labels = labels.view(-1)
 
+    # Mirror the Triton path: upcast to fp32 BEFORE scaling/softcapping so
+    # bf16/fp16 inputs don't accumulate rounding error inside tanh.
+    logits = logits.float()
     if logit_scaling != 0:
         logits = logits * logit_scaling
     if logit_softcapping != 0:
         logits = logit_softcapping * torch.tanh(logits / logit_softcapping)
-    logits = logits.float()
 
     loss = F.cross_entropy(
         logits,

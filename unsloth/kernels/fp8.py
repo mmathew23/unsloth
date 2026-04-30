@@ -501,7 +501,7 @@ def fp8_block_matmul(
 
 class FP8BlockQuantLinear(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, X, weight, weight_scale, backend = None):
+    def forward(ctx, X, weight, weight_scale, bias = None, backend = None):
         m, n = weight.shape
 
         # Save original scale for backward (before any transformation)
@@ -547,10 +547,14 @@ class FP8BlockQuantLinear(torch.autograd.Function):
             output_dtype = X.dtype,
             backend = backend,
         )
+        output = output.to(X.dtype)
+        if bias is not None:
+            output = output + bias.to(output.dtype)
         ctx.weight = weight
         ctx.weight_scale = original_weight_scale  # Save original for backward
         ctx.backend = backend
-        return output.to(X.dtype)
+        ctx.bias = bias
+        return output
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -562,12 +566,16 @@ class FP8BlockQuantLinear(torch.autograd.Function):
         )
         grad_X = torch_matmul(grad_output, W_deq)
         del W_deq
-        return grad_X, None, None, None
+        if ctx.bias is not None:
+            d_bias = grad_output.sum(dim = tuple(range(grad_output.ndim - 1)))
+        else:
+            d_bias = None
+        return grad_X, None, None, d_bias, None
 
 
 @torch_compile
-def fp8_torch_block_quant_forward(X, weight, weight_scale, *, backend = None):
-    return FP8BlockQuantLinear.apply(X, weight, weight_scale, backend)
+def fp8_torch_block_quant_forward(X, weight, weight_scale, bias = None, *, backend = None):
+    return FP8BlockQuantLinear.apply(X, weight, weight_scale, bias, backend)
 
 
 class FbgemmFp8Linear_matmul(torch.autograd.Function):
@@ -603,7 +611,8 @@ class FbgemmFp8Linear_matmul(torch.autograd.Function):
             output = torch.ops.fbgemm.f8f8bf16_rowwise(
                 x_quantized, weight, x_scale, weight_scale_float32, use_fast_accum = True
             )
-            output = output + bias if bias is not None else output
+            if bias is not None:
+                output = output + bias.to(output.dtype)
             # Hacky for now, we have the output to the device of x
             output = output.to(x.device, x.dtype)
             output = output.reshape(output_shape)
@@ -632,6 +641,7 @@ class FbgemmFp8Linear_matmul(torch.autograd.Function):
         ctx.weight = weight
         ctx.weight_scale = weight_scale
         ctx.backend = backend
+        ctx.bias = bias
         return output
 
     @staticmethod
@@ -644,7 +654,11 @@ class FbgemmFp8Linear_matmul(torch.autograd.Function):
         )
         grad_X = torch_matmul(grad_output, W_deq)
         del W_deq
-        return grad_X, None, None, None, None, None
+        if ctx.bias is not None:
+            d_bias = grad_output.sum(dim = tuple(range(grad_output.ndim - 1)))
+        else:
+            d_bias = None
+        return grad_X, None, None, d_bias, None
 
 
 @torch_compile
@@ -684,7 +698,8 @@ class FP8_fbgemm_block_linear(torch.autograd.Function):
         output = torch.ops.fbgemm.f8f8bf16_blockwise(
             xq, weight.contiguous(), xs, weight_scale.contiguous(), bs_m, bs_n, bs_k
         )
-        output = output + bias if bias is not None else output
+        if bias is not None:
+            output = output + bias.to(output.dtype)
 
         output = output.view(*orig_shape[:-1], -1)
 
@@ -695,6 +710,7 @@ class FP8_fbgemm_block_linear(torch.autograd.Function):
         ctx.weight_scale = weight_scale
         ctx.block_size = [bs_m, bs_n, bs_k]
         ctx.backend = backend
+        ctx.bias = bias
         return output
 
     @staticmethod
@@ -707,7 +723,11 @@ class FP8_fbgemm_block_linear(torch.autograd.Function):
         )
         grad_X = torch_matmul(grad_output, W_deq)
         del W_deq
-        return grad_X, None, None, None, None, None
+        if ctx.bias is not None:
+            d_bias = grad_output.sum(dim = tuple(range(grad_output.ndim - 1)))
+        else:
+            d_bias = None
+        return grad_X, None, None, d_bias, None
 
 
 @torch_compile
@@ -863,6 +883,7 @@ def fp8_linear(X, weight, weight_scale, bias = None, *, backend = None):
                 X,
                 weight,
                 weight_scale,
+                bias = bias,
                 backend = resolved_backend,
             )
     # Row/channel quantized FP8: 2D scale with shape (n, 1)

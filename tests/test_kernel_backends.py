@@ -619,7 +619,7 @@ class KernelBackendTests(unittest.TestCase):
         weight_scale = torch.ones(1, 1)
         captured = {}
 
-        def _fake_block(X, weight, weight_scale, *, backend = None):
+        def _fake_block(X, weight, weight_scale, bias = None, *, backend = None):
             captured["backend"] = backend
             return torch.zeros(X.shape[:-1] + (weight.shape[0],), dtype = X.dtype)
 
@@ -738,7 +738,7 @@ class KernelBackendTests(unittest.TestCase):
         weight_scale = torch.ones(1, 1)
         captured = {}
 
-        def _fake_block(X, weight, weight_scale, *, backend = None):
+        def _fake_block(X, weight, weight_scale, bias = None, *, backend = None):
             captured["backend"] = backend
             return torch.zeros(X.shape[:-1] + (weight.shape[0],), dtype = X.dtype)
 
@@ -762,6 +762,146 @@ class KernelBackendTests(unittest.TestCase):
 
         eager_impl.assert_called_once()
         self.assertTrue(torch.equal(out, torch.ones(2, 4)))
+
+
+    def test_fp8_block_path_forwards_bias(self):
+        # The dispatcher must forward a non-None bias kwarg into
+        # fp8_block_quant_linear -- prior to the fix it was silently dropped on
+        # the cutile / probed-not-OK FBGEMM block path.
+        X = torch.randn(2, 4)
+        weight = torch.randn(4, 4)
+        weight_scale = torch.ones(1, 1)
+        bias = torch.randn(4)
+        captured = {}
+
+        def _fake_block(X, weight, weight_scale, bias = None, *, backend = None):
+            captured["bias_id"] = id(bias) if bias is not None else None
+            captured["bias_is_none"] = bias is None
+            return torch.zeros(X.shape[:-1] + (weight.shape[0],), dtype = X.dtype)
+
+        with patch.object(fp8_module, "get_kernel_backend", return_value = "triton"):
+            with patch.object(fp8_module, "fp8_block_quant_linear", side_effect = _fake_block):
+                fp8_module.fp8_linear(X, weight, weight_scale, bias = bias, backend = "cutile")
+
+        self.assertFalse(
+            captured["bias_is_none"],
+            "fp8_linear must forward bias kwarg into fp8_block_quant_linear.",
+        )
+        self.assertEqual(captured["bias_id"], id(bias))
+
+    def test_fp8_block_quant_no_bias_unchanged(self):
+        # Regression: bias=None default must yield the same output as before
+        # the bias-plumbing change.
+        torch.manual_seed(0)
+        X = torch.randn(2, 4, dtype = torch.float32)
+        weight = torch.randn(4, 4, dtype = torch.float32)
+        weight_scale = torch.ones(1, 1, dtype = torch.float32)
+
+        with patch.object(fp8_module, "get_kernel_backend", return_value = "eager"):
+            out_no_bias = fp8_module.fp8_linear(X, weight, weight_scale, bias = None, backend = "eager")
+            out_default = fp8_module.fp8_linear(X, weight, weight_scale, backend = "eager")
+
+        self.assertTrue(torch.equal(out_no_bias, out_default))
+
+    def _make_block_quant_linear(self, in_features, out_features, bias):
+        # Synthetic block-quant linear: float weights paired with all-ones
+        # block scales so the FP8 path is exercised but the dequant collapses
+        # to identity. Returns (weight, weight_scale, bias_tensor).
+        weight = torch.randn(out_features, in_features, dtype = torch.float32, device = "cuda" if torch.cuda.is_available() else "cpu") * 0.05
+        block_size = [128, 128]
+        m, n = weight.shape
+        p = (m + block_size[0] - 1) // block_size[0]
+        q = (n + block_size[1] - 1) // block_size[1]
+        weight_scale = torch.ones(p, q, dtype = torch.float32, device = weight.device)
+        bias_t = torch.randn(out_features, dtype = torch.float32, device = weight.device) if bias else None
+        return weight, weight_scale, bias_t
+
+    def test_fp8_block_quant_bias_forward_correctness(self):
+        # Forward parity vs eager reference under the eager fp8_linear path
+        # (the only path runnable on CPU without GPU). With weight_scale=1 the
+        # FP8 dequant is a no-op so the output should equal X @ W.T + b.
+        weight, weight_scale, bias = self._make_block_quant_linear(128, 64, bias = True)
+        X = torch.randn(4, 16, 128, dtype = torch.float32, device = weight.device)
+
+        with patch.object(fp8_module, "get_kernel_backend", return_value = "eager"):
+            out = fp8_module.fp8_linear(X, weight, weight_scale, bias = bias, backend = "eager")
+
+        ref = X @ weight.T + bias
+        self.assertEqual(out.shape, ref.shape)
+        self.assertTrue(torch.allclose(out, ref, atol = 1e-2, rtol = 1e-2))
+
+    def test_fp8_block_quant_bias_backward_gradient(self):
+        # FP8BlockQuantLinear.backward must return a non-None d_bias in slot 4.
+        # Drive the autograd Function directly so the test runs CPU-or-GPU.
+        if not torch.cuda.is_available():
+            self.skipTest("FP8BlockQuantLinear requires a CUDA device for triton-backed matmul.")
+        torch.manual_seed(0)
+        # Block-quant matmul kernel expects FP8 weights paired with float scales.
+        weight_f, weight_scale, bias = self._make_block_quant_linear(128, 64, bias = True)
+        weight_fp8 = weight_f.to(torch.float8_e4m3fn)
+        X = torch.randn(4, 16, 128, dtype = torch.bfloat16, device = weight_fp8.device, requires_grad = True)
+        bias_p = bias.detach().clone().to(torch.bfloat16).requires_grad_(True)
+
+        out = fp8_module.FP8BlockQuantLinear.apply(X, weight_fp8, weight_scale, bias_p, "triton")
+        out.sum().backward()
+
+        self.assertIsNotNone(bias_p.grad, "d_bias must not be None when bias is provided.")
+        self.assertEqual(bias_p.grad.shape, bias_p.shape)
+        ref_grad = torch.ones_like(out).sum(dim = tuple(range(out.ndim - 1)))
+        self.assertTrue(
+            torch.allclose(bias_p.grad.to(torch.float32), ref_grad.to(torch.float32), atol = 1e-2, rtol = 1e-2),
+            "d_bias must equal the reduction of grad_output over leading dims.",
+        )
+
+    def test_fp8_fbgemm_rowwise_bias_backward_gradient(self):
+        if not fp8_module._HAS_FBGEMM_ROWWISE:
+            self.skipTest("torch.ops.fbgemm.f8f8bf16_rowwise unavailable.")
+        if not torch.cuda.is_available():
+            self.skipTest("FBGEMM rowwise requires CUDA.")
+        torch.manual_seed(0)
+        in_features, out_features = 128, 64
+        # Row-wise: weight_scale shape is (out_features, 1), per-row.
+        weight = torch.randn(out_features, in_features, dtype = torch.bfloat16, device = "cuda") * 0.05
+        weight_fp8 = weight.to(torch.float8_e4m3fn)
+        weight_scale = torch.ones(out_features, 1, dtype = torch.bfloat16, device = "cuda")
+        bias = torch.randn(out_features, dtype = torch.bfloat16, device = "cuda", requires_grad = True)
+        X = torch.randn(2, 8, in_features, dtype = torch.bfloat16, device = "cuda", requires_grad = True)
+
+        out = fp8_module.FbgemmFp8Linear_matmul.apply(X, weight_fp8, weight_scale, bias, "triton")
+        out.sum().backward()
+
+        self.assertIsNotNone(bias.grad, "FbgemmFp8Linear_matmul.backward must populate d_bias.")
+        self.assertEqual(bias.grad.shape, bias.shape)
+        ref_grad = torch.ones_like(out).sum(dim = tuple(range(out.ndim - 1)))
+        self.assertTrue(
+            torch.allclose(bias.grad.to(torch.float32), ref_grad.to(torch.float32), atol = 1e-2, rtol = 1e-2),
+        )
+
+    def test_fp8_fbgemm_block_bias_backward_gradient(self):
+        # FBGEMM block path is gated by the runtime probe; skip when probe says no.
+        if os.environ.get("UNSLOTH_HAS_FBGEMM", "0") != "1":
+            self.skipTest("FBGEMM blockwise FP8 not probed-OK on this device.")
+        if not torch.cuda.is_available():
+            self.skipTest("FBGEMM block requires CUDA.")
+        if fp8_module.triton_quantize_fp8_block is None:
+            self.skipTest("triton_quantize_fp8_block unavailable.")
+        torch.manual_seed(0)
+        in_features, out_features = 128, 128
+        weight = torch.randn(out_features, in_features, dtype = torch.bfloat16, device = "cuda") * 0.05
+        weight_fp8 = weight.to(torch.float8_e4m3fn)
+        weight_scale = torch.ones(1, 1, dtype = torch.float32, device = "cuda")
+        bias = torch.randn(out_features, dtype = torch.bfloat16, device = "cuda", requires_grad = True)
+        X = torch.randn(2, 8, in_features, dtype = torch.bfloat16, device = "cuda", requires_grad = True)
+
+        out = fp8_module.FP8_fbgemm_block_linear.apply(X, weight_fp8, weight_scale, bias, "triton")
+        out.sum().backward()
+
+        self.assertIsNotNone(bias.grad, "FP8_fbgemm_block_linear.backward must populate d_bias.")
+        self.assertEqual(bias.grad.shape, bias.shape)
+        ref_grad = torch.ones_like(out).sum(dim = tuple(range(out.ndim - 1)))
+        self.assertTrue(
+            torch.allclose(bias.grad.to(torch.float32), ref_grad.to(torch.float32), atol = 1e-2, rtol = 1e-2),
+        )
 
 
 if __name__ == "__main__":

@@ -455,6 +455,13 @@ def set_kernel_backend(backend: str | None) -> None:
 
         with kernel_backend_context(global_backend="cutile"):
             ...
+
+    Scope: applies to the current contextvar context only. New threads,
+    forked subprocesses (e.g. ``torch.utils.data.DataLoader`` workers,
+    Ray actors), and ``multiprocessing`` children do NOT inherit it. For
+    process-wide / cross-process configuration, set the
+    ``UNSLOTH_KERNEL_BACKEND`` environment variable before spawning — the
+    env var is read by every dispatch and inherited by subprocesses.
     """
     _RUNTIME_GLOBAL_BACKEND.set(_normalize_backend_name(backend))
 
@@ -467,6 +474,11 @@ def set_kernel_backend_for_op(name: str, backend: str | None) -> None:
 
         with kernel_backend_context(overrides={"rope_embedding": "cutile"}):
             ...
+
+    Scope: current contextvar context only (see :func:`set_kernel_backend`
+    for thread / subprocess caveats). For process-wide per-op overrides
+    use the ``UNSLOTH_KERNEL_BACKEND_OVERRIDES`` env var (format:
+    ``rope_embedding=cutile,layernorm=triton``).
     """
     kernel_name = _normalize_kernel_name(name)
     normalized_backend = _normalize_backend_name(backend)
@@ -492,6 +504,11 @@ def set_kernel_backends(
         with kernel_backend_context(global_backend="cutile",
                                     overrides={"rope_embedding": "triton"}):
             ...
+
+    Scope: current contextvar context only (see :func:`set_kernel_backend`
+    for thread / subprocess caveats). For process-wide configuration use
+    the ``UNSLOTH_KERNEL_BACKEND`` and ``UNSLOTH_KERNEL_BACKEND_OVERRIDES``
+    environment variables.
     """
     set_kernel_backend(global_backend)
     if overrides is None:

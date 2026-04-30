@@ -214,7 +214,10 @@ def _grouped_gemm_forward_kernel(
                         w = tl.reshape(w, (BLOCK_SIZE_N, BLOCK_SIZE_K))
 
                     x = x.to(w.dtype)
-                    accumulator += tl.dot(x, w.T)
+                    # Use input_precision="ieee" so fp32 inputs accumulate at
+                    # full fp32 precision; otherwise Triton on Ampere+ silently
+                    # truncates fp32 operands to TF32 (10-bit mantissa).
+                    accumulator += tl.dot(x, w.T, input_precision="ieee")
 
                     if not USE_TMA_LOAD_X:
                         x_ptrs += BLOCK_SIZE_K

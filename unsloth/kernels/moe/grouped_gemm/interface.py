@@ -95,6 +95,7 @@ def _is_tracing(*tensors):
 
 _per_device_alloc_fns = {}
 _WARNED_SHAPE_FALLBACKS = set()
+_FUSED_MUL_WARN = False
 
 
 def get_per_device_per_stream_alloc_fn(device):
@@ -930,8 +931,8 @@ class GroupedGemm(torch.autograd.Function):
             dX,
             dW,
             None,  # m_sizes
-            None,  # gather_indices
             None,  # topk
+            None,  # gather_indices
             None,  # permute_x
             None,  # permute_y
             None,  # topk_weights
@@ -1108,7 +1109,8 @@ def grouped_gemm(
 
     X = X.view(-1, X.shape[-1])
     m_sizes = m_sizes.view(-1)
-    gather_indices = gather_indices.view(-1)
+    if gather_indices is not None:
+        gather_indices = gather_indices.view(-1)
     N = W.shape[1]
     K = W.shape[2]
     autotune, kernel_config_fwd, kernel_config_bwd_dX, kernel_config_bwd_dW = (

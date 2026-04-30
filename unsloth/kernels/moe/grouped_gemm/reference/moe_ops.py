@@ -98,6 +98,10 @@ def get_routing_indices(
         selected_experts.view(-1).to(dtype = torch.int64),
         minlength = num_experts,
     )
+    # bincount output length = max(selected_expert_id) + 1 when any id exceeds num_experts-1.
+    # Truncate to num_experts so that m_sizes always has exactly num_experts entries and
+    # out-of-range expert ids don't silently corrupt the m_sizes tensor shape.
+    token_counts_by_expert = token_counts_by_expert[:num_experts]
     # token_indices_experts_sorted shape (bs*slen*top_k,)
     gather_indices = torch.argsort(selected_experts.view(-1), stable = True)
     if return_scatter_indices:

@@ -232,8 +232,13 @@ def _grouped_gemm_dX_kernel(
                     # TODO: check if predication along K is needed since we checked that K is divisible by BLOCK_SIZE_K in the forward kernel
 
                     # [M, N] @ [N, K] -> [M, K]
+                    # Cast to w.dtype for fp16/bf16 paths; fp32 stays fp32.
+                    # Use input_precision="ieee" to avoid TF32 precision loss when
+                    # both operands are float32 (Triton default is "tf32" on sm80+,
+                    # which reduces fp32 mantissa to 10 bits and produces ~0.03 errors
+                    # in gradients).  For fp16/bf16 operands this flag is ignored.
                     dY = dY.to(w.dtype)
-                    accumulator += tl.dot(dY, w)  # NOTE: no transpose of b
+                    accumulator += tl.dot(dY, w, input_precision="ieee")  # NOTE: no transpose of b
 
                     # Advance A along contiguous dimension
                     if not USE_TMA_LOAD_dY:
@@ -476,9 +481,12 @@ def _grouped_gemm_dW_kernel(
                                 mask = mn_mask,
                             )
 
+                        # Use input_precision="ieee" to avoid TF32 precision loss
+                        # when both operands are float32 (same reason as dX kernel).
                         accumulator += tl.dot(
                             dY.T.to(x.dtype),  # [BLOCK_N, BLOCK_M]
                             x,  # [BLOCK_M, BLOCK_K]
+                            input_precision="ieee",
                         )
 
                 y = accumulator.to(output_dtype)

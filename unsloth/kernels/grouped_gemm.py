@@ -50,10 +50,12 @@ def _grouped_gemm_eager(
     """
     del is_first_gemm, dX_only, dW_only
 
-    X = X.view(-1, X.shape[-1])
-    m_sizes = m_sizes.view(-1)
+    # Use reshape(...) instead of view(...) so non-contiguous inputs (e.g.
+    # transposed activations) don't crash before the kernel even runs.
+    X = X.reshape(-1, X.shape[-1])
+    m_sizes = m_sizes.reshape(-1)
     if gather_indices is not None:
-        gather_indices = gather_indices.view(-1)
+        gather_indices = gather_indices.reshape(-1)
 
     if permute_x:
         if gather_indices is None:
@@ -70,7 +72,7 @@ def _grouped_gemm_eager(
     if fuse_mul_post:
         if topk_weights is None:
             raise ValueError("topk_weights is required when fuse_mul_post is True")
-        output = output * topk_weights.view(-1, 1).to(dtype = output.dtype)
+        output = output * topk_weights.reshape(-1, 1).to(dtype = output.dtype)
 
     return output
 

@@ -11,6 +11,7 @@ from .autotuning import (
     prune_dX_configs,
     prune_kernel_configs_backward_dW,
 )
+from .forward import _FP32_INPUT_PRECISION
 
 """
 dX backward kernel
@@ -233,12 +234,11 @@ def _grouped_gemm_dX_kernel(
 
                     # [M, N] @ [N, K] -> [M, K]
                     # Cast to w.dtype for fp16/bf16 paths; fp32 stays fp32.
-                    # Use input_precision="ieee" to avoid TF32 precision loss when
-                    # both operands are float32 (Triton default is "tf32" on sm80+,
-                    # which reduces fp32 mantissa to 10 bits and produces ~0.03 errors
-                    # in gradients).  For fp16/bf16 operands this flag is ignored.
+                    # input_precision: tf32x3 on Ampere+ (3xTF32 emulation, ~fp32
+                    # precision at near-TF32 cost), ieee on Turing/Volta (no TF32).
+                    # The flag is ignored when both operands are fp16/bf16.
                     dY = dY.to(w.dtype)
-                    accumulator += tl.dot(dY, w, input_precision="ieee")  # NOTE: no transpose of b
+                    accumulator += tl.dot(dY, w, input_precision=_FP32_INPUT_PRECISION)  # NOTE: no transpose of b
 
                     # Advance A along contiguous dimension
                     if not USE_TMA_LOAD_dY:
@@ -481,12 +481,12 @@ def _grouped_gemm_dW_kernel(
                                 mask = mn_mask,
                             )
 
-                        # Use input_precision="ieee" to avoid TF32 precision loss
-                        # when both operands are float32 (same reason as dX kernel).
+                        # See _FP32_INPUT_PRECISION docstring (forward.py): tf32x3
+                        # on Ampere+, ieee on pre-Ampere. No-op for fp16/bf16.
                         accumulator += tl.dot(
                             dY.T.to(x.dtype),  # [BLOCK_N, BLOCK_M]
                             x,  # [BLOCK_M, BLOCK_K]
-                            input_precision="ieee",
+                            input_precision=_FP32_INPUT_PRECISION,
                         )
 
                 y = accumulator.to(output_dtype)

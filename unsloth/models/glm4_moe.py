@@ -482,6 +482,11 @@ class FastGLM4MoeModel(FastLlamaModel):
             Glm4MoeNaiveMoe.forward = Glm4MoeNaiveMoe_fast_forward
             Glm4MoeMoE.forward = Glm4MoeMoE_fast_forward
 
+        # Note: matches FastGLM47Model -- we don't patch DecoderLayer / MLP /
+        # RMSNorm because GLM4 uses MLA (Multi-head Latent Attention) with
+        # projection names and a rotary embedding shape that don't fit the
+        # Llama-derived fast-forward helpers. The grouped-GEMM MoE is the
+        # speedup we provide here.
         return
 
     @staticmethod

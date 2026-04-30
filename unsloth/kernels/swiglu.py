@@ -148,7 +148,10 @@ _triton_swiglu_fg_kernel = swiglu_fg_kernel
 
 
 def _swiglu_fg_eager(e, g):
-    return F.silu(e) * g
+    # Mirror the Triton kernel exactly: silu(e) is computed in fp32 then
+    # downcast back to input dtype; the f * g product is then in input dtype.
+    f = F.silu(e.float()).to(g.dtype)
+    return f * g
 
 
 register_kernel_backend("unsloth.swiglu_fg", "eager", _swiglu_fg_eager)
@@ -162,13 +165,20 @@ _triton_swiglu_DWf_DW_dfg_kernel = swiglu_DWf_DW_dfg_kernel
 
 
 def _swiglu_DWf_DW_dfg_eager(DW, e, g):
-    e_float = e.float()
-    sig = torch.sigmoid(e_float)
-    f = (e_float * sig).to(dtype = DW.dtype)
+    # Mirror the Triton kernel:
+    #   e upcast to fp32, sigmoid + silu in fp32
+    #   f = silu(e) downcast to input dtype
+    #   h = f * g, df = DW * f, dg = DW * g all in input dtype
+    #   de uses dg upcast-back-to-fp32 for the chain rule, then downcast
+    out_dtype = DW.dtype
+    e_f = e.float()
+    sig = torch.sigmoid(e_f)
+    f = (sig * e_f).to(out_dtype)
     h = f * g
     df = DW * f
-    de = (DW * g).float() * sig * (1.0 + e_float * (1.0 - sig))
-    return h, df, de.to(dtype = DW.dtype)
+    dg = DW * g
+    de = (dg.float() * sig * (1.0 + e_f * (1.0 - sig))).to(out_dtype)
+    return h, df, de
 
 
 register_kernel_backend("unsloth.swiglu_bwd", "eager", _swiglu_DWf_DW_dfg_eager)

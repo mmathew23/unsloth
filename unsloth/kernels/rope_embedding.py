@@ -191,6 +191,8 @@ class Fast_RoPE_Embedding(torch.autograd.Function):
         n_heads: int
         head_dim: int
         batch, seq_len, n_heads, head_dim = Q.shape
+        # The non-indexed call site (fast_rope_embedding) always hands us a
+        # fresh `.contiguous()` clone, so in-place rotation here is safe.
         Q = Q.reshape(batch * seq_len, n_heads * head_dim)
         n_rows: int
         n_cols: int
@@ -241,7 +243,10 @@ class Fast_RoPE_Embedding(torch.autograd.Function):
         n_heads: int
         head_dim: int
         batch, seq_len, n_heads, head_dim = dY.shape
+        # In-place rotation on the gradient buffer; autograd owns it.
         dY = dY.reshape(batch * seq_len, n_heads * head_dim)
+        if not dY.is_contiguous():
+            dY = dY.contiguous()
         n_rows: int
         n_cols: int
         n_rows, n_cols = dY.shape
@@ -297,7 +302,7 @@ def fast_rope_embedding(
         K_out = Fast_RoPE_Embedding.apply(
             K.transpose(1, 2).contiguous(), cos, sin
         ).transpose(1, 2)
-    if DEVICE_COUNT > 1:
+    if DEVICE_COUNT > 1 and Q.device.type == "cuda":
         torch_device_stream(Q.device).synchronize()
     return Q_out, K_out
 
@@ -389,6 +394,35 @@ register_kernel_backend(
 )
 
 
+def _rope_embedding_eager(Q, cos, sin):
+    """Single-Q rope, eager fallback.
+
+    Matches the shape convention of ``Fast_RoPE_Embedding.apply`` and the
+    CuTile single-Q registration: Q is ``(batch, seq, n_heads, head_dim)``.
+    cos/sin are reduced to half-head-dim and broadcast against Q's seq and
+    head-dim axes (``_apply_rope_eager`` only consumes the first half).
+    """
+    head_dim = Q.shape[-1]
+    half = head_dim // 2
+    cos_b = cos.squeeze()
+    sin_b = sin.squeeze()
+    if cos_b.shape[-1] == head_dim:
+        cos_b = cos_b[..., :half]
+        sin_b = sin_b[..., :half]
+    if Q.ndim == 4 and cos_b.ndim == 2:
+        # (seq, half) -> (1, seq, 1, half) to broadcast against (b, s, h, d)
+        cos_b = cos_b.unsqueeze(0).unsqueeze(2)
+        sin_b = sin_b.unsqueeze(0).unsqueeze(2)
+    return _apply_rope_eager(Q, cos_b, sin_b)
+
+
+register_kernel_backend(
+    "unsloth.rope_embedding",
+    "eager",
+    _rope_embedding_eager,
+)
+
+
 @torch.compiler.disable
 def fast_rope_embedding(
     Q,
@@ -408,9 +442,27 @@ def fast_rope_embedding(
         rope_embedding_indices,
         backend = backend,
     )
-    if DEVICE_COUNT > 1:
+    if DEVICE_COUNT > 1 and Q.device.type == "cuda":
         torch_device_stream(Q.device).synchronize()
     return Q_out, K_out
+
+
+@torch.compiler.disable
+def rope_embedding(Q, cos, sin, *, backend = None):
+    """Single-Q rotary position embedding through the pluggable backend.
+
+    Q is ``(batch, seq_len, n_heads, head_dim)``. cos/sin are the rotary
+    factors (any shape that broadcasts against Q's last two dims after
+    ``.squeeze()``). Falls back triton -> eager when the requested backend
+    is unavailable.
+    """
+    return dispatch_kernel(
+        "unsloth.rope_embedding",
+        Q,
+        cos,
+        sin,
+        backend = backend,
+    )
 
 
 class Fast_RoPE_Embedding_QK(torch.autograd.Function):
@@ -422,7 +474,11 @@ class Fast_RoPE_Embedding_QK(torch.autograd.Function):
         batch, n_heads_Q, seq_len, head_dim = Q.shape
         _, n_heads_K, _, _ = K.shape
 
-        # Inplace rotary embedding is generally fine
+        # In-place rotation when contiguous; clone otherwise. NOTE: the Triton
+        # kernel writes through raw pointers, so PyTorch's version counter is
+        # not bumped. Callers must not retain a reference to Q/K expecting the
+        # pre-rotation values; the standard q_proj -> rope -> attention flow is
+        # safe because nothing upstream depends on the original Q/K.
         Q_out = Q.clone() if not Q.is_contiguous() else Q
         K_out = K.clone() if not K.is_contiguous() else K
 
@@ -494,9 +550,10 @@ class Fast_RoPE_Embedding_QK(torch.autograd.Function):
             else ctx.cos.new_empty(1, dtype = torch.int32)
         )
 
-        # Inplace rotary embedding is generally fine
-        dQ_out = dQ.clone() if not dQ.is_contiguous() else dQ
-        dK_out = dK.clone() if not dK.is_contiguous() else dK
+        # In-place when contiguous; clone otherwise. The autograd engine owns
+        # the gradient buffer, so in-place rotation is safe here.
+        dQ_out = dQ if dQ.is_contiguous() else dQ.clone()
+        dK_out = dK if dK.is_contiguous() else dK.clone()
 
         Q_batch_stride, Q_head_stride, Q_seq_stride = (
             dQ_out.stride(0),

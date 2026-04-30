@@ -505,6 +505,12 @@ class FastLanguageModel(FastLlamaModel):
             # Leave as tuple if more than one arch
             model_type = model_types
 
+        # Normalize so 'glm4-moe' / 'GLM4_MoE' etc. all hit the same branch.
+        # Real HF configs are already snake_case lowercase, but defending
+        # against config typos and casing variants is cheap.
+        if isinstance(model_type, str):
+            model_type = model_type.lower().replace("-", "_")
+
         # New transformers need to check manually.
         if SUPPORTS_LLAMA32 and is_model and is_peft:
             # Check if folder exists locally
@@ -659,6 +665,11 @@ class FastLanguageModel(FastLlamaModel):
         # elif model_type == "granite":
         #     dispatch_model = FastGraniteModel
         else:
+            print(
+                f"Unsloth: model_type {model_type!r} has no specialized "
+                f"fast path in FastLanguageModel; routing through the "
+                f"generic FastModel loader instead."
+            )
             return FastModel.from_pretrained(
                 model_name = old_model_name,
                 max_seq_length = max_seq_length,

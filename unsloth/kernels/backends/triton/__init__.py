@@ -16,7 +16,7 @@ from ...geglu import (
 from ...grouped_gemm import _triton_grouped_gemm
 from ...layernorm import _fast_layernorm_triton
 from ...rms_layernorm import _fast_rms_layernorm_triton
-from ...rope_embedding import _triton_fast_rope_embedding
+from ...rope_embedding import Fast_RoPE_Embedding, _triton_fast_rope_embedding
 from ...swiglu import (
     _triton_swiglu_DWf_DW_dfg_kernel,
     _triton_swiglu_fg_kernel,
@@ -32,6 +32,7 @@ EXPECTED_OPS = (
     "unsloth.grouped_gemm",
     "unsloth.layernorm",
     "unsloth.rms_layernorm",
+    "unsloth.rope_embedding",
     "unsloth.rope_embedding_qk",
     "unsloth.swiglu_bwd",
     "unsloth.swiglu_fg",
@@ -40,74 +41,26 @@ EXPECTED_OPS = (
 )
 
 
-@register_impl("unsloth.layernorm")
-def _register_layernorm(*args, **kwargs):
-    return _fast_layernorm_triton(*args, **kwargs)
+_REGISTRATIONS = {
+    "unsloth.act_quant":             _triton_act_quant,
+    "unsloth.cross_entropy_loss":    _triton_fast_cross_entropy_loss,
+    "unsloth.geglu_approx_backward": _triton_geglu_approx_backward_kernel,
+    "unsloth.geglu_approx_forward":  _triton_geglu_approx_forward_kernel,
+    "unsloth.geglu_exact_backward":  _triton_geglu_exact_backward_kernel,
+    "unsloth.geglu_exact_forward":   _triton_geglu_exact_forward_kernel,
+    "unsloth.grouped_gemm":          _triton_grouped_gemm,
+    "unsloth.layernorm":             _fast_layernorm_triton,
+    "unsloth.rms_layernorm":         _fast_rms_layernorm_triton,
+    "unsloth.rope_embedding":        Fast_RoPE_Embedding.apply,
+    "unsloth.rope_embedding_qk":     _triton_fast_rope_embedding,
+    "unsloth.swiglu_bwd":            _triton_swiglu_DWf_DW_dfg_kernel,
+    "unsloth.swiglu_fg":             _triton_swiglu_fg_kernel,
+    "unsloth.w8a8_block_fp8_matmul": w8a8_block_fp8_matmul_triton,
+    "unsloth.weight_dequant":        _triton_weight_dequant_block,
+}
 
-
-@register_impl("unsloth.rms_layernorm")
-def _register_rms_layernorm(*args, **kwargs):
-    return _fast_rms_layernorm_triton(*args, **kwargs)
-
-
-@register_impl("unsloth.cross_entropy_loss")
-def _register_cross_entropy(*args, **kwargs):
-    return _triton_fast_cross_entropy_loss(*args, **kwargs)
-
-
-@register_impl("unsloth.swiglu_fg")
-def _register_swiglu_fg(*args, **kwargs):
-    return _triton_swiglu_fg_kernel(*args, **kwargs)
-
-
-@register_impl("unsloth.swiglu_bwd")
-def _register_swiglu_bwd(*args, **kwargs):
-    return _triton_swiglu_DWf_DW_dfg_kernel(*args, **kwargs)
-
-
-@register_impl("unsloth.geglu_exact_forward")
-def _register_geglu_exact_forward(*args, **kwargs):
-    return _triton_geglu_exact_forward_kernel(*args, **kwargs)
-
-
-@register_impl("unsloth.geglu_exact_backward")
-def _register_geglu_exact_backward(*args, **kwargs):
-    return _triton_geglu_exact_backward_kernel(*args, **kwargs)
-
-
-@register_impl("unsloth.geglu_approx_forward")
-def _register_geglu_approx_forward(*args, **kwargs):
-    return _triton_geglu_approx_forward_kernel(*args, **kwargs)
-
-
-@register_impl("unsloth.geglu_approx_backward")
-def _register_geglu_approx_backward(*args, **kwargs):
-    return _triton_geglu_approx_backward_kernel(*args, **kwargs)
-
-
-@register_impl("unsloth.grouped_gemm")
-def _register_grouped_gemm(*args, **kwargs):
-    return _triton_grouped_gemm(*args, **kwargs)
-
-
-@register_impl("unsloth.rope_embedding_qk")
-def _register_rope_embedding_qk(*args, **kwargs):
-    return _triton_fast_rope_embedding(*args, **kwargs)
-
-
-@register_impl("unsloth.weight_dequant")
-def _register_weight_dequant(*args, **kwargs):
-    return _triton_weight_dequant_block(*args, **kwargs)
-
-
-@register_impl("unsloth.act_quant")
-def _register_act_quant(*args, **kwargs):
-    return _triton_act_quant(*args, **kwargs)
-
-
-@register_impl("unsloth.w8a8_block_fp8_matmul")
-def _register_w8a8_block_fp8_matmul(*args, **kwargs):
-    return w8a8_block_fp8_matmul_triton(*args, **kwargs)
+for _op_name, _impl in _REGISTRATIONS.items():
+    register_impl(_op_name)(_impl)
 
 
 def load_backend() -> None:

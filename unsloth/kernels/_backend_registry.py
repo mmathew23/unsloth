@@ -1,4 +1,5 @@
 import contextlib
+import contextvars
 import importlib
 import importlib.util
 import os
@@ -21,8 +22,15 @@ _BUILTIN_LOADERS: dict[str, BackendLoader] = {}
 _BACKEND_PACKAGES: dict[str, str] = {}
 _AVAILABILITY_CHECKS: dict[str, AvailabilityCheck] = {}
 _LOADED_BACKENDS: set[str] = set()
-_GLOBAL_BACKEND_OVERRIDE: str | None = None
-_KERNEL_BACKEND_OVERRIDES: dict[str, str] = {}
+_LOADING_BACKENDS: dict[str, threading.Event] = {}
+_RUNTIME_GLOBAL_BACKEND: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "unsloth_kernel_backend_global",
+    default = None,
+)
+_RUNTIME_KERNEL_OVERRIDES: contextvars.ContextVar[dict[str, str]] = contextvars.ContextVar(
+    "unsloth_kernel_backend_overrides",
+    default = {},
+)
 _WARNED_FALLBACKS: set[tuple[str, str, str]] = set()
 _LOCK = threading.RLock()
 
@@ -59,10 +67,32 @@ def _parse_env_overrides(raw_value: str | None) -> dict[str, str]:
                 f"Invalid {OVERRIDES_ENV} entry {item!r}. Expected 'kernel=backend'."
             )
         kernel_name, backend_name = item.split("=", 1)
-        overrides[_normalize_kernel_name(kernel_name)] = _normalize_backend_name(
-            backend_name
-        )
+        normalized_backend = _normalize_backend_name(backend_name)
+        if normalized_backend is None:
+            # An empty value (e.g. "rope_embedding=") is treated as "no
+            # override" for that kernel rather than silently storing None.
+            continue
+        overrides[_normalize_kernel_name(kernel_name)] = normalized_backend
     return overrides
+
+
+# Cache for the parsed UNSLOTH_KERNEL_BACKEND_OVERRIDES env value. Re-parsing
+# the env var on every dispatch is measurable in tight training loops; the
+# cache is invalidated whenever the env string changes. CPython attribute
+# writes are atomic, so a benign race during cache refresh just re-parses
+# once on each thread -- correctness is preserved.
+_ENV_OVERRIDE_CACHE: tuple[str | None, dict[str, str]] = (None, {})
+
+
+def _get_env_overrides() -> dict[str, str]:
+    global _ENV_OVERRIDE_CACHE
+    raw = os.environ.get(OVERRIDES_ENV)
+    cached_raw, cached_value = _ENV_OVERRIDE_CACHE
+    if raw == cached_raw:
+        return cached_value
+    parsed = _parse_env_overrides(raw)
+    _ENV_OVERRIDE_CACHE = (raw, parsed)
+    return parsed
 
 
 def _strict_mode_enabled() -> bool:
@@ -142,6 +172,7 @@ def ensure_backend_loaded(backend: str) -> None:
     backend_name = _normalize_backend_name(backend)
     if backend_name is None:
         return
+
     with _LOCK:
         if backend_name in _LOADED_BACKENDS:
             return
@@ -149,19 +180,46 @@ def ensure_backend_loaded(backend: str) -> None:
         if loader is None:
             _LOADED_BACKENDS.add(backend_name)
             return
-    loader()
-    with _LOCK:
-        _LOADED_BACKENDS.add(backend_name)
+        availability_check = _AVAILABILITY_CHECKS.get(backend_name)
+        event = _LOADING_BACKENDS.get(backend_name)
+        if event is None:
+            event = threading.Event()
+            _LOADING_BACKENDS[backend_name] = event
+            should_load = True
+        else:
+            should_load = False
+
+    if not should_load:
+        event.wait()
+        return
+
+    try:
+        # Surface unavailability with a clear error before triggering the
+        # backend package's import-time setup (which can crash on missing
+        # native deps such as cuda.tile).
+        if availability_check is not None:
+            try:
+                available, reason = availability_check()
+            except Exception as exc:
+                available, reason = False, str(exc)
+            if not available:
+                raise ImportError(
+                    f"Backend '{backend_name}' is not available: {reason}"
+                )
+        loader()
+        with _LOCK:
+            _LOADED_BACKENDS.add(backend_name)
+    finally:
+        with _LOCK:
+            pending = _LOADING_BACKENDS.pop(backend_name, None)
+        if pending is not None:
+            pending.set()
 
 
 def is_kernel_backend_available(backend: str) -> tuple[bool, str | None]:
     backend_name = _normalize_backend_name(backend)
     if backend_name is None:
         return False, "Backend name is empty."
-    if backend_name == DEFAULT_KERNEL_BACKEND:
-        if importlib.util.find_spec("triton") is None:
-            return False, "Triton is not installed."
-        return True, None
 
     availability_check = _AVAILABILITY_CHECKS.get(backend_name)
     if availability_check is None:
@@ -172,28 +230,43 @@ def is_kernel_backend_available(backend: str) -> tuple[bool, str | None]:
         return False, str(exc)
 
 
-def _get_requested_backend(kernel_name: str, backend: str | None = None) -> str:
+def _get_requested_backend(
+    kernel_name: str, backend: str | None = None
+) -> tuple[str, bool]:
+    """Resolve the requested backend and whether the request was explicit.
+
+    "Explicit" means the user expressed intent through any of:
+      - the ``backend=`` kwarg
+      - ``set_kernel_backend_for_op`` / ``set_kernel_backend`` /
+        ``kernel_backend_context``
+      - ``UNSLOTH_KERNEL_BACKEND_OVERRIDES`` / ``UNSLOTH_KERNEL_BACKEND``
+
+    Only the hardcoded ``DEFAULT_KERNEL_BACKEND`` is treated as implicit.
+    Explicit requests skip the configured fallback (e.g. triton) and go
+    straight to eager when the requested backend is unavailable, so a user
+    who asks for cutile never silently runs Triton.
+    """
     explicit_backend = _normalize_backend_name(backend)
     if explicit_backend is not None:
-        return explicit_backend
+        return explicit_backend, True
 
-    runtime_override = _KERNEL_BACKEND_OVERRIDES.get(kernel_name)
+    runtime_override = _RUNTIME_KERNEL_OVERRIDES.get().get(kernel_name)
     if runtime_override is not None:
-        return runtime_override
+        return runtime_override, True
 
-    env_overrides = _parse_env_overrides(os.environ.get(OVERRIDES_ENV))
-    env_override = env_overrides.get(kernel_name)
+    env_override = _get_env_overrides().get(kernel_name)
     if env_override is not None:
-        return env_override
+        return env_override, True
 
-    if _GLOBAL_BACKEND_OVERRIDE is not None:
-        return _GLOBAL_BACKEND_OVERRIDE
+    runtime_global = _RUNTIME_GLOBAL_BACKEND.get()
+    if runtime_global is not None:
+        return runtime_global, True
 
     env_global = _normalize_backend_name(os.environ.get(GLOBAL_BACKEND_ENV))
     if env_global is not None:
-        return env_global
+        return env_global, True
 
-    return DEFAULT_KERNEL_BACKEND
+    return DEFAULT_KERNEL_BACKEND, False
 
 
 def _warn_fallback_once(kernel_name: str, requested_backend: str, fallback_backend: str):
@@ -259,8 +332,9 @@ def get_kernel_backend(
     fallback_backend: str = DEFAULT_KERNEL_BACKEND,
 ) -> str:
     kernel_name = _normalize_kernel_name(name)
-    explicit_backend = _normalize_backend_name(backend)
-    preferred_backend = _get_requested_backend(kernel_name, backend = backend)
+    preferred_backend, is_explicit = _get_requested_backend(
+        kernel_name, backend = backend,
+    )
     fallback_backend_name = _normalize_backend_name(fallback_backend) or DEFAULT_KERNEL_BACKEND
     available_backends = sorted(_REGISTRY.get(kernel_name, {}))
     available, reason = _backend_status_for_kernel(kernel_name, preferred_backend)
@@ -276,7 +350,7 @@ def get_kernel_backend(
     for candidate_backend in _candidate_backends(
         preferred_backend,
         fallback_backend_name,
-        explicit_request = explicit_backend is not None,
+        explicit_request = is_explicit,
     ):
         if candidate_backend == preferred_backend:
             continue
@@ -322,17 +396,18 @@ def dispatch_kernel(
 
 
 def set_kernel_backend(backend: str | None) -> None:
-    global _GLOBAL_BACKEND_OVERRIDE
-    _GLOBAL_BACKEND_OVERRIDE = _normalize_backend_name(backend)
+    _RUNTIME_GLOBAL_BACKEND.set(_normalize_backend_name(backend))
 
 
 def set_kernel_backend_for_op(name: str, backend: str | None) -> None:
     kernel_name = _normalize_kernel_name(name)
     normalized_backend = _normalize_backend_name(backend)
+    overrides = dict(_RUNTIME_KERNEL_OVERRIDES.get())
     if normalized_backend is None:
-        _KERNEL_BACKEND_OVERRIDES.pop(kernel_name, None)
+        overrides.pop(kernel_name, None)
     else:
-        _KERNEL_BACKEND_OVERRIDES[kernel_name] = normalized_backend
+        overrides[kernel_name] = normalized_backend
+    _RUNTIME_KERNEL_OVERRIDES.set(overrides)
 
 
 def set_kernel_backends(
@@ -348,9 +423,8 @@ def set_kernel_backends(
 
 
 def clear_kernel_backend_overrides() -> None:
-    global _GLOBAL_BACKEND_OVERRIDE
-    _GLOBAL_BACKEND_OVERRIDE = None
-    _KERNEL_BACKEND_OVERRIDES.clear()
+    _RUNTIME_GLOBAL_BACKEND.set(None)
+    _RUNTIME_KERNEL_OVERRIDES.set({})
 
 
 @contextlib.contextmanager
@@ -359,15 +433,22 @@ def kernel_backend_context(
     global_backend: str | None = None,
     overrides: dict[str, str | None] | None = None,
 ):
-    previous_global = _GLOBAL_BACKEND_OVERRIDE
-    previous_overrides = dict(_KERNEL_BACKEND_OVERRIDES)
-    set_kernel_backends(global_backend = global_backend, overrides = overrides)
+    global_token = _RUNTIME_GLOBAL_BACKEND.set(_normalize_backend_name(global_backend))
+    merged = dict(_RUNTIME_KERNEL_OVERRIDES.get())
+    if overrides:
+        for kernel_name, backend_name in overrides.items():
+            normalized_kernel = _normalize_kernel_name(kernel_name)
+            normalized_backend = _normalize_backend_name(backend_name)
+            if normalized_backend is None:
+                merged.pop(normalized_kernel, None)
+            else:
+                merged[normalized_kernel] = normalized_backend
+    overrides_token = _RUNTIME_KERNEL_OVERRIDES.set(merged)
     try:
         yield
     finally:
-        clear_kernel_backend_overrides()
-        set_kernel_backend(previous_global)
-        _KERNEL_BACKEND_OVERRIDES.update(previous_overrides)
+        _RUNTIME_KERNEL_OVERRIDES.reset(overrides_token)
+        _RUNTIME_GLOBAL_BACKEND.reset(global_token)
 
 
 def get_registered_kernel_backends(name: str | None = None) -> dict[str, list[str]] | list[str]:
@@ -381,14 +462,14 @@ def get_registered_kernel_backends(name: str | None = None) -> dict[str, list[st
 
 
 def get_kernel_backend_state() -> dict[str, Any]:
-    env_overrides = _parse_env_overrides(os.environ.get(OVERRIDES_ENV))
+    env_overrides = _get_env_overrides()
     return {
         "default_backend": DEFAULT_KERNEL_BACKEND,
         "eager_backend": EAGER_KERNEL_BACKEND,
         "env_global_backend": _normalize_backend_name(os.environ.get(GLOBAL_BACKEND_ENV)),
         "env_overrides": dict(sorted(env_overrides.items())),
-        "runtime_global_backend": _GLOBAL_BACKEND_OVERRIDE,
-        "runtime_overrides": dict(sorted(_KERNEL_BACKEND_OVERRIDES.items())),
+        "runtime_global_backend": _RUNTIME_GLOBAL_BACKEND.get(),
+        "runtime_overrides": dict(sorted(_RUNTIME_KERNEL_OVERRIDES.get().items())),
         "strict": _strict_mode_enabled(),
     }
 

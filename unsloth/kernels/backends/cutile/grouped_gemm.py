@@ -751,6 +751,7 @@ def grouped_gemm_cutile(
     is_first_gemm: bool = True,
     dX_only: bool = False,
     dW_only: bool = False,
+    **_unused,  # absorbs Triton-only kwargs (kernel_config_*, autotune)
 ) -> torch.Tensor:
     """
     CuTile grouped GEMM for MoE.

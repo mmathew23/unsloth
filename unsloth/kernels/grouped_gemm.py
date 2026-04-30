@@ -14,11 +14,7 @@
 
 import torch
 
-from ._backend_registry import (
-    get_kernel_backend,
-    get_kernel_impl,
-    register_kernel_backend,
-)
+from ._backend_registry import dispatch_kernel, register_kernel_backend
 from ._optional_triton import HAS_TRITON
 from .moe.grouped_gemm.reference.moe_ops import (
     get_routing_indices,
@@ -46,7 +42,12 @@ def _grouped_gemm_eager(
     is_first_gemm: bool = True,
     dX_only: bool = False,
     dW_only: bool = False,
+    **_unused,
 ) -> torch.Tensor:
+    """Eager grouped GEMM. Accepts and discards backend-specific kwargs
+    (``kernel_config_*``, ``autotune``) so every backend share a single
+    public signature.
+    """
     del is_first_gemm, dX_only, dW_only
 
     X = X.view(-1, X.shape[-1])
@@ -101,40 +102,23 @@ def grouped_gemm(
     *,
     backend: str | None = None,
 ) -> torch.Tensor:
-    backend_name = get_kernel_backend("unsloth.grouped_gemm", backend = backend)
-    implementation = get_kernel_impl("unsloth.grouped_gemm", backend = backend_name)
-
-    if backend_name == "triton":
-        return implementation(
-            X,
-            W,
-            m_sizes,
-            topk,
-            gather_indices,
-            permute_x,
-            permute_y,
-            topk_weights,
-            fuse_mul_post,
-            kernel_config_fwd,
-            kernel_config_bwd_dX,
-            kernel_config_bwd_dW,
-            autotune,
-            is_first_gemm,
-            dX_only,
-            dW_only,
-        )
-
-    return implementation(
+    return dispatch_kernel(
+        "unsloth.grouped_gemm",
         X,
         W,
         m_sizes,
         topk,
-        gather_indices,
-        permute_x,
-        permute_y,
-        topk_weights,
-        fuse_mul_post,
-        is_first_gemm,
-        dX_only,
-        dW_only,
+        gather_indices = gather_indices,
+        permute_x = permute_x,
+        permute_y = permute_y,
+        topk_weights = topk_weights,
+        fuse_mul_post = fuse_mul_post,
+        kernel_config_fwd = kernel_config_fwd,
+        kernel_config_bwd_dX = kernel_config_bwd_dX,
+        kernel_config_bwd_dW = kernel_config_bwd_dW,
+        autotune = autotune,
+        is_first_gemm = is_first_gemm,
+        dX_only = dX_only,
+        dW_only = dW_only,
+        backend = backend,
     )

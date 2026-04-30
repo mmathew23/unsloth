@@ -41,7 +41,7 @@ try:
     import triton.language as tl  # type: ignore[import-not-found]
 
     HAS_TRITON = True
-except ModuleNotFoundError:
+except Exception:
     HAS_TRITON = False
 
     class _TLMath:

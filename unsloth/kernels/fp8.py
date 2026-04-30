@@ -207,6 +207,28 @@ def act_quant(
 _triton_act_quant = act_quant
 
 
+def _act_quant_eager(
+    x: torch.Tensor, block_size: int = 128
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not x.is_contiguous():
+        x = x.contiguous()
+    assert x.shape[-1] % block_size == 0
+    num_blocks = x.shape[-1] // block_size
+    x_blocks = x.to(torch.float32).reshape(*x.shape[:-1], num_blocks, block_size)
+    abs_max = x_blocks.abs().amax(dim = -1)
+    scale = abs_max / 448.0
+    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    y = (x_blocks / scale.unsqueeze(-1)).reshape_as(x).to(torch.float8_e4m3fn)
+    return y, scale.contiguous()
+
+
+register_kernel_backend(
+    "unsloth.act_quant",
+    "eager",
+    _act_quant_eager,
+)
+
+
 def act_quant(
     x: torch.Tensor,
     block_size: int = 128,
@@ -389,6 +411,47 @@ def torchao_block_matmul(
         block_size = block_size[1],
     )
     return out.to(output_dtype)
+
+
+def _w8a8_block_fp8_matmul_eager(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    block_size,
+    output_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    if block_size is None:
+        block_n, block_k = 128, 128
+    else:
+        block_n, block_k = block_size[0], block_size[1]
+
+    N, K = B.shape
+    M = A.numel() // A.shape[-1]
+
+    A_f = A.reshape(M, K).to(torch.float32)
+    B_f = B.to(torch.float32)
+
+    # As: (..., ceil(K/block_k)) -> (M, ceil(K/block_k))
+    As_f = As.reshape(M, -1).to(torch.float32)
+    A_scale = As_f.repeat_interleave(block_k, dim = -1)[..., :K]
+    A_scaled = A_f * A_scale
+
+    # Bs: (ceil(N/block_n), ceil(K/block_k))
+    Bs_f = Bs.to(torch.float32)
+    B_scale = Bs_f.repeat_interleave(block_n, dim = 0)[:N, :]
+    B_scale = B_scale.repeat_interleave(block_k, dim = 1)[:, :K]
+    B_scaled = B_f * B_scale
+
+    out = A_scaled @ B_scaled.t()
+    return out.reshape(A.shape[:-1] + (N,)).to(output_dtype)
+
+
+register_kernel_backend(
+    "unsloth.w8a8_block_fp8_matmul",
+    "eager",
+    _w8a8_block_fp8_matmul_eager,
+)
 
 
 # Note that older versions of fbgemm (<=1.3.0) cause numerical imprecisions resulting in NaNs especially when X has high values in it.
@@ -784,15 +847,21 @@ def fp8_linear(X, weight, weight_scale, bias = None, *, backend = None):
     return out
 
 
-def module_forward_patch(forward_function, scale_attr = "weight_scale"):
+def module_forward_patch(scale_attr = "weight_scale"):
     def patched_forward(self, X):
-        return forward_function(X, self.weight, getattr(self, scale_attr))
+        return fp8_linear(
+            X,
+            self.weight,
+            getattr(self, scale_attr),
+            getattr(self, "bias", None),
+        )
 
     return patched_forward
 
 
-# Patch the forward functions of the layers (for compiled models)
+# Patch the forward functions of the layers (for compiled models). Route through
+# fp8_linear() so the runtime backend selection (and bias) are both honored.
 if FbgemmFp8Linear is not None:
-    FbgemmFp8Linear.forward = module_forward_patch(fbgemm_fp8_linear, "weight_scale")
+    FbgemmFp8Linear.forward = module_forward_patch("weight_scale")
 if FP8Linear is not None:
-    FP8Linear.forward = module_forward_patch(fp8_block_quant_linear, "weight_scale_inv")
+    FP8Linear.forward = module_forward_patch("weight_scale_inv")

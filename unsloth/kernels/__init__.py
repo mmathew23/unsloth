@@ -24,11 +24,15 @@ from ._backend_registry import (
     is_kernel_backend_available,
     kernel_backend_context,
     register_kernel_backend,
-    register_impl,
     set_kernel_backend,
     set_kernel_backend_for_op,
     set_kernel_backends,
 )
+# NOTE: the generic ``register_impl`` decorator is intentionally NOT
+# re-exported. Backend packages should register through their own
+# ``backends/<name>/_adapter.py`` so the backend identity is enforced.
+# External code that needs to register implementations should call
+# ``register_kernel_backend(op, backend, fn)`` directly.
 from .cross_entropy_loss import (
     fast_cross_entropy_loss,
     post_patch_loss_function,
@@ -43,7 +47,7 @@ from .layernorm import (
     fast_layernorm,
     patch_layernorm,
 )
-from .rope_embedding import fast_rope_embedding, inplace_rope_embedding
+from .rope_embedding import fast_rope_embedding, inplace_rope_embedding, rope_embedding
 from .swiglu import swiglu_fg_kernel, swiglu_DWf_DW_dfg_kernel
 from .geglu import (
     geglu_exact_forward_kernel,

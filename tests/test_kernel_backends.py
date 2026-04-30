@@ -119,12 +119,18 @@ class KernelBackendTests(unittest.TestCase):
         self.assertEqual(backend, "eager")
         backend_registry._AVAILABILITY_CHECKS.pop("missing", None)
 
-    def test_implicit_backend_request_can_use_configured_fallback_backend(self):
+    def test_implicit_default_uses_configured_fallback_backend(self):
+        # When no kwarg / env / runtime override is set, the resolution is
+        # implicit: it starts from DEFAULT_KERNEL_BACKEND ("triton") and walks
+        # through the configured fallback before landing on eager. Anything
+        # the user expresses (kwarg, env var, set_kernel_backend, override)
+        # is treated as explicit and skips the configured fallback.
         kernel_name = "unsloth.synthetic_implicit_request"
-        backend_registry._AVAILABILITY_CHECKS["missing"] = lambda: (False, "blocked")
         register_kernel_backend(kernel_name, "dummy_default", lambda x: x + 10)
         register_kernel_backend(kernel_name, "eager", lambda x: x + 1)
-        set_kernel_backend("missing")
+        # No registration under DEFAULT_KERNEL_BACKEND ("triton"): chain is
+        # [triton, dummy_default, eager] -> triton step is skipped (no impl)
+        # -> resolves to dummy_default.
 
         backend = get_kernel_backend(
             kernel_name,
@@ -132,7 +138,26 @@ class KernelBackendTests(unittest.TestCase):
         )
 
         self.assertEqual(backend, "dummy_default")
-        backend_registry._AVAILABILITY_CHECKS.pop("missing", None)
+
+    def test_set_kernel_backend_request_is_explicit(self):
+        # set_kernel_backend / env var should match the explicit kwarg path:
+        # if the requested backend is unavailable, the chain skips the
+        # configured fallback and goes straight to eager. This prevents a
+        # user who said "cutile" from silently running on triton.
+        kernel_name = "unsloth.synthetic_runtime_explicit"
+        backend_registry._AVAILABILITY_CHECKS["missing"] = lambda: (False, "blocked")
+        register_kernel_backend(kernel_name, "dummy_default", lambda x: x + 10)
+        register_kernel_backend(kernel_name, "eager", lambda x: x + 1)
+        set_kernel_backend("missing")
+        try:
+            backend = get_kernel_backend(
+                kernel_name,
+                fallback_backend = "dummy_default",
+            )
+            self.assertEqual(backend, "eager")
+        finally:
+            set_kernel_backend(None)
+            backend_registry._AVAILABILITY_CHECKS.pop("missing", None)
 
     def test_describe_kernel_backends_reports_capabilities(self):
         description = describe_kernel_backends()
@@ -232,7 +257,7 @@ class KernelBackendTests(unittest.TestCase):
                 get_registered_kernel_backends("unsloth.grouped_gemm"),
             )
 
-    def test_grouped_gemm_non_triton_backends_ignore_triton_only_kwargs(self):
+    def test_grouped_gemm_dispatch_passes_unified_kwargs(self):
         captured = {}
 
         def _dummy_grouped_gemm(*args, **kwargs):
@@ -261,9 +286,41 @@ class KernelBackendTests(unittest.TestCase):
             backend = "dummy",
         )
 
+        # Single dispatch -> backend receives X, W, m_sizes, topk positionally
+        # and the rest as kwargs. Triton-only kwargs are present but expected
+        # to be absorbed by each backend (eager/cutile use **_unused).
         self.assertEqual(tuple(out.shape), (6, 6))
-        self.assertEqual(captured["num_args"], 12)
-        self.assertEqual(captured["kwargs"], {})
+        self.assertEqual(captured["num_args"], 4)
+        for key in (
+            "gather_indices",
+            "permute_x",
+            "kernel_config_fwd",
+            "kernel_config_bwd_dX",
+            "kernel_config_bwd_dW",
+            "autotune",
+        ):
+            self.assertIn(key, captured["kwargs"])
+        self.assertEqual(captured["kwargs"]["kernel_config_fwd"], "fwd_config")
+        self.assertTrue(captured["kwargs"]["autotune"])
+
+    def test_grouped_gemm_eager_absorbs_triton_only_kwargs(self):
+        # Confirms the registered eager impl tolerates kernel_config_* / autotune
+        # without raising (uses **_unused).
+        X = torch.randn(6, 4)
+        W = torch.randn(2, 4, 4)
+        m_sizes = torch.tensor([3, 3], dtype = torch.int32)
+        out = grouped_gemm(
+            X,
+            W,
+            m_sizes,
+            topk = 1,
+            kernel_config_fwd = "ignored",
+            kernel_config_bwd_dX = "ignored",
+            kernel_config_bwd_dW = "ignored",
+            autotune = True,
+            backend = "eager",
+        )
+        self.assertEqual(out.shape[-1], W.shape[-2])
 
     def test_requested_backend_runtime_failure_is_surfaced(self):
         kernel_name = "unsloth.synthetic_runtime_failure"

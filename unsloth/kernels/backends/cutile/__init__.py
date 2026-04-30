@@ -12,6 +12,11 @@ from types import ModuleType
 def _install_tile_experimental_compat() -> None:
     if importlib.util.find_spec("cuda.tile_experimental") is not None:
         return
+    # If neither tile nor tile_experimental is installed, leave the shim
+    # uninstalled. The submodule imports below will surface a clearer
+    # ImportError pointing at the real missing dependency.
+    if importlib.util.find_spec("cuda.tile") is None:
+        return
 
     import cuda.tile as ct
 

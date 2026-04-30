@@ -295,7 +295,10 @@ _triton_geglu_exact_forward_kernel = geglu_exact_forward_kernel
 
 
 def _geglu_exact_forward_eager(gate, up):
-    return F.gelu(gate, approximate = "none") * up
+    # Mirror Triton: gelu(gate) in fp32, downcast to input dtype, then
+    # multiply by up at input dtype.
+    f = F.gelu(gate.float(), approximate = "none").to(up.dtype)
+    return f * up
 
 
 register_kernel_backend(
@@ -318,14 +321,18 @@ _triton_geglu_exact_backward_kernel = geglu_exact_backward_kernel
 
 
 def _geglu_exact_backward_eager(DW, e, g):
-    e_float = e.float()
-    f = F.gelu(e_float, approximate = "none").to(dtype = DW.dtype)
+    # Mirror Triton: f computed in fp32 then downcast; h/df/dg in input dtype;
+    # de uses dg.float() for the chain rule, downcast at end.
+    out_dtype = DW.dtype
+    e_f = e.float()
+    f_partial = 0.5 * (torch.erf(0.7071067811865476 * e_f) + 1.0)
+    f = (f_partial * e_f).to(out_dtype)
     h = f * g
     df = DW * f
-    f_partial = 0.5 * (torch.erf(0.7071067811865476 * e_float) + 1.0)
-    df_de = f_partial + 0.3989422804014327 * e_float * torch.exp(-0.5 * e_float.square())
-    de = (DW * g).float() * df_de
-    return h, df, de.to(dtype = DW.dtype)
+    dg = DW * g
+    df_de = f_partial + 0.3989422804014327 * e_f * torch.exp(-0.5 * e_f.square())
+    de = (dg.float() * df_de).to(out_dtype)
+    return h, df, de
 
 
 register_kernel_backend(
@@ -349,7 +356,10 @@ _triton_geglu_approx_forward_kernel = geglu_approx_forward_kernel
 
 
 def _geglu_approx_forward_eager(gate, up):
-    return F.gelu(gate, approximate = "tanh") * up
+    # Mirror Triton: tanh-gelu in fp32, downcast to input dtype, multiply
+    # by up at input dtype.
+    f = F.gelu(gate.float(), approximate = "tanh").to(up.dtype)
+    return f * up
 
 
 register_kernel_backend(
@@ -372,19 +382,23 @@ _triton_geglu_approx_backward_kernel = geglu_approx_backward_kernel
 
 
 def _geglu_approx_backward_eager(DW, e, g):
-    e_float = e.float()
+    # Mirror Triton: tanh-gelu in fp32, downcast f to input dtype, products
+    # in input dtype, de uses dg.float() for the chain rule.
+    out_dtype = DW.dtype
+    e_f = e.float()
     s = 0.7978845608028654
-    a = s * e_float
-    b = a * 0.044715 * e_float.square()
+    a = s * e_f
+    b = a * 0.044715 * e_f.square()
     T = 1.0 + torch.tanh(a + b)
     T2 = 0.5 * T
     Q2 = -T2 * (T - 2.0) * (a + 3.0 * b)
     df_de = T2 + Q2
-    f = (T2 * e_float).to(dtype = DW.dtype)
+    f = (T2 * e_f).to(out_dtype)
     h = f * g
     df = DW * f
-    de = (DW * g).float() * df_de
-    return h, df, de.to(dtype = DW.dtype)
+    dg = DW * g
+    de = (dg.float() * df_de).to(out_dtype)
+    return h, df, de
 
 
 register_kernel_backend(

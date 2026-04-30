@@ -42,7 +42,21 @@ class CutilePackagingTests(unittest.TestCase):
         self.assertIn("cutile", optional)
         cutile_deps = optional["cutile"]
         self.assertTrue(any(dep.startswith("cuda-tile") for dep in cutile_deps))
-        self.assertTrue(any(dep.startswith("cut_cross_entropy") for dep in cutile_deps))
+
+        def _has_cce(dep_list):
+            return any(dep.startswith("cut_cross_entropy") for dep in dep_list)
+
+        cce_directly_in_cutile = _has_cce(cutile_deps)
+        pulls_core = any(
+            dep == "unsloth_zoo[core]" or dep.startswith("unsloth_zoo[core,")
+            for dep in cutile_deps
+        )
+        cce_via_core = pulls_core and _has_cce(optional.get("core", []))
+        cce_via_base = _has_cce(_load_dependencies(UNSLOTH_ZOO_PYPROJECT))
+        self.assertTrue(
+            cce_directly_in_cutile or cce_via_core or cce_via_base,
+            "cut_cross_entropy must be reachable from the [cutile] install path",
+        )
 
     def test_unsloth_zoo_huggingface_extra_keeps_triton_path(self):
         optional = _load_optional_dependencies(UNSLOTH_ZOO_PYPROJECT)

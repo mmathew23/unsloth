@@ -438,6 +438,28 @@ class KernelBackendTests(unittest.TestCase):
 
         self.assertEqual(captured["backend"], "triton")
 
+    def test_fp8_block_path_cutile_uses_fp8_block_quant_linear(self):
+        # Regression: cutile must route through fp8_block_quant_linear
+        # (which is FBGEMM when probed OK, else registry-dispatched torch impl)
+        # so a CuTile selection still benefits from FBGEMM when installed.
+        X = torch.randn(2, 4)
+        weight = torch.randn(4, 4)
+        weight_scale = torch.ones(1, 1)
+        captured = {}
+
+        def _fake_block(X, weight, weight_scale, *, backend = None):
+            captured["backend"] = backend
+            return torch.zeros(X.shape[:-1] + (weight.shape[0],), dtype = X.dtype)
+
+        with patch.object(fp8_module, "get_kernel_backend", return_value = "cutile"):
+            with patch.object(fp8_module, "fp8_block_quant_linear", side_effect = _fake_block) as block_impl:
+                with patch.object(fp8_module, "fp8_torch_block_quant_forward") as torch_block_impl:
+                    fp8_module.fp8_linear(X, weight, weight_scale, backend = "cutile")
+
+        block_impl.assert_called_once()
+        torch_block_impl.assert_not_called()
+        self.assertEqual(captured["backend"], "cutile")
+
     def test_fp8_eager_fallback_uses_eager_linear(self):
         X = torch.randn(2, 4)
         weight = torch.randn(4, 4)

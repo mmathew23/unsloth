@@ -1,6 +1,7 @@
 """Built-in Triton kernel backend registrations."""
 
 from ._adapter import register_impl
+from ..._optional_triton import HAS_TRITON
 from ...cross_entropy_loss import _triton_fast_cross_entropy_loss
 from ...fp8 import (
     _triton_act_quant,
@@ -59,8 +60,15 @@ _REGISTRATIONS = {
     "unsloth.weight_dequant":        _triton_weight_dequant_block,
 }
 
-for _op_name, _impl in _REGISTRATIONS.items():
-    register_impl(_op_name)(_impl)
+# Only register the Triton implementations if Triton is actually importable.
+# Without this guard, an unconditional `import unsloth.kernels.backends.triton`
+# on a CuTile-only install would populate the registry with wrappers that
+# crash at launch time inside _KernelStub.__getitem__ -- the dispatch chain
+# would prefer 'triton' over the eager fallback and surface a confusing
+# RuntimeError instead of cleanly degrading.
+if HAS_TRITON:
+    for _op_name, _impl in _REGISTRATIONS.items():
+        register_impl(_op_name)(_impl)
 
 
 def load_backend() -> None:

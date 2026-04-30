@@ -16,6 +16,7 @@ import logging
 
 from .loader import FastModel, DISABLE_SDPA_MODEL_NAMES
 from ._utils import SUPPORTS_BFLOAT16
+from unsloth_zoo.temporary_patches.common import torch_compile
 import inspect
 import json
 import os
@@ -1295,7 +1296,7 @@ class FastSentenceTransformer(FastModel):
         """
         if hasattr(model, "__getitem__"):
             inner_model = model[0].auto_model
-            compiled = torch.compile(inner_model, mode = mode)
+            compiled = torch_compile(inner_model, mode = mode)
             model[0].auto_model = compiled
             # Fix for accelerate unwrap_model bug:
             # When SentenceTransformer contains a compiled inner model,
@@ -1304,7 +1305,7 @@ class FastSentenceTransformer(FastModel):
             # This workaround sets _orig_mod to satisfy accelerate.
             model.__dict__["_orig_mod"] = model
         else:
-            model = torch.compile(model, mode = mode)
+            model = torch_compile(model, mode = mode)
         return model
 
     @staticmethod

@@ -187,6 +187,10 @@ def resolve_hip_gpu_stats_name(gpu_stats):
 from unsloth_zoo.temporary_patches import (
     TEMPORARY_PATCHES,
 )
+from unsloth_zoo.temporary_patches.common import (
+    torch_compile,
+    UNSLOTH_COMPILE_BACKEND,
+)
 
 
 def apply_unsloth_gradient_checkpointing(
@@ -1228,12 +1232,16 @@ import accelerate
 
 
 def torch_compile_kwargs(*args, **kwargs):
+    # Patch replaces TorchDynamoPlugin.to_kwargs so accelerate uses our backend/options.
     print("Unsloth: Enabled auto compiling")
-    return {
+    result = {
         "dynamic": True,
         "fullgraph": False,
-        "options": torch_compile_options,
+        "backend": UNSLOTH_COMPILE_BACKEND,
     }
+    if UNSLOTH_COMPILE_BACKEND == "inductor":
+        result["options"] = torch_compile_options
+    return result
 
 
 accelerate.utils.dataclasses.TorchDynamoPlugin.to_kwargs = torch_compile_kwargs
@@ -1258,10 +1266,9 @@ def patch_regional_compilation():
             args = [
                 old_module_list(
                     [
-                        torch.compile(
+                        torch_compile(
                             x,
                             dynamic = True,
-                            options = torch_compile_options,
                             fullgraph = False,
                         )
                         for x in args[0]

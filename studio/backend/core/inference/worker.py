@@ -685,10 +685,10 @@ def run_inference_process(
 
             logger.info("Triton available — torch.compile enabled")
         except ImportError:
-            os.environ["TORCHDYNAMO_DISABLE"] = "1"
+            os.environ.setdefault("UNSLOTH_TORCH_COMPILE_BACKEND", "aot_eager")
             logger.warning(
-                "Triton not found on Windows — torch.compile disabled. "
-                'Install for better performance: pip install "triton-windows<3.7"'
+                "Triton not found on Windows — falling back to torch.compile aot_eager backend. "
+                'For best performance install Triton: pip install "triton-windows<3.7"'
             )
 
     # ── 2. Import ML libraries (fresh in this clean process) ──

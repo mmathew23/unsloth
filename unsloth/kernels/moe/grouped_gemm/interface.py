@@ -527,10 +527,23 @@ def grouped_gemm_dX(
     ), f"M_total ({M_total}) must be divisible by topk ({topk})"
     num_tokens = M_total // topk
 
-    total_tokens = gather_indices.shape[0]
-    assert (
-        total_tokens == M_total
-    ), f"Total tokens ({total_tokens}) must match M_total ({M_total})"
+    if permute_x or permute_y:
+        assert gather_indices is not None, (
+            "gather_indices must be provided when permute_x or permute_y is True"
+        )
+        total_tokens = gather_indices.shape[0]
+        assert (
+            total_tokens == M_total
+        ), f"Total tokens ({total_tokens}) must match M_total ({M_total})"
+    else:
+        # No permutation requested -- gather_indices is unused by the kernel
+        # (PERMUTE_X / PERMUTE_Y constexpr branches), but the kernel signature
+        # still expects a valid pointer, so synthesize a dummy buffer.
+        total_tokens = M_total
+        if gather_indices is None:
+            gather_indices = torch.empty(
+                M_total, device = dY.device, dtype = torch.int32
+            )
 
     # Note that the output shape is [NUM_TOKENS * TOPK, K] even when `permute_x` is True since we need to accumulate gradients across all experts chosen by the token.
     # This will be done in a post-processing step reduction step.

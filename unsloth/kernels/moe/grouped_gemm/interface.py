@@ -699,8 +699,16 @@ def grouped_gemm_dW(
         else:
             assert X.shape[0] == total_tokens
     else:
+        # No permutation requested -- gather_indices is unused by the kernel
+        # (PERMUTE_X / PERMUTE_Y constexpr branches are elided), but the
+        # kernel signature still expects a valid pointer, so synthesize a
+        # dummy buffer. Mirror of the grouped_gemm_dX guard.
         total_tokens = X.shape[0]
         num_tokens = total_tokens // topk
+        if gather_indices is None:
+            gather_indices = torch.empty(
+                total_tokens, device = X.device, dtype = torch.int32
+            )
 
     num_experts = m_sizes.shape[0]
     # Get dimensions

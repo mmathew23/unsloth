@@ -21,7 +21,10 @@ _REGISTRY: dict[str, dict[str, KernelImplementation]] = {}
 _BUILTIN_LOADERS: dict[str, BackendLoader] = {}
 _BACKEND_PACKAGES: dict[str, str] = {}
 _AVAILABILITY_CHECKS: dict[str, AvailabilityCheck] = {}
-_LOADED_BACKENDS: set[str] = set()
+# One entry per backend whose loader has been attempted.
+# Value is None on success, the raised exception on failure (cached so we
+# don't retry a broken loader on every dispatch).
+_BACKEND_LOAD_RESULT: dict[str, BaseException | None] = {}
 _LOADING_BACKENDS: dict[str, threading.Event] = {}
 _RUNTIME_GLOBAL_BACKEND: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "unsloth_kernel_backend_global",
@@ -174,11 +177,14 @@ def ensure_backend_loaded(backend: str) -> None:
         return
 
     with _LOCK:
-        if backend_name in _LOADED_BACKENDS:
+        if backend_name in _BACKEND_LOAD_RESULT:
+            cached = _BACKEND_LOAD_RESULT[backend_name]
+            if cached is not None:
+                raise cached
             return
         loader = _BUILTIN_LOADERS.get(backend_name)
         if loader is None:
-            _LOADED_BACKENDS.add(backend_name)
+            _BACKEND_LOAD_RESULT[backend_name] = None
             return
         availability_check = _AVAILABILITY_CHECKS.get(backend_name)
         event = _LOADING_BACKENDS.get(backend_name)
@@ -191,8 +197,13 @@ def ensure_backend_loaded(backend: str) -> None:
 
     if not should_load:
         event.wait()
+        with _LOCK:
+            cached = _BACKEND_LOAD_RESULT.get(backend_name)
+        if cached is not None:
+            raise cached
         return
 
+    exc_to_cache: BaseException | None = None
     try:
         # Surface unavailability with a clear error before triggering the
         # backend package's import-time setup (which can crash on missing
@@ -207,13 +218,31 @@ def ensure_backend_loaded(backend: str) -> None:
                     f"Backend '{backend_name}' is not available: {reason}"
                 )
         loader()
-        with _LOCK:
-            _LOADED_BACKENDS.add(backend_name)
+    except BaseException as exc:
+        exc_to_cache = exc
+        raise
     finally:
         with _LOCK:
+            _BACKEND_LOAD_RESULT[backend_name] = exc_to_cache
             pending = _LOADING_BACKENDS.pop(backend_name, None)
         if pending is not None:
             pending.set()
+
+
+def clear_backend_load_cache(backend: str | None = None) -> None:
+    """Clear cached backend load results so the next dispatch retries the loader.
+
+    Pass a backend name to clear only that backend, or omit to clear all.
+    Useful in tests, and for users who fix a broken install mid-process.
+    Does not interrupt an in-flight load.
+    """
+    with _LOCK:
+        if backend is None:
+            _BACKEND_LOAD_RESULT.clear()
+            return
+        backend_name = _normalize_backend_name(backend)
+        if backend_name is not None:
+            _BACKEND_LOAD_RESULT.pop(backend_name, None)
 
 
 def is_kernel_backend_available(backend: str) -> tuple[bool, str | None]:
@@ -291,11 +320,32 @@ def _candidate_backends(
     *,
     explicit_request: bool,
 ) -> list[str]:
-    candidates: list[str] = []
+    """Return the ordered list of backends to try for a dispatch.
+
+    For an *explicit* request (``backend=`` kwarg, env vars, runtime setters)
+    the chain is intentionally short: ``[requested, eager]``. A user who asked
+    for cutile must never silently end up running triton.
+
+    For an *implicit* request (no user signal — only the hardcoded
+    ``DEFAULT_KERNEL_BACKEND``) the chain walks every other registered
+    builtin backend in registration order before falling to eager. This keeps
+    ``pip install unsloth[cutile]`` working out of the box: triton is
+    unavailable, the chain falls through to cutile (next registered builtin)
+    rather than silently dropping to eager. Triton-installed users see no
+    change because triton is the first candidate and succeeds.
+    """
     ordered_backends = [preferred_backend]
     if not explicit_request:
         ordered_backends.append(fallback_backend)
+        # Snapshot keys under the lock to avoid racing a concurrent
+        # register_builtin_backend_loader call. Reads of _BUILTIN_LOADERS
+        # elsewhere also rely on stable ordering established at registration.
+        with _LOCK:
+            registered_builtins = tuple(_BUILTIN_LOADERS)
+        ordered_backends.extend(registered_builtins)
     ordered_backends.append(EAGER_KERNEL_BACKEND)
+
+    candidates: list[str] = []
     for backend_name in ordered_backends:
         normalized = _normalize_backend_name(backend_name)
         if normalized is None or normalized in candidates:
@@ -396,10 +446,28 @@ def dispatch_kernel(
 
 
 def set_kernel_backend(backend: str | None) -> None:
+    """Set the runtime global kernel backend. Setter only — returns ``None``.
+
+    This is NOT a context manager. ``with set_kernel_backend("cutile"):`` will
+    raise ``TypeError`` because ``None`` is not a context manager. For a
+    scoped override that auto-restores on exit, use
+    :func:`kernel_backend_context` instead::
+
+        with kernel_backend_context(global_backend="cutile"):
+            ...
+    """
     _RUNTIME_GLOBAL_BACKEND.set(_normalize_backend_name(backend))
 
 
 def set_kernel_backend_for_op(name: str, backend: str | None) -> None:
+    """Set the runtime backend for a single kernel. Setter only — returns ``None``.
+
+    This is NOT a context manager. For a scoped per-op override use
+    :func:`kernel_backend_context` with ``overrides={...}`` instead::
+
+        with kernel_backend_context(overrides={"rope_embedding": "cutile"}):
+            ...
+    """
     kernel_name = _normalize_kernel_name(name)
     normalized_backend = _normalize_backend_name(backend)
     overrides = dict(_RUNTIME_KERNEL_OVERRIDES.get())
@@ -415,6 +483,16 @@ def set_kernel_backends(
     global_backend: str | None = None,
     overrides: dict[str, str | None] | None = None,
 ) -> None:
+    """Set the global backend and/or per-kernel overrides. Setter only — returns ``None``.
+
+    This is NOT a context manager. For scoped, auto-restored configuration use
+    :func:`kernel_backend_context`, which takes the same ``global_backend`` and
+    ``overrides`` keyword arguments::
+
+        with kernel_backend_context(global_backend="cutile",
+                                    overrides={"rope_embedding": "triton"}):
+            ...
+    """
     set_kernel_backend(global_backend)
     if overrides is None:
         return
@@ -423,17 +501,57 @@ def set_kernel_backends(
 
 
 def clear_kernel_backend_overrides() -> None:
+    """Clear the runtime global backend and all per-kernel overrides.
+
+    Setter only — returns ``None``. Resets the runtime contextvars to their
+    default empty state. Environment-variable backends
+    (``UNSLOTH_KERNEL_BACKEND``, ``UNSLOTH_KERNEL_BACKEND_OVERRIDES``) are not
+    affected.
+    """
     _RUNTIME_GLOBAL_BACKEND.set(None)
     _RUNTIME_KERNEL_OVERRIDES.set({})
+
+
+_UNSET: Any = object()
 
 
 @contextlib.contextmanager
 def kernel_backend_context(
     *,
-    global_backend: str | None = None,
+    global_backend: str | None = _UNSET,
     overrides: dict[str, str | None] | None = None,
 ):
-    global_token = _RUNTIME_GLOBAL_BACKEND.set(_normalize_backend_name(global_backend))
+    """Scoped kernel-backend override; restores the previous state on exit.
+
+    Use this instead of :func:`set_kernel_backend` /
+    :func:`set_kernel_backend_for_op` / :func:`set_kernel_backends` when you
+    want the override to last only for a block of code. Example::
+
+        with kernel_backend_context(global_backend="cutile",
+                                    overrides={"rope_embedding": "triton"}):
+            run_step()
+        # Outside the block the previous backend state is restored.
+
+    Semantics for ``global_backend``:
+
+    * Omitted (default sentinel) → **preserve** the outer global backend.
+      An outer ``set_kernel_backend("cutile")`` keeps applying inside the
+      scope.
+    * ``None`` → **explicitly clear** the outer global backend within the
+      scope (matches :func:`set_kernel_backend(None)`).
+    * Any string → set the global backend to that value within the scope.
+
+    Semantics for ``overrides``:
+
+    * Omitted / ``None`` → preserve the outer per-kernel overrides.
+    * Dict → merge with the outer overrides for the duration of the block.
+      Passing ``None`` for a given kernel name clears that single override
+      inside the scope.
+    """
+    if global_backend is _UNSET:
+        global_token = None
+    else:
+        global_token = _RUNTIME_GLOBAL_BACKEND.set(_normalize_backend_name(global_backend))
     merged = dict(_RUNTIME_KERNEL_OVERRIDES.get())
     if overrides:
         for kernel_name, backend_name in overrides.items():
@@ -448,7 +566,8 @@ def kernel_backend_context(
         yield
     finally:
         _RUNTIME_KERNEL_OVERRIDES.reset(overrides_token)
-        _RUNTIME_GLOBAL_BACKEND.reset(global_token)
+        if global_token is not None:
+            _RUNTIME_GLOBAL_BACKEND.reset(global_token)
 
 
 def get_registered_kernel_backends(name: str | None = None) -> dict[str, list[str]] | list[str]:
@@ -497,7 +616,8 @@ def describe_kernel_backends() -> dict[str, Any]:
         backends[backend_name] = {
             "available": available,
             "reason": reason,
-            "loaded": backend_name in _LOADED_BACKENDS,
+            "loaded": _BACKEND_LOAD_RESULT.get(backend_name) is None
+                       and backend_name in _BACKEND_LOAD_RESULT,
             "package": _BACKEND_PACKAGES.get(backend_name),
             "registered_op_count": len(registered_ops),
             "registered_ops": registered_ops,
@@ -525,8 +645,15 @@ def _check_cutile_backend() -> tuple[bool, str | None]:
 
 
 def _check_triton_backend() -> tuple[bool, str | None]:
-    if importlib.util.find_spec("triton") is None:
-        return False, "Triton is not installed."
+    # find_spec is not enough: a partial install (ABI mismatch, missing .so)
+    # leaves the spec in place but raises on import. Mirror _check_cutile_backend
+    # and actually attempt the import so describe_kernel_backends() doesn't
+    # report a broken triton as available. After first call, sys.modules
+    # caches the result so subsequent dispatches are a dict hit.
+    try:
+        importlib.import_module("triton")
+    except Exception as exc:
+        return False, f"Triton import failed: {exc}"
     return True, None
 
 

@@ -14,6 +14,7 @@
 
 from ._backend_registry import (
     EAGER_KERNEL_BACKEND,
+    clear_backend_load_cache,
     clear_kernel_backend_overrides,
     describe_kernel_backends,
     ensure_backend_loaded,

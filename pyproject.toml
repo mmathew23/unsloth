@@ -95,6 +95,10 @@ huggingface = [
 cutile = [
     "unsloth[huggingfacenotorch]",
     "unsloth_zoo[cutile]>=2026.4.3",
+    # Mirror zoo's cuda-tile pin directly so the unsloth[cutile] contract is
+    # self-documenting and isn't silently weakened by a stale installed
+    # unsloth-zoo whose [cutile] metadata predates the cuda-tile entry.
+    "cuda-tile[tileiras]>=1.3.0,<2.0 ; ('linux' in sys_platform)",
     "torchvision",
 ]
 windows = [

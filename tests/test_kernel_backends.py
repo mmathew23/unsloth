@@ -1,3 +1,4 @@
+import importlib
 import os
 import subprocess
 import sys
@@ -92,6 +93,212 @@ class KernelBackendTests(unittest.TestCase):
         self.assertEqual(captured["bias_shape"], (4,))
         self.assertEqual(captured["eps"], layernorm.eps)
         self.assertTrue(torch.equal(out, X + layernorm.weight + layernorm.bias))
+
+    def test_implicit_request_walks_registered_builtins_before_eager(self):
+        """A user with a cutile-only install (or any install where the default
+        backend is unavailable but another registered builtin IS available)
+        must get the registered builtin, not fall straight to eager.
+        """
+        from unsloth.kernels import _backend_registry as br
+
+        kernel_name = "unsloth.synthetic_implicit_walk"
+        # No "triton" / "cutile" entries for this kernel so the test is
+        # decoupled from real backend installs. Use synthetic names that
+        # mirror the production order: a "primary" that is unavailable, a
+        # "secondary" that is available.
+        br._BUILTIN_LOADERS["synthetic_primary"] = lambda: None
+        br._AVAILABILITY_CHECKS["synthetic_primary"] = lambda: (False, "blocked")
+        br._BUILTIN_LOADERS["synthetic_secondary"] = lambda: None
+        br._AVAILABILITY_CHECKS["synthetic_secondary"] = lambda: (True, None)
+        register_kernel_backend(kernel_name, "synthetic_secondary", lambda x: x + 1)
+        register_kernel_backend(kernel_name, "eager", lambda x: x - 1)
+        try:
+            with patch.object(br, "DEFAULT_KERNEL_BACKEND", "synthetic_primary"):
+                backend = get_kernel_backend(kernel_name)
+            self.assertEqual(
+                backend, "synthetic_secondary",
+                "Implicit request must walk registered builtins before eager; "
+                "got eager instead, meaning cutile-only installs would silently "
+                "lose performance.",
+            )
+        finally:
+            br._BUILTIN_LOADERS.pop("synthetic_primary", None)
+            br._BUILTIN_LOADERS.pop("synthetic_secondary", None)
+            br._AVAILABILITY_CHECKS.pop("synthetic_primary", None)
+            br._AVAILABILITY_CHECKS.pop("synthetic_secondary", None)
+            br._REGISTRY.pop(kernel_name, None)
+
+    def test_explicit_request_does_not_walk_other_registered_builtins(self):
+        """An explicit ``backend=`` request must NOT silently fall through to
+        any other registered builtin. The chain is [requested, eager] only —
+        a user who asks for X never silently runs Y."""
+        from unsloth.kernels import _backend_registry as br
+
+        kernel_name = "unsloth.synthetic_explicit_walk"
+        br._BUILTIN_LOADERS["synthetic_decoy"] = lambda: None
+        br._AVAILABILITY_CHECKS["synthetic_decoy"] = lambda: (True, None)
+        register_kernel_backend(kernel_name, "synthetic_decoy", lambda x: x + 100)
+        register_kernel_backend(kernel_name, "eager", lambda x: x - 1)
+        try:
+            backend = get_kernel_backend(kernel_name, backend = "missing_backend")
+            self.assertEqual(
+                backend, "eager",
+                "Explicit unknown backend leaked into a non-eager fallback; "
+                "explicit requests must only fall to eager.",
+            )
+        finally:
+            br._BUILTIN_LOADERS.pop("synthetic_decoy", None)
+            br._AVAILABILITY_CHECKS.pop("synthetic_decoy", None)
+            br._REGISTRY.pop(kernel_name, None)
+
+    def test_check_triton_backend_actually_imports_not_just_find_spec(self):
+        """Regression: partial triton installs (find_spec returns a valid spec
+        but import raises ABI/native-deps error) used to pass the availability
+        check. Now the check imports the module so describe_kernel_backends()
+        doesn't lie about a broken triton being available."""
+        from unsloth.kernels._backend_registry import _check_triton_backend
+
+        # Patch importlib.import_module to simulate a broken triton install:
+        # find_spec would succeed (it scans for the module on disk), but the
+        # actual import raises (e.g., undefined symbol on .so load).
+        original_import = importlib.import_module
+        def _fake_import(name, *args, **kwargs):
+            if name == "triton":
+                raise ImportError("undefined symbol: simulated ABI mismatch")
+            return original_import(name, *args, **kwargs)
+
+        with patch.object(importlib, "import_module", side_effect = _fake_import):
+            available, reason = _check_triton_backend()
+        self.assertFalse(available)
+        self.assertIsNotNone(reason)
+        self.assertIn("Triton import failed", reason)
+        self.assertIn("simulated ABI mismatch", reason)
+
+    def test_failed_backend_loader_is_cached_not_retried(self):
+        """A loader that raises should be cached so subsequent dispatches
+        don't re-run it. Also verifies clear_backend_load_cache() forces a
+        retry."""
+        from unsloth.kernels import clear_backend_load_cache
+        from unsloth.kernels import _backend_registry as br
+
+        backend_name = "synthetic_failing_backend"
+        call_count = {"n": 0}
+
+        def loader():
+            call_count["n"] += 1
+            raise ImportError("synthetic broken loader")
+
+        br.register_builtin_backend_loader(backend_name, loader)
+        # Make sure no stale cache is around.
+        clear_backend_load_cache(backend_name)
+
+        with self.assertRaises(ImportError):
+            br.ensure_backend_loaded(backend_name)
+        self.assertEqual(call_count["n"], 1)
+
+        # Subsequent calls must NOT re-run the loader; they raise the cached exc.
+        for _ in range(5):
+            with self.assertRaises(ImportError):
+                br.ensure_backend_loaded(backend_name)
+        self.assertEqual(call_count["n"], 1, "Failed loader was retried; cache broken.")
+
+        # Clearing the cache must allow a retry.
+        clear_backend_load_cache(backend_name)
+        with self.assertRaises(ImportError):
+            br.ensure_backend_loaded(backend_name)
+        self.assertEqual(call_count["n"], 2)
+
+        # Cleanup so other tests don't see this synthetic backend.
+        br._BUILTIN_LOADERS.pop(backend_name, None)
+        clear_backend_load_cache(backend_name)
+
+    def test_concurrent_failed_load_propagates_to_waiters(self):
+        """Threads that wait on a concurrent load whose loader fails must also
+        see the failure, not silently treat the wake-up as success.
+        """
+        import threading
+        from unsloth.kernels import clear_backend_load_cache
+        from unsloth.kernels import _backend_registry as br
+
+        backend_name = "synthetic_concurrent_failing_backend"
+        gate = threading.Event()  # held until the test releases the loader thread
+
+        def loader():
+            gate.wait(timeout = 5.0)
+            raise ImportError("synthetic concurrent failure")
+
+        br.register_builtin_backend_loader(backend_name, loader)
+        clear_backend_load_cache(backend_name)
+
+        results = {"loader_thread": None, "waiter_thread": None}
+
+        def call(key):
+            try:
+                br.ensure_backend_loaded(backend_name)
+            except BaseException as e:
+                results[key] = e
+
+        loader_thread = threading.Thread(target = call, args = ("loader_thread",))
+        waiter_thread = threading.Thread(target = call, args = ("waiter_thread",))
+        loader_thread.start()
+        # Give loader_thread a moment to take the load slot before waiter_thread arrives.
+        import time
+        time.sleep(0.1)
+        waiter_thread.start()
+        gate.set()
+        loader_thread.join(timeout = 5.0)
+        waiter_thread.join(timeout = 5.0)
+
+        self.assertIsInstance(results["loader_thread"], ImportError)
+        self.assertIsInstance(
+            results["waiter_thread"], ImportError,
+            "Waiter thread did not receive the loader's failure; it was treated as success.",
+        )
+
+        br._BUILTIN_LOADERS.pop(backend_name, None)
+        clear_backend_load_cache(backend_name)
+
+    def test_kernel_backend_context_preserves_outer_global_when_omitted(self):
+        """Regression: kernel_backend_context(overrides=...) must not silently
+        wipe an outer set_kernel_backend("cutile") from the surrounding scope.
+
+        Before the sentinel fix, the default ``global_backend=None`` was
+        forwarded to ``_RUNTIME_GLOBAL_BACKEND.set(None)`` and replaced the
+        outer "cutile" with None inside the block. Now omitting the kwarg
+        preserves the outer state; passing ``None`` explicitly still clears
+        it (matching ``set_kernel_backend(None)``).
+        """
+        register_kernel_backend("unsloth.swiglu_fg", "dummy_outer", lambda e, g: e * 0)
+        register_kernel_backend("unsloth.swiglu_fg", "dummy_inner", lambda e, g: e + g)
+
+        # Outer setter establishes a global backend.
+        set_kernel_backend("dummy_outer")
+
+        # Context with overrides ONLY (no global_backend kwarg) must not
+        # clobber the outer "dummy_outer" — kernels not in the override map
+        # must keep resolving to "dummy_outer".
+        with kernel_backend_context(overrides = {"some_other_kernel": "x"}):
+            self.assertEqual(
+                backend_registry._RUNTIME_GLOBAL_BACKEND.get(),
+                "dummy_outer",
+                "outer global backend was wiped by kernel_backend_context "
+                "default; sentinel preserve-semantics is broken.",
+            )
+
+        # Explicit None must still clear the global backend within the scope.
+        with kernel_backend_context(global_backend = None):
+            self.assertIsNone(
+                backend_registry._RUNTIME_GLOBAL_BACKEND.get(),
+                "explicit global_backend=None must clear the outer state "
+                "(matches set_kernel_backend(None)).",
+            )
+
+        # After exit either way, the outer state is restored.
+        self.assertEqual(
+            backend_registry._RUNTIME_GLOBAL_BACKEND.get(),
+            "dummy_outer",
+            "outer global backend not restored after kernel_backend_context exit.",
+        )
 
     def test_per_op_override_beats_global_backend(self):
         register_kernel_backend("unsloth.swiglu_fg", "dummy", lambda e, g: e - g)
@@ -423,6 +630,8 @@ class KernelBackendTests(unittest.TestCase):
         self.assertEqual(captured["backend"], "triton")
 
     def test_fp8_rowwise_path_preserves_resolved_backend(self):
+        # When rowwise FBGEMM ops ARE available, the resolved backend must be
+        # forwarded through the row-wise dispatch (was always-call-fbgemm).
         X = torch.randn(2, 4)
         weight = torch.randn(4, 4)
         weight_scale = torch.ones(4, 1)
@@ -432,11 +641,93 @@ class KernelBackendTests(unittest.TestCase):
             captured["backend"] = backend
             return torch.zeros(X.shape[:-1] + (weight.shape[0],), dtype = X.dtype)
 
-        with patch.object(fp8_module, "get_kernel_backend", return_value = "triton"):
-            with patch.object(fp8_module, "fbgemm_fp8_linear", side_effect = _fake_rowwise):
-                fp8_module.fp8_linear(X, weight, weight_scale, backend = "cutile")
+        with patch.object(fp8_module, "_HAS_FBGEMM_ROWWISE", True):
+            with patch.object(fp8_module, "get_kernel_backend", return_value = "triton"):
+                with patch.object(fp8_module, "fbgemm_fp8_linear", side_effect = _fake_rowwise):
+                    fp8_module.fp8_linear(X, weight, weight_scale, backend = "cutile")
 
         self.assertEqual(captured["backend"], "triton")
+
+    def test_fp8_rowwise_eager_fallback_warns_once(self):
+        """When FBGEMM rowwise is missing AND the user asked for non-eager,
+        the eager fallback must emit a one-shot warning so the perf surprise
+        shows up in logs. Subsequent calls must NOT re-warn (dedupe)."""
+        X = torch.randn(2, 4)
+        weight = torch.randn(4, 4)
+        weight_scale = torch.ones(4, 1)
+
+        def _fake_eager(X, weight, weight_scale, bias = None):
+            return torch.zeros(X.shape[:-1] + (weight.shape[0],), dtype = X.dtype)
+
+        with patch.object(fp8_module, "_HAS_FBGEMM_ROWWISE", False):
+            with patch.object(fp8_module, "_warned_fp8_rowwise_eager_fallback", False):
+                with patch.object(fp8_module, "get_kernel_backend", return_value = "cutile"):
+                    with patch.object(fp8_module, "_fp8_linear_eager", side_effect = _fake_eager):
+                        with patch.object(fp8_module.logger, "warning") as warn:
+                            fp8_module.fp8_linear(X, weight, weight_scale, backend = "cutile")
+                            fp8_module.fp8_linear(X, weight, weight_scale, backend = "cutile")
+                            fp8_module.fp8_linear(X, weight, weight_scale, backend = "cutile")
+                self.assertEqual(
+                    warn.call_count, 1,
+                    "Row-wise FP8 → eager fallback warning must fire exactly once "
+                    "across multiple calls (one-shot dedupe).",
+                )
+                msg = warn.call_args[0][0]
+                self.assertIn("fbgemm_gpu", msg)
+                self.assertIn("eager", msg)
+
+    def test_fp8_rowwise_eager_fallback_does_not_warn_when_user_picked_eager(self):
+        """If the user explicitly resolved to eager, they got what they asked
+        for — no surprise, no warning, regardless of FBGEMM presence."""
+        X = torch.randn(2, 4)
+        weight = torch.randn(4, 4)
+        weight_scale = torch.ones(4, 1)
+
+        def _fake_eager(X, weight, weight_scale, bias = None):
+            return torch.zeros(X.shape[:-1] + (weight.shape[0],), dtype = X.dtype)
+
+        with patch.object(fp8_module, "_HAS_FBGEMM_ROWWISE", False):
+            with patch.object(fp8_module, "_warned_fp8_rowwise_eager_fallback", False):
+                with patch.object(fp8_module, "get_kernel_backend", return_value = "eager"):
+                    with patch.object(fp8_module, "_fp8_linear_eager", side_effect = _fake_eager):
+                        with patch.object(fp8_module.logger, "warning") as warn:
+                            fp8_module.fp8_linear(X, weight, weight_scale, backend = "eager")
+                self.assertEqual(
+                    warn.call_count, 0,
+                    "Explicit eager request must NOT emit a fallback warning.",
+                )
+
+    def test_fp8_rowwise_falls_to_eager_when_fbgemm_rowwise_missing(self):
+        """Regression: cutile-only install (no fbgemm_gpu) used to crash with
+        AttributeError on torch.ops.fbgemm.f8f8bf16_rowwise once a non-eager
+        backend resolved to the row-wise FP8 dispatch. With the
+        _HAS_FBGEMM_ROWWISE guard, this now falls to eager silently."""
+        X = torch.randn(2, 4)
+        weight = torch.randn(4, 4)
+        weight_scale = torch.ones(4, 1)
+        eager_called = {"n": 0}
+
+        def _fake_eager(X, weight, weight_scale, bias = None):
+            eager_called["n"] += 1
+            return torch.zeros(X.shape[:-1] + (weight.shape[0],), dtype = X.dtype)
+
+        def _explode_rowwise(*args, **kwargs):
+            raise AttributeError(
+                "torch.ops.fbgemm.f8f8bf16_rowwise — simulating absent FBGEMM"
+            )
+
+        with patch.object(fp8_module, "_HAS_FBGEMM_ROWWISE", False):
+            with patch.object(fp8_module, "get_kernel_backend", return_value = "cutile"):
+                with patch.object(fp8_module, "_fp8_linear_eager", side_effect = _fake_eager):
+                    with patch.object(fp8_module, "fbgemm_fp8_linear", side_effect = _explode_rowwise):
+                        # Pre-fix: would call _explode_rowwise → AttributeError.
+                        # Post-fix: guard routes to _fake_eager.
+                        fp8_module.fp8_linear(X, weight, weight_scale, backend = "cutile")
+
+        self.assertEqual(
+            eager_called["n"], 1,
+            "Row-wise FP8 must fall to eager when FBGEMM rowwise op is absent.",
+        )
 
     def test_fp8_block_path_cutile_uses_fp8_block_quant_linear(self):
         # Regression: cutile must route through fp8_block_quant_linear

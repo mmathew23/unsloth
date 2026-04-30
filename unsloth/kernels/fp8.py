@@ -776,6 +776,43 @@ def _fp8_linear_eager(X, weight, weight_scale, bias = None):
     return output
 
 
+def _has_rowwise_fbgemm_ops() -> bool:
+    """Return True iff ``torch.ops.fbgemm.f8f8bf16_rowwise`` is available.
+
+    Independent from the blockwise FBGEMM probe (``UNSLOTH_HAS_FBGEMM``):
+    that one tests a CUTLASS kernel which may fail on consumer GPUs even
+    when FBGEMM is otherwise installed. The rowwise op is a different
+    entry point that can be present (or absent) independently. Without
+    this guard, ``fp8_linear``'s row-wise branch on a non-eager backend
+    (e.g. cutile) would call ``fbgemm_fp8_linear`` and crash with
+    ``AttributeError`` at first invocation when fbgemm_gpu isn't installed.
+    """
+    try:
+        return hasattr(torch.ops.fbgemm, "f8f8bf16_rowwise")
+    except (AttributeError, RuntimeError):
+        return False
+
+
+_HAS_FBGEMM_ROWWISE = _has_rowwise_fbgemm_ops()
+
+# One-shot warn flag for row-wise FP8 → eager fallback. The hot path of
+# row-wise FP8 is FBGEMM-only (no triton/cutile equivalent registered);
+# without fbgemm_gpu it silently runs at eager speed, which is the user's
+# real surprise. Warn once at first hit so logs show why perf is flat.
+_warned_fp8_rowwise_eager_fallback = False
+
+
+def _warn_fp8_rowwise_eager_fallback_once() -> None:
+    global _warned_fp8_rowwise_eager_fallback
+    if _warned_fp8_rowwise_eager_fallback:
+        return
+    _warned_fp8_rowwise_eager_fallback = True
+    logger.warning(
+        "Unsloth: Row-wise FP8 detected but `fbgemm_gpu` is not installed. "
+        "Falling back to eager (slower). For best row-wise FP8 performance, "
+        "install fbgemm_gpu."
+    )
+
 fp8_block_quant_linear = fp8_torch_block_quant_forward
 if "UNSLOTH_HAS_FBGEMM" not in os.environ:
     os.environ["UNSLOTH_HAS_FBGEMM"] = "0"
@@ -830,7 +867,16 @@ def fp8_linear(X, weight, weight_scale, bias = None, *, backend = None):
             )
     # Row/channel quantized FP8: 2D scale with shape (n, 1)
     else:
-        if resolved_backend == "eager":
+        # Fall to eager if either the user asked for it OR rowwise FBGEMM
+        # ops aren't available (cutile-only install, FBGEMM not installed).
+        # Without the second condition, fbgemm_fp8_linear would crash with
+        # AttributeError on torch.ops.fbgemm.f8f8bf16_rowwise.
+        if resolved_backend == "eager" or not _HAS_FBGEMM_ROWWISE:
+            # Only warn when the user wanted non-eager perf and we silently
+            # downgraded due to a missing optional dep. If the user picked
+            # eager themselves, they got what they asked for.
+            if not _HAS_FBGEMM_ROWWISE and resolved_backend != "eager":
+                _warn_fp8_rowwise_eager_fallback_once()
             out = _fp8_linear_eager(X, weight, weight_scale, bias)
         else:
             out = fbgemm_fp8_linear(

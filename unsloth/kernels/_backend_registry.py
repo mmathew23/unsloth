@@ -53,6 +53,60 @@ _LOCK = threading.RLock()
 _LOADED_BACKENDS: set[str] = set()
 _RESOLVE_CACHE: dict[tuple[str, str | None, str, str | None, str | None], str] = {}
 
+# Hooks fired when the global resolved backend changes — i.e. when
+# `set_kernel_backend` / `set_kernel_backends` / `clear_kernel_backend_overrides`
+# mutates `_RUNTIME_GLOBAL_BACKEND`, when `kernel_backend_context` enters/exits,
+# or when a new backend implementation is registered (so dispatcher kernels can
+# rebind their `_resolved_<name>` module aliases). Per-op overrides
+# (`set_kernel_backend_for_op`) do NOT fire hooks because they don't change
+# the global default — dispatcher entry points still consult the registry on
+# the rare explicit-backend path.
+GlobalBackendChangeHook = Callable[[str | None], None]
+_GLOBAL_BACKEND_CHANGE_HOOKS: list[GlobalBackendChangeHook] = []
+
+
+def register_global_backend_change_hook(fn: GlobalBackendChangeHook) -> None:
+    """Register `fn` to be invoked after the resolved global backend changes.
+
+    Called with the currently-resolved global backend string (e.g. ``"triton"``)
+    or ``None`` if the global has been cleared. Fired by:
+      * ``set_kernel_backend`` / ``set_kernel_backends`` / ``clear_kernel_backend_overrides``
+      * ``kernel_backend_context`` enter and exit (so nested-context restoration is honored)
+      * ``register_kernel_backend`` (so a backend that registers AFTER a kernel
+        module's `_resolved_<name>` alias was bound triggers a re-bind)
+      * ``ensure_backend_loaded`` on first successful load (same reason)
+
+    Hooks must be idempotent and side-effect-free beyond updating their own
+    module-level aliases. Exceptions raised inside a hook are swallowed and
+    logged (a faulty backend should not break global state mutation).
+    """
+    if not callable(fn):
+        raise TypeError("Backend change hook must be callable.")
+    with _LOCK:
+        if fn not in _GLOBAL_BACKEND_CHANGE_HOOKS:
+            _GLOBAL_BACKEND_CHANGE_HOOKS.append(fn)
+
+
+def _fire_global_backend_change_hooks() -> None:
+    """Invoke every registered global-change hook with the current resolved
+    global backend value. Hook exceptions are swallowed — a buggy hook must
+    not corrupt the registry's state. Called after `_RUNTIME_GLOBAL_BACKEND`
+    or the loaded-backend set has been mutated."""
+    with _LOCK:
+        hooks = tuple(_GLOBAL_BACKEND_CHANGE_HOOKS)
+    if not hooks:
+        return
+    current = _RUNTIME_GLOBAL_BACKEND.get()
+    for hook in hooks:
+        try:
+            hook(current)
+        except Exception as exc:
+            warnings.warn(
+                f"Backend change hook {hook!r} raised {exc!r}; ignoring.",
+                RuntimeWarning,
+                stacklevel = 3,
+            )
+
 
 def _invalidate_resolve_cache() -> None:
     """Drop the resolution cache. Cheap; called from setters that mutate
@@ -151,6 +205,10 @@ def register_kernel_backend(
     with _LOCK:
         _REGISTRY.setdefault(kernel_name, {})[backend_name] = implementation
         _invalidate_resolve_cache()
+    # New backend impl may unlock dispatcher aliases that were `None` before
+    # (e.g. cutile registers its `act_quant` after fp8.py was imported).
+    # Fire hooks so module-level `_resolved_<name>` aliases pick it up.
+    _fire_global_backend_change_hooks()
 
 
 def register_builtin_backend_loader(
@@ -238,6 +296,7 @@ def ensure_backend_loaded(backend: str) -> None:
         return
 
     exc_to_cache: BaseException | None = None
+    newly_loaded = False
     try:
         # Surface unavailability with a clear error before triggering the
         # backend package's import-time setup (which can crash on missing
@@ -262,9 +321,15 @@ def ensure_backend_loaded(backend: str) -> None:
             if exc_to_cache is None:
                 # Promote to lock-free fast-path set so future dispatches
                 # skip the entire `with _LOCK` block.
+                if backend_name not in _LOADED_BACKENDS:
+                    newly_loaded = True
                 _LOADED_BACKENDS.add(backend_name)
         if pending is not None:
             pending.set()
+        # Backend just registered its kernels via `load_backend` — give the
+        # dispatcher modules a chance to rebind `_resolved_<name>` aliases.
+        if newly_loaded:
+            _fire_global_backend_change_hooks()
 
 
 def clear_backend_load_cache(backend: str | None = None) -> None:
@@ -531,6 +596,7 @@ def set_kernel_backend(backend: str | None) -> None:
     env var is read by every dispatch and inherited by subprocesses.
     """
     _RUNTIME_GLOBAL_BACKEND.set(_normalize_backend_name(backend))
+    _fire_global_backend_change_hooks()
 
 
 def set_kernel_backend_for_op(name: str, backend: str | None) -> None:
@@ -594,6 +660,7 @@ def clear_kernel_backend_overrides() -> None:
     """
     _RUNTIME_GLOBAL_BACKEND.set(None)
     _RUNTIME_KERNEL_OVERRIDES.set({})
+    _fire_global_backend_change_hooks()
 
 
 _UNSET: Any = object()
@@ -646,12 +713,21 @@ def kernel_backend_context(
             else:
                 merged[normalized_kernel] = normalized_backend
     overrides_token = _RUNTIME_KERNEL_OVERRIDES.set(merged)
+    # Fire after both contextvars are mutated so hooks observe the entered
+    # state. Per-op overrides don't change the global default, but a
+    # `kernel_backend_context(global_backend="cutile")` call DOES change it
+    # and dispatcher modules need to rebind.
+    if global_token is not None:
+        _fire_global_backend_change_hooks()
     try:
         yield
     finally:
         _RUNTIME_KERNEL_OVERRIDES.reset(overrides_token)
         if global_token is not None:
             _RUNTIME_GLOBAL_BACKEND.reset(global_token)
+            # Fire on exit too so the outer context's resolved backend is
+            # restored on dispatcher aliases.
+            _fire_global_backend_change_hooks()
 
 
 def get_registered_kernel_backends(name: str | None = None) -> dict[str, list[str]] | list[str]:

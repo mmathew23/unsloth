@@ -277,6 +277,36 @@ register_kernel_backend(
 )
 
 
+_resolved_fast_rms_layernorm = None
+
+
+def _rebind_rms_layernorm_aliases(backend=None) -> None:
+    """Hook fired by `_backend_registry` when the global backend changes
+    or when a new backend impl is registered. Re-resolves `_resolved_*`
+    aliases for this module from the registry. Falls back to `None` so
+    the entry point routes through `dispatch_kernel`, preserving today's
+    behavior for explicit `backend=` callers."""
+    global _resolved_fast_rms_layernorm
+    try:
+        from ._backend_registry import get_kernel_impl
+        _resolved_fast_rms_layernorm = get_kernel_impl("unsloth.rms_layernorm")
+    except Exception:
+        _resolved_fast_rms_layernorm = None
+
+
+# Initial bind.
+try:
+    _rebind_rms_layernorm_aliases()
+except Exception:
+    pass
+
+try:
+    from ._backend_registry import register_global_backend_change_hook as _register_global_backend_change_hook
+    _register_global_backend_change_hook(_rebind_rms_layernorm_aliases)
+except Exception:
+    pass
+
+
 @torch.compiler.disable
 def fast_rms_layernorm(
     layernorm,
@@ -291,6 +321,8 @@ def fast_rms_layernorm(
         if hasattr(layernorm, "variance_epsilon")
         else layernorm.eps
     )
+    if backend is None and _resolved_fast_rms_layernorm is not None:
+        return _resolved_fast_rms_layernorm(X, W, eps, gemma)
     return dispatch_kernel(
         "unsloth.rms_layernorm",
         X,

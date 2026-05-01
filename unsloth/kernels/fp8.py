@@ -16,7 +16,13 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import math
-from ._backend_registry import dispatch_kernel, get_kernel_backend, register_kernel_backend
+from ._backend_registry import (
+    dispatch_kernel,
+    get_kernel_backend,
+    get_kernel_impl,
+    register_global_backend_change_hook,
+    register_kernel_backend,
+)
 from ._optional_triton import HAS_TRITON, tl, triton
 from unsloth_zoo.utils import Version
 from unsloth_zoo.log import logger
@@ -135,6 +141,8 @@ def weight_dequant_block(
     *,
     backend = None,
 ) -> torch.Tensor:
+    if backend is None and _resolved_weight_dequant_block is not None:
+        return _resolved_weight_dequant_block(x, s, block_size, dtype)
     return dispatch_kernel(
         "unsloth.weight_dequant",
         x,
@@ -235,15 +243,15 @@ def act_quant(
     *,
     backend = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # Hot-path bypass: when fp8_linear has already resolved the backend it
-    # passes a known-good name in. Skip the dispatcher (and its lock /
-    # ContextVar reads / env scans) for the two backends that are
-    # implemented locally in this module. Cutile's act_quant lives in the
-    # cutile backend package, so it still goes through dispatch_kernel.
-    if backend == "triton":
-        return _triton_act_quant(x, block_size)
-    if backend == "eager":
-        return _act_quant_eager(x, block_size)
+    # Hot path: alias was bound by `_rebind_fp8_aliases` at module load
+    # (and rebound on every `set_kernel_backend` / `kernel_backend_context`
+    # transition). Dynamo constant-folds `backend is None` away and traces
+    # the call as a direct invocation of the resolved impl with one ID_MATCH
+    # guard on `_resolved_act_quant`'s code object — no kwargs, no
+    # ContextVar.get(), no graph break.
+    if backend is None and _resolved_act_quant is not None:
+        return _resolved_act_quant(x, block_size)
+    # Slow path: explicit backend kwarg or alias not yet bound.
     return dispatch_kernel(
         "unsloth.act_quant",
         x,
@@ -476,25 +484,12 @@ def fp8_block_matmul(
     *,
     backend = None,
 ):
-    # Hot-path bypass for backends implemented locally in this module.
-    # fp8_linear already resolves the backend once and threads it in; this
-    # avoids a second `get_kernel_backend` (and its lock + env scan) per
-    # FP8 layer. Triton additionally has a torchao-backed alternative
-    # preferred when available.
-    resolved = backend if backend is not None else get_kernel_backend(
-        "unsloth.w8a8_block_fp8_matmul",
-    )
-    if resolved == "triton":
-        if torchao_blockwise_gemm is not None:
-            return torchao_block_matmul(
-                act_q,
-                weight_q,
-                act_scale,
-                weight_scale,
-                block_size,
-                output_dtype = output_dtype,
-            )
-        return w8a8_block_fp8_matmul_triton(
+    # Hot path: `_resolved_fp8_block_matmul` was bound at module load and is
+    # rebound by the registry hook on `set_kernel_backend` /
+    # `kernel_backend_context` transitions. The triton resolution embeds the
+    # torchao-vs-raw-triton preference (see `_rebind_fp8_aliases`).
+    if backend is None and _resolved_fp8_block_matmul is not None:
+        return _resolved_fp8_block_matmul(
             act_q,
             weight_q,
             act_scale,
@@ -502,16 +497,7 @@ def fp8_block_matmul(
             block_size,
             output_dtype = output_dtype,
         )
-    if resolved == "eager":
-        return _w8a8_block_fp8_matmul_eager(
-            act_q,
-            weight_q,
-            act_scale,
-            weight_scale,
-            block_size,
-            output_dtype = output_dtype,
-        )
-    # Cutile or any other registered backend: go through the dispatcher.
+    # Slow path: explicit backend kwarg or alias not yet bound.
     return dispatch_kernel(
         "unsloth.w8a8_block_fp8_matmul",
         act_q,
@@ -520,7 +506,7 @@ def fp8_block_matmul(
         weight_scale,
         block_size,
         output_dtype,
-        backend = resolved,
+        backend = backend,
     )
 
 
@@ -561,8 +547,12 @@ class FP8BlockQuantLinear(torch.autograd.Function):
         if not weight.is_contiguous():
             weight = weight.contiguous()
 
-        # Quantize input and run FP8 matmul
-        qinput, scale = act_quant(X, block_size[1], backend = backend)
+        # Quantize input and run FP8 matmul. Inner calls intentionally do
+        # NOT pass `backend=` — `_resolved_act_quant` / `_resolved_fp8_block_matmul`
+        # handle backend selection via the static-binding hot path. The
+        # outer `backend` arg is dead in the body but kept in the signature
+        # for autograd.Function.apply call-shape compatibility.
+        qinput, scale = act_quant(X, block_size[1])
         output = fp8_block_matmul(
             qinput,
             weight,
@@ -570,7 +560,6 @@ class FP8BlockQuantLinear(torch.autograd.Function):
             weight_scale,
             block_size,
             output_dtype = X.dtype,
-            backend = backend,
         )
         output = output.to(X.dtype)
         if bias is not None:
@@ -663,33 +652,21 @@ class FP8BlockQuantLinearLean(torch.autograd.Function):
         if not weight.is_contiguous():
             weight = weight.contiguous()
 
-        # Direct-bound impls (see `_hot_act_quant` / `_hot_fp8_block_matmul`
-        # below at L1006). For the resolved backend, these are the SAME plain
-        # functions PyPI calls — no wrapper, no kwarg branching. Falls back
-        # to the dispatcher path only for backends without a direct binding.
-        if _hot_act_quant is not None:
-            qinput, scale = _hot_act_quant(X, block_size[1])
-            output = _hot_fp8_block_matmul(
-                qinput,
-                weight,
-                scale,
-                weight_scale,
-                block_size,
-                output_dtype = X.dtype,
-            )
-        else:
-            qinput, scale = act_quant(
-                X, block_size[1], backend = _BAKED_BLOCK_FP8_BACKEND,
-            )
-            output = fp8_block_matmul(
-                qinput,
-                weight,
-                scale,
-                weight_scale,
-                block_size,
-                output_dtype = X.dtype,
-                backend = _BAKED_BLOCK_FP8_BACKEND,
-            )
+        # Hot path: `act_quant` / `fp8_block_matmul` constant-fold
+        # `backend is None` and dispatch via `_resolved_act_quant` /
+        # `_resolved_fp8_block_matmul` — same call shape PyPI uses (one
+        # ID_MATCH guard per alias, no ContextVar.get(), no graph break).
+        # The aliases are rebound by `_rebind_fp8_aliases` whenever the
+        # global backend changes.
+        qinput, scale = act_quant(X, block_size[1])
+        output = fp8_block_matmul(
+            qinput,
+            weight,
+            scale,
+            weight_scale,
+            block_size,
+            output_dtype = X.dtype,
+        )
         ctx.weight = weight
         ctx.weight_scale = original_weight_scale  # Save original for backward
         return output.to(X.dtype)
@@ -700,7 +677,6 @@ class FP8BlockQuantLinearLean(torch.autograd.Function):
             ctx.weight,
             ctx.weight_scale,
             dtype = grad_output.dtype,
-            backend = _BAKED_BLOCK_FP8_BACKEND,
         )
         grad_X = torch_matmul(grad_output, W_deq)
         del W_deq
@@ -759,11 +735,12 @@ class FbgemmFp8Linear_matmul(torch.autograd.Function):
             # The transpose case is generally noticed in backward pass when we do dY@W instead of @W.T as we do for forward.
             # The shape case, I noticed to happen in MLP of Qwen 2.5 VL 7B where the gate proj is of shape (3420, 1280) and 3420/8=427.5
 
+            # Inner call drops `backend=` — `_resolved_weight_dequant_block`
+            # handles backend selection via the static-binding hot path.
             W_deq = weight_dequant(
                 weight,
                 weight_scale,
                 dtype = x.dtype,
-                backend = backend,
             ).T
             output = torch_matmul(x, W_deq)
             del W_deq
@@ -995,47 +972,106 @@ except:
 _KNOWN_LOCAL_BACKENDS = ("triton", "eager", "cutile")
 
 
-# Block-FP8 backend resolved once at module load time and threaded through the
-# lean autograd Function (see `FP8BlockQuantLinearLean` above). Any non-None
-# value lets `act_quant` / `fp8_block_matmul` / `weight_dequant` skip the
-# `_RUNTIME_GLOBAL_BACKEND.get()` ContextVar read inside their dispatch path,
-# which dynamo can't trace through.  Wrapped in try/except so that early
-# imports (before any backend loader has registered) silently fall back to
-# `None`, which restores the original dispatcher path — same safety net as
-# `module_forward_patch`'s `baked_backend` resolution.
+# Block-FP8 backend resolved once at module load time and threaded through
+# `fp8_linear` (see L1041 below). The `if backend is None: resolved_backend
+# = _BAKED_BLOCK_FP8_BACKEND` branch prevents `fp8_linear`'s `@torch_compile`
+# body from reaching `_RUNTIME_GLOBAL_BACKEND.get()` (a ContextVar.get()
+# that dynamo can't trace), so the body compiles into a single graph
+# instead of two split by `torch_dynamo_resume_in_fp8_linear`.
+#
+# This constant is rebound by `_rebind_fp8_aliases` whenever the global
+# backend changes — keep it in sync with the dispatcher hot-path aliases
+# below so a runtime `set_kernel_backend("cutile")` re-routes everything.
 try:
     _BAKED_BLOCK_FP8_BACKEND = get_kernel_backend("unsloth.w8a8_block_fp8_matmul")
 except Exception:
     _BAKED_BLOCK_FP8_BACKEND = None
 
 
-# Direct bindings for the FP8 generate hot path. Mirror PyPI's pattern (see
-# pypi/unsloth/kernels/fp8.py L323-327): pick the impl at import time and
-# alias it to a module-level name so `FP8BlockQuantLinearLean.forward` can
-# call it with no wrapper, no backend kwarg, no per-call branching.
-#
-# The dispatcher entry points (`act_quant` redefined at L232,
-# `fp8_block_matmul` at L469) are still used by callers that pass `backend=`
-# explicitly or need runtime switching via `kernel_backend_context`.  This
-# only short-circuits the *generate-time* hot path where switching is not
-# meaningful (the patched `forward` was bound at model load).
-#
-# Resolved-backend → impl table.  Future builtin backends (cutile, future
-# kernels) add their own branch here.  When a backend has no direct binding
-# (`None`), the lean Function falls back to the dispatcher path.
-if _BAKED_BLOCK_FP8_BACKEND == "triton":
-    _hot_act_quant = _triton_act_quant
-    _hot_fp8_block_matmul = (
-        torchao_block_matmul
-        if torchao_blockwise_gemm is not None
-        else w8a8_block_fp8_matmul_triton
-    )
-elif _BAKED_BLOCK_FP8_BACKEND == "eager":
-    _hot_act_quant = _act_quant_eager
-    _hot_fp8_block_matmul = _w8a8_block_fp8_matmul_eager
-else:
-    _hot_act_quant = None
-    _hot_fp8_block_matmul = None
+# Module-level aliases for the dispatcher hot path. Bound at import via
+# `_rebind_fp8_aliases` and rebound by the registry hook on every
+# `set_kernel_backend` / `kernel_backend_context` transition. Each
+# dispatcher entry point (`act_quant`, `fp8_block_matmul`,
+# `weight_dequant_block`) constant-folds `backend is None` to a direct call
+# of the resolved alias — one ID_MATCH guard per alias, no kwargs, no
+# ContextVar reads, no graph break inside `@torch_compile` callers.
+_resolved_act_quant = None
+_resolved_fp8_block_matmul = None
+_resolved_weight_dequant_block = None
+
+
+def _rebind_fp8_aliases(backend = None) -> None:
+    """Rebind dispatcher aliases from the registry. Called at module load
+    and as a hook from `set_kernel_backend` / `kernel_backend_context` /
+    `register_kernel_backend` / `ensure_backend_loaded`.
+
+    Three aliases:
+      * `_resolved_act_quant` — backed by `unsloth.act_quant` registry entry.
+      * `_resolved_fp8_block_matmul` — backed by `unsloth.w8a8_block_fp8_matmul`.
+        For the triton resolution, embeds the torchao-vs-raw-triton
+        preference (matches the original branch at L487-504).
+      * `_resolved_weight_dequant_block` — backed by `unsloth.weight_dequant`.
+
+    Also refreshes `_BAKED_BLOCK_FP8_BACKEND` so the `fp8_linear`
+    `if backend is None: resolved_backend = _BAKED_BLOCK_FP8_BACKEND` branch
+    stays consistent with the dispatcher aliases.
+
+    Falls back to `None` for any alias whose registry lookup fails (e.g.
+    the requested backend has no implementation registered). The dispatcher
+    entry points then route through `dispatch_kernel`, preserving today's
+    fallback behavior.
+    """
+    global _resolved_act_quant, _resolved_fp8_block_matmul
+    global _resolved_weight_dequant_block, _BAKED_BLOCK_FP8_BACKEND
+
+    try:
+        _resolved_act_quant = get_kernel_impl("unsloth.act_quant")
+    except Exception:
+        _resolved_act_quant = None
+
+    try:
+        impl = get_kernel_impl("unsloth.w8a8_block_fp8_matmul")
+        # Triton-specific perf preference: torchao's blockwise GEMM is
+        # ~3x faster than the raw triton kernel when available. Embed it
+        # in the static binding so the dispatcher hot path stays a single
+        # call without an extra runtime branch.
+        if impl is w8a8_block_fp8_matmul_triton and torchao_blockwise_gemm is not None:
+            impl = torchao_block_matmul
+        _resolved_fp8_block_matmul = impl
+    except Exception:
+        _resolved_fp8_block_matmul = None
+
+    try:
+        _resolved_weight_dequant_block = get_kernel_impl("unsloth.weight_dequant")
+    except Exception:
+        _resolved_weight_dequant_block = None
+
+    # Keep the baked block-FP8 backend constant in sync with the dispatcher
+    # alias so `fp8_linear`'s `if backend is None` branch matches what the
+    # autograd Functions dispatch to.
+    try:
+        _BAKED_BLOCK_FP8_BACKEND = get_kernel_backend(
+            "unsloth.w8a8_block_fp8_matmul",
+        )
+    except Exception:
+        _BAKED_BLOCK_FP8_BACKEND = None
+
+
+# Initial bind. Wrapped in try/except so module load never fails when no
+# backend has registered yet — the dispatcher entry points then route
+# through `dispatch_kernel`, which has its own fallback chain.
+try:
+    _rebind_fp8_aliases()
+except Exception:
+    pass
+
+
+# Register hook so `set_kernel_backend(...)` and `kernel_backend_context(...)`
+# transitions rebind the aliases without callers needing to re-import.
+try:
+    register_global_backend_change_hook(_rebind_fp8_aliases)
+except Exception:
+    pass
 
 
 @torch_compile

@@ -191,6 +191,41 @@ def _fast_layernorm_eager(X, W, b, eps):
 register_kernel_backend("unsloth.layernorm", "eager", _fast_layernorm_eager)
 
 
+# Module-level alias rebound by hook on backend change. None when no
+# implementation is registered for the resolved global backend yet.
+_resolved_fast_layernorm = None
+
+
+def _rebind_layernorm_aliases(backend = None) -> None:
+    """Hook fired by `_backend_registry` when the global backend changes
+    or when a new backend impl is registered. Looks up the resolved impl
+    for the current global backend and pins it to the module-level alias.
+    Falls back to `None` so the entry point routes through `dispatch_kernel`,
+    preserving today's behavior for explicit `backend=` callers and runtime
+    switches that aren't yet supported."""
+    global _resolved_fast_layernorm
+    try:
+        from ._backend_registry import get_kernel_impl
+        _resolved_fast_layernorm = get_kernel_impl("unsloth.layernorm")
+    except Exception:
+        _resolved_fast_layernorm = None
+
+
+# Initial bind. Wrapped so module load never fails if no backend is loaded yet.
+try:
+    _rebind_layernorm_aliases()
+except Exception:
+    pass
+
+# Register hook so global-backend changes (set_kernel_backend / kernel_backend_context)
+# rebind the alias.
+try:
+    from ._backend_registry import register_global_backend_change_hook as _register_global_backend_change_hook
+    _register_global_backend_change_hook(_rebind_layernorm_aliases)
+except Exception:
+    pass
+
+
 def fast_layernorm(layernorm, X, *, backend = None):
     assert layernorm.elementwise_affine is True
     W = layernorm.weight
@@ -200,6 +235,8 @@ def fast_layernorm(layernorm, X, *, backend = None):
         if hasattr(layernorm, "variance_epsilon")
         else layernorm.eps
     )
+    if backend is None and _resolved_fast_layernorm is not None:
+        return _resolved_fast_layernorm(X, W, bias, eps)
     return dispatch_kernel(
         "unsloth.layernorm",
         X,

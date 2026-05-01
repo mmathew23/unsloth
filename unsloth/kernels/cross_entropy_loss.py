@@ -493,6 +493,36 @@ register_kernel_backend(
 )
 
 
+_resolved_fast_cross_entropy_loss = None
+
+
+def _rebind_cross_entropy_aliases(backend=None) -> None:
+    """Hook fired by `_backend_registry` when the global backend changes
+    or when a new backend impl is registered. Re-resolves `_resolved_*`
+    aliases for this module from the registry. Falls back to `None` so
+    the entry point routes through `dispatch_kernel`, preserving today's
+    behavior for explicit `backend=` callers."""
+    global _resolved_fast_cross_entropy_loss
+    try:
+        from ._backend_registry import get_kernel_impl
+        _resolved_fast_cross_entropy_loss = get_kernel_impl("unsloth.cross_entropy_loss")
+    except Exception:
+        _resolved_fast_cross_entropy_loss = None
+
+
+# Initial bind.
+try:
+    _rebind_cross_entropy_aliases()
+except Exception:
+    pass
+
+try:
+    from ._backend_registry import register_global_backend_change_hook as _register_global_backend_change_hook
+    _register_global_backend_change_hook(_rebind_cross_entropy_aliases)
+except Exception:
+    pass
+
+
 def fast_cross_entropy_loss(
     logits,
     labels,
@@ -502,6 +532,8 @@ def fast_cross_entropy_loss(
     *,
     backend = None,
 ):
+    if backend is None and _resolved_fast_cross_entropy_loss is not None:
+        return _resolved_fast_cross_entropy_loss(logits, labels, logit_softcapping, logit_scaling, n_items)
     return dispatch_kernel(
         "unsloth.cross_entropy_loss",
         logits,

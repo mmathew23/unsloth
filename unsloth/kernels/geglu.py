@@ -308,15 +308,6 @@ register_kernel_backend(
 )
 
 
-def geglu_exact_forward_kernel(gate, up, *, backend = None):
-    return dispatch_kernel(
-        "unsloth.geglu_exact_forward",
-        gate,
-        up,
-        backend = backend,
-    )
-
-
 _triton_geglu_exact_backward_kernel = geglu_exact_backward_kernel
 
 
@@ -342,16 +333,6 @@ register_kernel_backend(
 )
 
 
-def geglu_exact_backward_kernel(DW, e, g, *, backend = None):
-    return dispatch_kernel(
-        "unsloth.geglu_exact_backward",
-        DW,
-        e,
-        g,
-        backend = backend,
-    )
-
-
 _triton_geglu_approx_forward_kernel = geglu_approx_forward_kernel
 
 
@@ -367,15 +348,6 @@ register_kernel_backend(
     "eager",
     _geglu_approx_forward_eager,
 )
-
-
-def geglu_approx_forward_kernel(gate, up, *, backend = None):
-    return dispatch_kernel(
-        "unsloth.geglu_approx_forward",
-        gate,
-        up,
-        backend = backend,
-    )
 
 
 _triton_geglu_approx_backward_kernel = geglu_approx_backward_kernel
@@ -408,7 +380,94 @@ register_kernel_backend(
 )
 
 
+# Module-level aliases rebound by hook on backend change. None when no
+# implementation is registered for the resolved global backend yet.
+_resolved_geglu_exact_fg = None
+_resolved_geglu_exact_bwd = None
+_resolved_geglu_approx_fg = None
+_resolved_geglu_approx_bwd = None
+
+
+def _rebind_geglu_aliases(backend = None) -> None:
+    """Hook fired by `_backend_registry` when the global backend changes
+    or when a new backend impl is registered. Looks up the resolved impl
+    for the current global backend and pins it to the module-level aliases.
+    Falls back to `None` so the entry point routes through `dispatch_kernel`,
+    preserving today's behavior for explicit `backend=` callers and runtime
+    switches that aren't yet supported."""
+    global _resolved_geglu_exact_fg, _resolved_geglu_exact_bwd
+    global _resolved_geglu_approx_fg, _resolved_geglu_approx_bwd
+    from ._backend_registry import get_kernel_impl
+    try:
+        _resolved_geglu_exact_fg = get_kernel_impl("unsloth.geglu_exact_forward")
+    except Exception:
+        _resolved_geglu_exact_fg = None
+    try:
+        _resolved_geglu_exact_bwd = get_kernel_impl("unsloth.geglu_exact_backward")
+    except Exception:
+        _resolved_geglu_exact_bwd = None
+    try:
+        _resolved_geglu_approx_fg = get_kernel_impl("unsloth.geglu_approx_forward")
+    except Exception:
+        _resolved_geglu_approx_fg = None
+    try:
+        _resolved_geglu_approx_bwd = get_kernel_impl("unsloth.geglu_approx_backward")
+    except Exception:
+        _resolved_geglu_approx_bwd = None
+
+
+# Initial bind. Wrapped so module load never fails if no backend is loaded yet.
+try:
+    _rebind_geglu_aliases()
+except Exception:
+    pass
+
+# Register hook so global-backend changes (set_kernel_backend / kernel_backend_context)
+# rebind the aliases.
+try:
+    from ._backend_registry import register_global_backend_change_hook as _register_global_backend_change_hook
+    _register_global_backend_change_hook(_rebind_geglu_aliases)
+except Exception:
+    pass
+
+
+def geglu_exact_forward_kernel(gate, up, *, backend = None):
+    if backend is None and _resolved_geglu_exact_fg is not None:
+        return _resolved_geglu_exact_fg(gate, up)
+    return dispatch_kernel(
+        "unsloth.geglu_exact_forward",
+        gate,
+        up,
+        backend = backend,
+    )
+
+
+def geglu_exact_backward_kernel(DW, e, g, *, backend = None):
+    if backend is None and _resolved_geglu_exact_bwd is not None:
+        return _resolved_geglu_exact_bwd(DW, e, g)
+    return dispatch_kernel(
+        "unsloth.geglu_exact_backward",
+        DW,
+        e,
+        g,
+        backend = backend,
+    )
+
+
+def geglu_approx_forward_kernel(gate, up, *, backend = None):
+    if backend is None and _resolved_geglu_approx_fg is not None:
+        return _resolved_geglu_approx_fg(gate, up)
+    return dispatch_kernel(
+        "unsloth.geglu_approx_forward",
+        gate,
+        up,
+        backend = backend,
+    )
+
+
 def geglu_approx_backward_kernel(DW, e, g, *, backend = None):
+    if backend is None and _resolved_geglu_approx_bwd is not None:
+        return _resolved_geglu_approx_bwd(DW, e, g)
     return dispatch_kernel(
         "unsloth.geglu_approx_backward",
         DW,

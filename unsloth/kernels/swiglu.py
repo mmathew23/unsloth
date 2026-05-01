@@ -157,10 +157,6 @@ def _swiglu_fg_eager(e, g):
 register_kernel_backend("unsloth.swiglu_fg", "eager", _swiglu_fg_eager)
 
 
-def swiglu_fg_kernel(e, g, *, backend = None):
-    return dispatch_kernel("unsloth.swiglu_fg", e, g, backend = backend)
-
-
 _triton_swiglu_DWf_DW_dfg_kernel = swiglu_DWf_DW_dfg_kernel
 
 
@@ -184,5 +180,54 @@ def _swiglu_DWf_DW_dfg_eager(DW, e, g):
 register_kernel_backend("unsloth.swiglu_bwd", "eager", _swiglu_DWf_DW_dfg_eager)
 
 
+# Module-level aliases rebound by hook on backend change. None when no
+# implementation is registered for the resolved global backend yet.
+_resolved_swiglu_fg = None
+_resolved_swiglu_bwd = None
+
+
+def _rebind_swiglu_aliases(backend = None) -> None:
+    """Hook fired by `_backend_registry` when the global backend changes
+    or when a new backend impl is registered. Looks up the resolved impl
+    for the current global backend and pins it to the module-level aliases.
+    Falls back to `None` so the entry point routes through `dispatch_kernel`,
+    preserving today's behavior for explicit `backend=` callers and runtime
+    switches that aren't yet supported."""
+    global _resolved_swiglu_fg, _resolved_swiglu_bwd
+    try:
+        from ._backend_registry import get_kernel_impl
+        _resolved_swiglu_fg = get_kernel_impl("unsloth.swiglu_fg")
+    except Exception:
+        _resolved_swiglu_fg = None
+    try:
+        from ._backend_registry import get_kernel_impl
+        _resolved_swiglu_bwd = get_kernel_impl("unsloth.swiglu_bwd")
+    except Exception:
+        _resolved_swiglu_bwd = None
+
+
+# Initial bind. Wrapped so module load never fails if no backend is loaded yet.
+try:
+    _rebind_swiglu_aliases()
+except Exception:
+    pass
+
+# Register hook so global-backend changes (set_kernel_backend / kernel_backend_context)
+# rebind the aliases.
+try:
+    from ._backend_registry import register_global_backend_change_hook as _register_global_backend_change_hook
+    _register_global_backend_change_hook(_rebind_swiglu_aliases)
+except Exception:
+    pass
+
+
+def swiglu_fg_kernel(e, g, *, backend = None):
+    if backend is None and _resolved_swiglu_fg is not None:
+        return _resolved_swiglu_fg(e, g)
+    return dispatch_kernel("unsloth.swiglu_fg", e, g, backend = backend)
+
+
 def swiglu_DWf_DW_dfg_kernel(DW, e, g, *, backend = None):
+    if backend is None and _resolved_swiglu_bwd is not None:
+        return _resolved_swiglu_bwd(DW, e, g)
     return dispatch_kernel("unsloth.swiglu_bwd", DW, e, g, backend = backend)

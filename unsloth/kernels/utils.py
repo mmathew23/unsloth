@@ -1015,16 +1015,23 @@ else:
     pass
 
 
-def fast_linear_forward(proj, X, temp_lora = None, out = None, *, backend = None):
+def fast_linear_forward(proj, X, temp_lora = None, out = None):
+    # Signature matches PyPI exactly — no `backend=` kwarg.  Dynamo's bytecode
+    # tracing creates a separate compile_id for kwarg-bearing call shapes when
+    # this function is reached from inside HF generate's outer compile.  All
+    # downstream callees (fp8_linear, fast_dequantize, matmul_lora) resolve
+    # the backend from the registry / module-level baked constants instead of
+    # threading it through the kwarg, which would force Dynamo to guard on
+    # the kwarg value per call.
     W, W_quant, lora_A, lora_B, lora_S, bias = get_lora_parameters_bias(proj)
     bsz, q_len, in_dim = X.shape
     if q_len != 1:
-        return matmul_lora(X, W, W_quant, lora_A, lora_B, lora_S, backend = backend)
+        return matmul_lora(X, W, W_quant, lora_A, lora_B, lora_S)
 
     if W_quant is None:
         out = torch_matmul(X, W.t(), out = out)
     elif W.dtype == torch.float8_e4m3fn:
-        out = fp8_linear(X, W, W_quant, bias, backend = backend)
+        out = fp8_linear(X, W, W_quant, bias)
     elif bsz == 1 and q_len == 1:
         out = fast_gemv(X, W, W_quant, out = out)
     else:
@@ -1032,7 +1039,6 @@ def fast_linear_forward(proj, X, temp_lora = None, out = None, *, backend = None
             W.t(),
             W_quant,
             use_global_buffer = True,
-            backend = backend,
         )
         out = torch_matmul(X, W, out = out)
 

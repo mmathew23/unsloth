@@ -37,6 +37,30 @@ _RUNTIME_KERNEL_OVERRIDES: contextvars.ContextVar[dict[str, str]] = contextvars.
 _WARNED_FALLBACKS: set[tuple[str, str, str]] = set()
 _LOCK = threading.RLock()
 
+# Hot-path caches. Hit on the steady-state training step where the same
+# (kernel, backend) pair is dispatched 100s of times per second. Reading
+# either is GIL-atomic so we skip _LOCK entirely on the common cache-hit
+# path, eliminating ~750 RLock acquires per Qwen3-8B step.
+#
+# Invariants:
+#  * `_LOADED_BACKENDS` is a strict subset of backends whose loader has
+#    completed successfully. Once added, an entry is never removed (loader
+#    failures are kept out). `clear_backend_load_cache` resets it.
+#  * `_RESOLVE_CACHE` is keyed by the full resolution input (kernel_name,
+#    explicit_backend kwarg, fallback_backend, env_global, env_overrides_str)
+#    so any env-driven change is naturally a cache miss. Setter functions
+#    that mutate `_REGISTRY` / `_BUILTIN_LOADERS` clear it.
+_LOADED_BACKENDS: set[str] = set()
+_RESOLVE_CACHE: dict[tuple[str, str | None, str, str | None, str | None], str] = {}
+
+
+def _invalidate_resolve_cache() -> None:
+    """Drop the resolution cache. Cheap; called from setters that mutate
+    process-wide registry state. Per-thread/contextvar setters do not need
+    to call this — `get_kernel_backend` checks the contextvars before
+    consulting the cache."""
+    _RESOLVE_CACHE.clear()
+
 
 def _normalize_kernel_name(name: str) -> str:
     normalized = str(name).strip()
@@ -126,6 +150,7 @@ def register_kernel_backend(
         raise ValueError(f"Backend for {kernel_name!r} must not be empty.")
     with _LOCK:
         _REGISTRY.setdefault(kernel_name, {})[backend_name] = implementation
+        _invalidate_resolve_cache()
 
 
 def register_builtin_backend_loader(
@@ -141,6 +166,7 @@ def register_builtin_backend_loader(
         _BUILTIN_LOADERS[backend_name] = loader
         if availability_check is not None:
             _AVAILABILITY_CHECKS[backend_name] = availability_check
+        _invalidate_resolve_cache()
 
 
 def register_backend_package(
@@ -176,15 +202,23 @@ def ensure_backend_loaded(backend: str) -> None:
     if backend_name is None:
         return
 
+    # Hot-path: already loaded successfully. `set.__contains__` is GIL-atomic
+    # for str keys; no lock needed. This skips ~99% of dispatch_kernel calls
+    # past the first per backend.
+    if backend_name in _LOADED_BACKENDS:
+        return
+
     with _LOCK:
         if backend_name in _BACKEND_LOAD_RESULT:
             cached = _BACKEND_LOAD_RESULT[backend_name]
             if cached is not None:
                 raise cached
+            _LOADED_BACKENDS.add(backend_name)
             return
         loader = _BUILTIN_LOADERS.get(backend_name)
         if loader is None:
             _BACKEND_LOAD_RESULT[backend_name] = None
+            _LOADED_BACKENDS.add(backend_name)
             return
         availability_check = _AVAILABILITY_CHECKS.get(backend_name)
         event = _LOADING_BACKENDS.get(backend_name)
@@ -225,6 +259,10 @@ def ensure_backend_loaded(backend: str) -> None:
         with _LOCK:
             _BACKEND_LOAD_RESULT[backend_name] = exc_to_cache
             pending = _LOADING_BACKENDS.pop(backend_name, None)
+            if exc_to_cache is None:
+                # Promote to lock-free fast-path set so future dispatches
+                # skip the entire `with _LOCK` block.
+                _LOADED_BACKENDS.add(backend_name)
         if pending is not None:
             pending.set()
 
@@ -239,10 +277,14 @@ def clear_backend_load_cache(backend: str | None = None) -> None:
     with _LOCK:
         if backend is None:
             _BACKEND_LOAD_RESULT.clear()
+            _LOADED_BACKENDS.clear()
+            _invalidate_resolve_cache()
             return
         backend_name = _normalize_backend_name(backend)
         if backend_name is not None:
             _BACKEND_LOAD_RESULT.pop(backend_name, None)
+            _LOADED_BACKENDS.discard(backend_name)
+            _invalidate_resolve_cache()
 
 
 def is_kernel_backend_available(backend: str) -> tuple[bool, str | None]:
@@ -382,6 +424,27 @@ def get_kernel_backend(
     fallback_backend: str = DEFAULT_KERNEL_BACKEND,
 ) -> str:
     kernel_name = _normalize_kernel_name(name)
+    explicit_backend = _normalize_backend_name(backend)
+
+    # Hot-path cache. Skipped when per-thread overrides are in play because
+    # those mutate via ContextVar without notifying the cache. Env vars are
+    # baked into the cache key so a mid-run env change naturally misses.
+    runtime_global = _RUNTIME_GLOBAL_BACKEND.get()
+    runtime_overrides = _RUNTIME_KERNEL_OVERRIDES.get()
+    if not runtime_global and not runtime_overrides and not _strict_mode_enabled():
+        cache_key = (
+            kernel_name,
+            explicit_backend,
+            fallback_backend,
+            os.environ.get(GLOBAL_BACKEND_ENV),
+            os.environ.get(OVERRIDES_ENV),
+        )
+        cached = _RESOLVE_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+    else:
+        cache_key = None
+
     preferred_backend, is_explicit = _get_requested_backend(
         kernel_name, backend = backend,
     )
@@ -389,6 +452,8 @@ def get_kernel_backend(
     available_backends = sorted(_REGISTRY.get(kernel_name, {}))
     available, reason = _backend_status_for_kernel(kernel_name, preferred_backend)
     if available:
+        if cache_key is not None:
+            _RESOLVE_CACHE[cache_key] = preferred_backend
         return preferred_backend
 
     if _strict_mode_enabled():
@@ -408,6 +473,8 @@ def get_kernel_backend(
         if not candidate_available:
             continue
         _warn_fallback_once(kernel_name, preferred_backend, candidate_backend)
+        if cache_key is not None:
+            _RESOLVE_CACHE[cache_key] = candidate_backend
         return candidate_backend
 
     raise NotImplementedError(

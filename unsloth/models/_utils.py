@@ -1484,10 +1484,11 @@ def torch_compile_kwargs(*args, **kwargs):
     result = {
         "dynamic": True,
         "fullgraph": False,
-        "backend": UNSLOTH_COMPILE_BACKEND,
     }
     if UNSLOTH_COMPILE_BACKEND == "inductor":
         result["options"] = torch_compile_options
+    else:
+        result["backend"] = UNSLOTH_COMPILE_BACKEND
     return result
 
 

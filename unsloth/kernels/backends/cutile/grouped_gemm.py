@@ -48,13 +48,24 @@ permute_y support (second GEMM — output scatter):
 import math
 
 import cuda.tile as ct
-import cuda.tile_experimental as ct_experimental
 import torch
 
 from ._adapter import register_impl
+from ._stream import current_cuda_stream
 
 from .ct_ops import autotune_configs
+from .ct_ops import select_launch_config
 from .ct_ops import next_power_of_2
+
+# UNSLOTH_TILEGYM_DIFF_REVIEW: TileGym calls exhaustive_search directly for
+# grouped GEMM forward/backward launches. Local code routes through
+# select_launch_config to keep production padding-free training from
+# re-benchmarking many runtime shapes; exhaustive tuning remains opt-in via
+# UNSLOTH_CUTILE_EXHAUSTIVE_TUNE=1.
+# Module-level tune caches for forward, dX backward, and dW backward
+_grouped_gemm_fwd_tune_cache: dict = {}
+_grouped_gemm_dX_tune_cache: dict = {}
+_grouped_gemm_dW_tune_cache: dict = {}
 
 
 def _gemm_block_sizes(N, K, avg_tokens):
@@ -563,11 +574,58 @@ class GroupedGemmCT(torch.autograd.Function):
 
         if total_tokens > 0:
             NUM_SMS = _get_num_sms(X.device)
-            ct_experimental.autotune_launch(
-                torch.cuda.current_stream(),
-                grid_fn=lambda cfg: (NUM_SMS, 1, 1),
-                kernel=_grouped_gemm_fwd_kernel_ct,
-                args_fn=lambda cfg: (
+            fwd_stream = current_cuda_stream()
+            fwd_cache_key = (
+                total_tokens,
+                N,
+                K,
+                num_experts,
+                BLOCK_M,
+                BLOCK_N,
+                BLOCK_K,
+                permute_x_flag,
+                permute_y_flag,
+                topk,
+                X.dtype,
+                str(X.device),
+            )
+            if fwd_cache_key not in _grouped_gemm_fwd_tune_cache:
+                result = select_launch_config(
+                    list(autotune_configs()),
+                    fwd_stream,
+                    lambda cfg: (NUM_SMS, 1, 1),
+                    _grouped_gemm_fwd_kernel_ct,
+                    lambda cfg: (
+                        X_2d,
+                        W_flat,
+                        Y,
+                        m_sizes_i32,
+                        gather_indices_i32,
+                        N,
+                        K,
+                        total_tokens,
+                        num_experts,
+                        NUM_SMS,
+                        BLOCK_M,
+                        BLOCK_N,
+                        BLOCK_K,
+                        permute_x_flag,
+                        permute_y_flag,
+                        topk,
+                    ),
+                    lambda cfg: {"occupancy": cfg.occupancy},
+                )
+                best_cfg = result.best.config
+                _grouped_gemm_fwd_tune_cache[fwd_cache_key] = ct.kernel(
+                    _grouped_gemm_fwd_kernel_ct._pyfunc,
+                    occupancy=best_cfg.occupancy,
+                )
+            tuned_fwd_kernel = _grouped_gemm_fwd_tune_cache[fwd_cache_key]
+            ct.launch(
+                fwd_stream,
+                (NUM_SMS, 1, 1),
+                tuned_fwd_kernel,
+                (
                     X_2d,
                     W_flat,
                     Y,
@@ -585,8 +643,6 @@ class GroupedGemmCT(torch.autograd.Function):
                     permute_y_flag,
                     topk,
                 ),
-                hints_fn=lambda cfg: {"occupancy": cfg.occupancy},
-                search_space=autotune_configs,
             )
 
         ctx.save_for_backward(X, W, m_sizes, gather_indices)
@@ -642,18 +698,62 @@ class GroupedGemmCT(torch.autograd.Function):
         BLOCK_M, BLOCK_N, BLOCK_K = _gemm_block_sizes(N, K, avg_tokens_per_expert)
 
         NUM_SMS = _get_num_sms(dY.device)
-        stream = torch.cuda.current_stream()
+        stream = current_cuda_stream()
 
         # ----- dX = dY @ W (skip if dW_only) -----
         if not dW_only:
             dX = torch.zeros((total_tokens, K), device=dY.device, dtype=dY.dtype)
 
             if total_tokens > 0:
-                ct_experimental.autotune_launch(
+                dX_cache_key = (
+                    total_tokens,
+                    N,
+                    K,
+                    num_experts,
+                    BLOCK_M,
+                    BLOCK_N,
+                    BLOCK_K,
+                    permute_x_flag,
+                    permute_y_flag,
+                    dY.dtype,
+                    str(dY.device),
+                )
+                if dX_cache_key not in _grouped_gemm_dX_tune_cache:
+                    result = select_launch_config(
+                        list(autotune_configs()),
+                        stream,
+                        lambda cfg: (NUM_SMS, 1, 1),
+                        _grouped_gemm_dX_kernel_ct,
+                        lambda cfg: (
+                            dY.view(-1, N),
+                            W_flat,
+                            dX,
+                            m_sizes_i32,
+                            gather_indices_i32,
+                            N,
+                            K,
+                            total_tokens,
+                            num_experts,
+                            NUM_SMS,
+                            BLOCK_M,
+                            BLOCK_N,
+                            BLOCK_K,
+                            permute_x_flag,
+                            permute_y_flag,
+                        ),
+                        lambda cfg: {"occupancy": cfg.occupancy},
+                    )
+                    best_cfg = result.best.config
+                    _grouped_gemm_dX_tune_cache[dX_cache_key] = ct.kernel(
+                        _grouped_gemm_dX_kernel_ct._pyfunc,
+                        occupancy=best_cfg.occupancy,
+                    )
+                tuned_dX_kernel = _grouped_gemm_dX_tune_cache[dX_cache_key]
+                ct.launch(
                     stream,
-                    grid_fn=lambda cfg: (NUM_SMS, 1, 1),
-                    kernel=_grouped_gemm_dX_kernel_ct,
-                    args_fn=lambda cfg: (
+                    (NUM_SMS, 1, 1),
+                    tuned_dX_kernel,
+                    (
                         dY.view(-1, N),
                         W_flat,
                         dX,
@@ -670,8 +770,6 @@ class GroupedGemmCT(torch.autograd.Function):
                         permute_x_flag,
                         permute_y_flag,
                     ),
-                    hints_fn=lambda cfg: {"occupancy": cfg.occupancy},
-                    search_space=autotune_configs,
                 )
 
             # topk > 1 with permute_x: multiple expert slots map to same token,
@@ -690,11 +788,56 @@ class GroupedGemmCT(torch.autograd.Function):
             dW = torch.zeros((num_experts * N, K), device=dY.device, dtype=dY.dtype)
 
             if total_dw_tiles > 0:
-                ct_experimental.autotune_launch(
+                dW_cache_key = (
+                    total_tokens,
+                    N,
+                    K,
+                    num_experts,
+                    BLOCK_M,
+                    BLOCK_N,
+                    BLOCK_K,
+                    permute_x_flag,
+                    permute_y_flag,
+                    topk,
+                    dY.dtype,
+                    str(dY.device),
+                )
+                if dW_cache_key not in _grouped_gemm_dW_tune_cache:
+                    result = select_launch_config(
+                        list(autotune_configs()),
+                        stream,
+                        lambda cfg: (total_dw_tiles, 1, 1),
+                        _grouped_gemm_dW_kernel_ct,
+                        lambda cfg: (
+                            X_2d,
+                            dY.view(-1, N),
+                            dW,
+                            m_sizes_i32,
+                            gather_indices_i32,
+                            num_experts,
+                            N,
+                            K,
+                            total_tokens,
+                            BLOCK_M,
+                            BLOCK_N,
+                            BLOCK_K,
+                            permute_x_flag,
+                            permute_y_flag,
+                            topk,
+                        ),
+                        lambda cfg: {"occupancy": cfg.occupancy},
+                    )
+                    best_cfg = result.best.config
+                    _grouped_gemm_dW_tune_cache[dW_cache_key] = ct.kernel(
+                        _grouped_gemm_dW_kernel_ct._pyfunc,
+                        occupancy=best_cfg.occupancy,
+                    )
+                tuned_dW_kernel = _grouped_gemm_dW_tune_cache[dW_cache_key]
+                ct.launch(
                     stream,
-                    grid_fn=lambda cfg: (total_dw_tiles, 1, 1),
-                    kernel=_grouped_gemm_dW_kernel_ct,
-                    args_fn=lambda cfg: (
+                    (total_dw_tiles, 1, 1),
+                    tuned_dW_kernel,
+                    (
                         X_2d,
                         dY.view(-1, N),
                         dW,
@@ -711,8 +854,6 @@ class GroupedGemmCT(torch.autograd.Function):
                         permute_y_flag,
                         topk,
                     ),
-                    hints_fn=lambda cfg: {"occupancy": cfg.occupancy},
-                    search_space=autotune_configs,
                 )
 
             dW = dW.view(num_experts, N, K)
@@ -751,7 +892,6 @@ def grouped_gemm_cutile(
     is_first_gemm: bool = True,
     dX_only: bool = False,
     dW_only: bool = False,
-    **_unused,  # absorbs Triton-only kwargs (kernel_config_*, autotune)
 ) -> torch.Tensor:
     """
     CuTile grouped GEMM for MoE.

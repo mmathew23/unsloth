@@ -606,6 +606,170 @@ def check_fbgemm_gpu_version():
     logger.info(f"Unsloth: fbgemm_gpu_genai=={fbgemm_gpu_version} detected.")
 
 
+def patch_sdpa_without_triton():
+    """Avoid cuDNN SDPA plans that fail in no-Triton CUDA installs."""
+    if importlib.util.find_spec("triton") is not None:
+        return
+    if os.environ.get("UNSLOTH_NO_TRITON_ALLOW_CUDNN_SDPA", "0") in (
+        "1",
+        "True",
+        "true",
+    ):
+        return
+    try:
+        import torch
+    except Exception:
+        return
+    cuda_backends = getattr(torch.backends, "cuda", None)
+    if cuda_backends is None:
+        return
+    enable_cudnn_sdp = getattr(cuda_backends, "enable_cudnn_sdp", None)
+    if enable_cudnn_sdp is not None:
+        enable_cudnn_sdp(False)
+
+
+def patch_finegrained_fp8_without_triton():
+    """Let HF finegrained-FP8 model loading work in CuTile-only installs."""
+    if importlib.util.find_spec("triton") is not None:
+        return
+    try:
+        from transformers.quantizers.quantizer_finegrained_fp8 import (
+            FineGrainedFP8HfQuantizer,
+        )
+        from transformers.quantizers.quantizers_utils import should_convert_module
+        import torch
+        import torch.nn as nn
+    except Exception:
+        return
+
+    class UnslothFP8Linear(nn.Linear):
+        def __init__(
+            self,
+            in_features: int,
+            out_features: int,
+            block_size: tuple[int, int] | None = None,
+            activation_scheme: str = "dynamic",
+            has_bias: bool = False,
+            dtype = torch.float8_e4m3fn,
+        ):
+            super().__init__(in_features, out_features)
+            self.has_bias = has_bias
+            self.block_size = block_size
+            self.activation_scheme = activation_scheme
+            weight_kwargs = {} if dtype is None else {"dtype": dtype}
+            self.weight = nn.Parameter(torch.empty(out_features, in_features, **weight_kwargs))
+            if self.block_size is None:
+                self.weight_scale_inv = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+            else:
+                scale_out_features = (out_features + self.block_size[0] - 1) // self.block_size[0]
+                scale_in_features = (in_features + self.block_size[1] - 1) // self.block_size[1]
+                self.weight_scale_inv = nn.Parameter(
+                    torch.empty(scale_out_features, scale_in_features, dtype=torch.float32)
+                )
+            if self.activation_scheme == "static":
+                self.activation_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+            else:
+                self.register_parameter("activation_scale", None)
+            if self.has_bias:
+                self.bias = nn.Parameter(torch.empty(self.out_features))
+            else:
+                self.register_parameter("bias", None)
+
+        def forward(self, input: torch.Tensor) -> torch.Tensor:
+            if self.weight.element_size() > 1:
+                return nn.functional.linear(input, self.weight, self.bias)
+            if self.activation_scheme != "dynamic":
+                raise NotImplementedError(
+                    f"Unsupported FP8 activation scheme without Triton: {self.activation_scheme}"
+                )
+            from unsloth.kernels.fp8 import fp8_linear
+
+            weight = self.weight.contiguous()
+            scale_inv = self.weight_scale_inv.contiguous()
+            return fp8_linear(input, weight, scale_inv, self.bias).to(dtype=input.dtype)
+
+    def replace_with_unsloth_fp8_linear(
+        model,
+        modules_to_not_convert: list[str] | None = None,
+        quantization_config = None,
+        pre_quantized: bool = False,
+    ):
+        if quantization_config.dequantize:
+            return model
+        has_been_replaced = False
+        for module_name, module in model.named_modules():
+            if not should_convert_module(module_name, modules_to_not_convert):
+                continue
+            if not isinstance(module, nn.Linear):
+                continue
+            module_kwargs = {} if pre_quantized else {"dtype": None}
+            with torch.device("meta"):
+                new_module = UnslothFP8Linear(
+                    in_features = module.in_features,
+                    out_features = module.out_features,
+                    block_size = quantization_config.weight_block_size,
+                    activation_scheme = quantization_config.activation_scheme,
+                    has_bias = module.bias is not None,
+                    **module_kwargs,
+                )
+            model.set_submodule(module_name, new_module)
+            has_been_replaced = True
+        if not has_been_replaced:
+            logger.warning(
+                "You are loading your model using fp8 but no linear modules were found in your model."
+            )
+        return model
+
+    def _process_model_before_weight_loading(self, model, **kwargs):
+        self.modules_to_not_convert = self.get_modules_to_not_convert(
+            model,
+            self.quantization_config.modules_to_not_convert,
+            model._keep_in_fp32_modules,
+        )
+        return replace_with_unsloth_fp8_linear(
+            model,
+            modules_to_not_convert = self.modules_to_not_convert,
+            quantization_config = self.quantization_config,
+            pre_quantized = self.pre_quantized,
+        )
+
+    def _get_weight_conversions(self):
+        if not (self.pre_quantized and self.quantization_config.dequantize):
+            return []
+        from transformers.core_model_loading import WeightConverter
+
+        class _Fp8Dequantize:
+            def __init__(self, quantizer):
+                self.quantizer = quantizer
+
+            def __call__(self, weight, weight_scale_inv, activation_scale = None):
+                from unsloth.kernels.fp8 import weight_dequant
+
+                return weight_dequant(weight, weight_scale_inv, dtype = torch.get_default_dtype())
+
+        return [
+            WeightConverter(
+                source_patterns = ["weight$", "weight_scale_inv", "activation_scale"],
+                target_patterns = "weight",
+                operations = [_Fp8Dequantize(self)],
+            )
+        ]
+
+    def _param_needs_quantization(self, model, param_name: str, **kwargs) -> bool:
+        from transformers.modeling_utils import get_module_from_name
+
+        module, tensor_name = get_module_from_name(model, param_name)
+        if isinstance(module, UnslothFP8Linear):
+            return not (self.pre_quantized or tensor_name == "bias")
+        return False
+
+    FineGrainedFP8HfQuantizer._process_model_before_weight_loading = (
+        _process_model_before_weight_loading
+    )
+    FineGrainedFP8HfQuantizer.get_weight_conversions = _get_weight_conversions
+    FineGrainedFP8HfQuantizer.param_needs_quantization = _param_needs_quantization
+
+
 def patch_enable_input_require_grads():
     """
     Patch transformers PreTrainedModel.enable_input_require_grads to handle vision models

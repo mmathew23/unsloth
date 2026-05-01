@@ -23,16 +23,25 @@ Conversion notes:
 """
 
 import cuda.tile as ct
-import cuda.tile_experimental as ct_experimental
 import torch
 
 from ._adapter import register_impl
+from ._stream import current_cuda_stream
 
 from .ct_ops import autotune_configs
+from .ct_ops import select_launch_config
 from .ct_ops import cdiv
 from .ct_ops import erf_ct
 
 ConstInt = ct.Constant[int]
+
+# UNSLOTH_TILEGYM_DIFF_REVIEW: TileGym calls exhaustive_search directly for
+# forward launches. Local code routes through select_launch_config so the
+# production default avoids per-shape tuning overhead while keeping opt-in
+# exhaustive tuning available through UNSLOTH_CUTILE_EXHAUSTIVE_TUNE=1.
+# Module-level tune caches: (n_elements, LONG_INDEXING, dtype, device) -> tuned_kernel
+_geglu_exact_fwd_tune_cache: dict = {}
+_geglu_approx_fwd_tune_cache: dict = {}
 
 # signed int32 max is 2**31-1 so num_elements cannot exceed 2**31
 NUM_INT32_ELEMENTS = 2**31
@@ -183,13 +192,36 @@ def geglu_exact_forward(gate, up):
     batch, seq_len, hd = gate.shape
     n_elements = gate.numel()
     out = torch.empty((batch, seq_len, hd), dtype=gate.dtype, device=gate.device)
-    stream = torch.cuda.current_stream()
+    stream = current_cuda_stream()
     LONG_INDEXING = 0 if n_elements <= INT32_SAFETY_BUFFER else 1
-    ct_experimental.autotune_launch(
+    cache_key = (n_elements, LONG_INDEXING, gate.dtype, str(gate.device))
+    if cache_key not in _geglu_exact_fwd_tune_cache:
+        result = select_launch_config(
+            list(autotune_configs()),
+            stream,
+            lambda cfg: (cdiv(n_elements, BLOCK_SIZE_FWD),),
+            _exact_forward_ct,
+            lambda cfg: (
+                gate.reshape(-1),
+                up.reshape(-1),
+                out.reshape(-1),
+                n_elements,
+                BLOCK_SIZE_FWD,
+                LONG_INDEXING,
+            ),
+            lambda cfg: {"occupancy": cfg.occupancy},
+        )
+        best_cfg = result.best.config
+        _geglu_exact_fwd_tune_cache[cache_key] = ct.kernel(
+            _exact_forward_ct._pyfunc,
+            occupancy=best_cfg.occupancy,
+        )
+    tuned_kernel = _geglu_exact_fwd_tune_cache[cache_key]
+    ct.launch(
         stream,
-        grid_fn=lambda cfg: (cdiv(n_elements, BLOCK_SIZE_FWD),),
-        kernel=_exact_forward_ct,
-        args_fn=lambda cfg: (
+        (cdiv(n_elements, BLOCK_SIZE_FWD),),
+        tuned_kernel,
+        (
             gate.reshape(-1),
             up.reshape(-1),
             out.reshape(-1),
@@ -197,8 +229,6 @@ def geglu_exact_forward(gate, up):
             BLOCK_SIZE_FWD,
             LONG_INDEXING,
         ),
-        hints_fn=lambda cfg: {"occupancy": cfg.occupancy},
-        search_space=autotune_configs,
     )
     return out
 
@@ -208,7 +238,7 @@ def geglu_exact_backward(DW, e, g):
     n_elements = e.numel()
     LONG_INDEXING = 0 if n_elements <= INT32_SAFETY_BUFFER else 1
     grid = (cdiv(n_elements, BLOCK_SIZE_BWD),)
-    stream = torch.cuda.current_stream()
+    stream = current_cuda_stream()
     ct.launch(
         stream,
         grid,
@@ -223,13 +253,36 @@ def geglu_approx_forward(gate, up):
     batch, seq_len, hd = gate.shape
     n_elements = gate.numel()
     out = torch.empty((batch, seq_len, hd), dtype=gate.dtype, device=gate.device)
-    stream = torch.cuda.current_stream()
+    stream = current_cuda_stream()
     LONG_INDEXING = 0 if n_elements <= INT32_SAFETY_BUFFER else 1
-    ct_experimental.autotune_launch(
+    cache_key = (n_elements, LONG_INDEXING, gate.dtype, str(gate.device))
+    if cache_key not in _geglu_approx_fwd_tune_cache:
+        result = select_launch_config(
+            list(autotune_configs()),
+            stream,
+            lambda cfg: (cdiv(n_elements, BLOCK_SIZE_FWD),),
+            _approx_forward_ct,
+            lambda cfg: (
+                gate.reshape(-1),
+                up.reshape(-1),
+                out.reshape(-1),
+                n_elements,
+                BLOCK_SIZE_FWD,
+                LONG_INDEXING,
+            ),
+            lambda cfg: {"occupancy": cfg.occupancy},
+        )
+        best_cfg = result.best.config
+        _geglu_approx_fwd_tune_cache[cache_key] = ct.kernel(
+            _approx_forward_ct._pyfunc,
+            occupancy=best_cfg.occupancy,
+        )
+    tuned_kernel = _geglu_approx_fwd_tune_cache[cache_key]
+    ct.launch(
         stream,
-        grid_fn=lambda cfg: (cdiv(n_elements, BLOCK_SIZE_FWD),),
-        kernel=_approx_forward_ct,
-        args_fn=lambda cfg: (
+        (cdiv(n_elements, BLOCK_SIZE_FWD),),
+        tuned_kernel,
+        (
             gate.reshape(-1),
             up.reshape(-1),
             out.reshape(-1),
@@ -237,8 +290,6 @@ def geglu_approx_forward(gate, up):
             BLOCK_SIZE_FWD,
             LONG_INDEXING,
         ),
-        hints_fn=lambda cfg: {"occupancy": cfg.occupancy},
-        search_space=autotune_configs,
     )
     return out
 
@@ -248,7 +299,7 @@ def geglu_approx_backward(DW, e, g):
     n_elements = e.numel()
     LONG_INDEXING = 0 if n_elements <= INT32_SAFETY_BUFFER else 1
     grid = (cdiv(n_elements, BLOCK_SIZE_BWD),)
-    stream = torch.cuda.current_stream()
+    stream = current_cuda_stream()
     ct.launch(
         stream,
         grid,

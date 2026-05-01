@@ -6,11 +6,12 @@
 CuTile helper ops and shared utilities for unsloth kernels.
 
 Includes:
-  - Host-side utilities: next_power_of_2, cdiv, calculate_settings, autotune_configs
+  - Host-side utilities: next_power_of_2, cdiv, calculate_settings, autotune_configs, select_launch_config
   - Device-side helpers (for @ct.kernel): erf_ct
 """
 
 import math
+import os
 from types import SimpleNamespace
 
 import cuda.tile as ct
@@ -44,9 +45,32 @@ def calculate_settings(n):
 
 
 def autotune_configs():
-    """Yield standard occupancy configs for autotune_launch."""
+    """Yield standard occupancy configs for CuTile launches."""
     for occ in [1, 2, 4, 8]:
         yield SimpleNamespace(occupancy=occ)
+
+
+# UNSLOTH_TILEGYM_DIFF_REVIEW: TileGym origin/main calls
+# cuda.tile.tune.exhaustive_search at each tuned launch site. That is useful
+# for profiling fixed shapes, but Unsloth padding-free training creates many
+# runtime shapes and the repeated searches dominated wall time. Production
+# defaults to the first config; set UNSLOTH_CUTILE_EXHAUSTIVE_TUNE=1 to review
+# or profile the exact TileGym exhaustive-tuning behavior.
+def select_launch_config(configs, stream, grid_fn, kernel, args_fn, hints_fn):
+    """Select a CuTile launch config without benchmarking by default.
+
+    TileGym's published kernels use cuda.tile.tune.exhaustive_search, but
+    Unsloth's padding-free training sees many runtime shapes. Exhaustively
+    benchmarking every new shape dominates runtime, so the production default
+    keeps the old single-config behavior. Set UNSLOTH_CUTILE_EXHAUSTIVE_TUNE=1
+    for intentional profiling/tuning runs.
+    """
+    configs = list(configs)
+    if os.environ.get("UNSLOTH_CUTILE_EXHAUSTIVE_TUNE", "0") == "1":
+        from cuda.tile.tune import exhaustive_search
+
+        return exhaustive_search(configs, stream, grid_fn, kernel, args_fn, hints_fn)
+    return SimpleNamespace(best=SimpleNamespace(config=configs[0]))
 
 
 # ---- Device-side helpers (for use inside @ct.kernel) ----

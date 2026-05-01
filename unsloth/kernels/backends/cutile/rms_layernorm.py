@@ -11,7 +11,7 @@ RMS LayerNorm CuTile kernels (standard + Gemma variant).
 
 CuTile kernels:
   - _rms_layernorm_forward_ct_1d: 1D gather/scatter forward with autotune over occupancy.
-    Uses cuda.tile_experimental.autotune_launch to search occupancy=[1, 2, 4, 8].
+    Uses host-side occupancy selection; exhaustive tuning is opt-in.
     Both produce flat load_ptr_tko IR (matching NVT pattern), avoiding tensor_view/
     partition_view abstraction that causes predicate explosion.
   - _rms_layernorm_backward_ct_1d: 1D gather/scatter backward with autotune over occupancy.
@@ -28,13 +28,21 @@ Performance notes:
 """
 
 import cuda.tile as ct
-import cuda.tile_experimental as ct_experimental
 import torch
 
 from ._adapter import register_impl
+from ._stream import current_cuda_stream
 
 from .ct_ops import autotune_configs
+from .ct_ops import select_launch_config
 from .ct_ops import calculate_settings
+
+# UNSLOTH_TILEGYM_DIFF_REVIEW: TileGym calls exhaustive_search directly for RMS
+# layernorm launches. Local code routes through select_launch_config to avoid
+# repeated per-shape benchmarking in production; exhaustive tuning is opt-in via
+# UNSLOTH_CUTILE_EXHAUSTIVE_TUNE=1.
+# Module-level tune cache: (direction, n_rows, n_cols, dtype, TILE_N, OFFSET, device) -> tuned_kernel
+_rms_layernorm_tune_cache: dict = {}
 
 ConstInt = ct.Constant[int]
 ConstFloat = ct.Constant[float]
@@ -100,10 +108,10 @@ def _rms_layernorm_forward_ct_1d(
     OFFSET: ConstFloat,
     TILE_N: ConstInt,
 ):
-    """1D RMS LayerNorm forward with autotune over occupancy.
+    """1D RMS LayerNorm forward with host-selected occupancy.
 
-    Bare @ct.kernel — occupancy is injected at runtime by autotune_launch via
-    hints_fn. Search space: occupancy=[1, 2, 4, 8].
+    Production defaults to one occupancy config to avoid per-shape tuning.
+    Exhaustive occupancy tuning is available through select_launch_config.
     """
     _rms_layernorm_forward_ct_1d_body(Y, X, W, r, n_cols, eps, OFFSET, TILE_N)
 
@@ -170,10 +178,9 @@ def _rms_layernorm_backward_ct_1d(
     OFFSET: ConstFloat,
     TILE_N: ConstInt,
 ):
-    """1D RMS LayerNorm backward with autotune over occupancy.
+    """1D RMS LayerNorm backward with host-selected occupancy.
 
-    Bare @ct.kernel — occupancy is injected at runtime by autotune_launch via
-    hints_fn. Search space: occupancy=[1, 2, 4, 8].
+    Production defaults to one occupancy config to avoid per-shape tuning.
     """
     _rms_layernorm_backward_ct_1d_body(dX, dY, X, W, r, n_cols, OFFSET, TILE_N)
 
@@ -191,14 +198,28 @@ class _Fast_RMS_Layernorm_CT(torch.autograd.Function):
         Y = torch.empty((n_rows, n_cols), dtype=X.dtype, device=X.device)
         r = torch.empty(n_rows, dtype=torch.float32, device=X.device)
 
-        stream = torch.cuda.current_stream()
-        ct_experimental.autotune_launch(
+        stream = current_cuda_stream()
+        fwd_cache_key = ("fwd", n_rows, n_cols, X.dtype, TILE_N, OFFSET, str(X.device))
+        if fwd_cache_key not in _rms_layernorm_tune_cache:
+            result = select_launch_config(
+                list(autotune_configs()),
+                stream,
+                lambda cfg: (n_rows,),
+                _rms_layernorm_forward_ct_1d,
+                lambda cfg: (Y, X, W, r, n_cols, eps, OFFSET, TILE_N),
+                lambda cfg: {"occupancy": cfg.occupancy},
+            )
+            best_cfg = result.best.config
+            _rms_layernorm_tune_cache[fwd_cache_key] = ct.kernel(
+                _rms_layernorm_forward_ct_1d._pyfunc,
+                occupancy=best_cfg.occupancy,
+            )
+        tuned_fwd_kernel = _rms_layernorm_tune_cache[fwd_cache_key]
+        ct.launch(
             stream,
-            grid_fn=lambda cfg: (n_rows,),
-            kernel=_rms_layernorm_forward_ct_1d,
-            args_fn=lambda cfg: (Y, X, W, r, n_cols, eps, OFFSET, TILE_N),
-            hints_fn=lambda cfg: {"occupancy": cfg.occupancy},
-            search_space=autotune_configs,
+            (n_rows,),
+            tuned_fwd_kernel,
+            (Y, X, W, r, n_cols, eps, OFFSET, TILE_N),
         )
 
         ctx.eps = eps
@@ -216,19 +237,33 @@ class _Fast_RMS_Layernorm_CT(torch.autograd.Function):
         X, W, r = ctx.saved_tensors
         n_rows, n_cols = dY.shape
 
-        # Always allocate separate output buffer — autotune_launch runs the
-        # kernel multiple times to benchmark occupancy configs, so in-place
+        # Always allocate separate output buffer — optional exhaustive tuning can run the
+        # kernel multiple times, so in-place
         # (dX == dY) would corrupt dY on the first trial and produce garbage.
         dX = torch.empty_like(dY)
 
-        stream = torch.cuda.current_stream()
-        ct_experimental.autotune_launch(
+        stream = current_cuda_stream()
+        bwd_cache_key = ("bwd", n_rows, n_cols, dY.dtype, ctx.TILE_N, ctx.OFFSET, str(dY.device))
+        if bwd_cache_key not in _rms_layernorm_tune_cache:
+            result = select_launch_config(
+                list(autotune_configs()),
+                stream,
+                lambda cfg: (n_rows,),
+                _rms_layernorm_backward_ct_1d,
+                lambda cfg: (dX, dY, X, W, r, n_cols, ctx.OFFSET, ctx.TILE_N),
+                lambda cfg: {"occupancy": cfg.occupancy},
+            )
+            best_cfg = result.best.config
+            _rms_layernorm_tune_cache[bwd_cache_key] = ct.kernel(
+                _rms_layernorm_backward_ct_1d._pyfunc,
+                occupancy=best_cfg.occupancy,
+            )
+        tuned_bwd_kernel = _rms_layernorm_tune_cache[bwd_cache_key]
+        ct.launch(
             stream,
-            grid_fn=lambda cfg: (n_rows,),
-            kernel=_rms_layernorm_backward_ct_1d,
-            args_fn=lambda cfg: (dX, dY, X, W, r, n_cols, ctx.OFFSET, ctx.TILE_N),
-            hints_fn=lambda cfg: {"occupancy": cfg.occupancy},
-            search_space=autotune_configs,
+            (n_rows,),
+            tuned_bwd_kernel,
+            (dX, dY, X, W, r, n_cols, ctx.OFFSET, ctx.TILE_N),
         )
 
         return dX.view(*shape), None, None, None

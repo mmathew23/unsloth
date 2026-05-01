@@ -4,6 +4,10 @@
 
 """Internal adapter surface for CuTile kernel registration."""
 
+# UNSLOTH_TILEGYM_DIFF_REVIEW: TileGym imports register_impl from
+# tilegym.backend. Local Unsloth kernels route registration into
+# unsloth.kernels._backend_registry instead.
+
 from ..._backend_registry import register_kernel_backend
 
 BACKEND_NAME = "cutile"

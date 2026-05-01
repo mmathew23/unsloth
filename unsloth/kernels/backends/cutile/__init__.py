@@ -4,51 +4,6 @@
 
 """CuTile implementations for unsloth suite."""
 
-import importlib.util
-import sys
-from types import ModuleType
-
-
-def _install_tile_experimental_compat() -> None:
-    if importlib.util.find_spec("cuda.tile_experimental") is not None:
-        return
-    # If neither tile nor tile_experimental is installed, leave the shim
-    # uninstalled. The submodule imports below will surface a clearer
-    # ImportError pointing at the real missing dependency.
-    if importlib.util.find_spec("cuda.tile") is None:
-        return
-
-    import cuda.tile as ct
-
-    tile_experimental = ModuleType("cuda.tile_experimental")
-
-    def autotune_launch(
-        stream,
-        *,
-        grid_fn,
-        kernel,
-        args_fn,
-        hints_fn = None,
-        search_space = None,
-    ):
-        config = None
-        if search_space is not None:
-            configs = search_space() if callable(search_space) else search_space
-            config = next(iter(configs), None)
-        grid = grid_fn(config)
-        args = args_fn(config)
-        return ct.launch(stream, grid, kernel, args)
-
-    def clear_autotune_cache():
-        return None
-
-    tile_experimental.autotune_launch = autotune_launch
-    tile_experimental.clear_autotune_cache = clear_autotune_cache
-    sys.modules["cuda.tile_experimental"] = tile_experimental
-
-
-_install_tile_experimental_compat()
-
 # Shared CuTile op helpers (sigmoid, erf, etc.)
 from . import ct_ops  # noqa: F401
 from .cross_entropy_loss import cross_entropy_loss as cross_entropy_loss_fn
@@ -67,6 +22,9 @@ from .rope_embedding import rope_embedding_qk
 from .swiglu import swiglu_bwd
 from .swiglu import swiglu_fg
 
+# UNSLOTH_TILEGYM_DIFF_REVIEW: TileGym's suite package only exports kernels.
+# Unsloth's backend registry expects an explicit operation manifest and loader
+# hook, so keep these local unless TileGym grows an equivalent backend API.
 EXPECTED_OPS = (
     "unsloth.act_quant",
     "unsloth.cross_entropy_loss",

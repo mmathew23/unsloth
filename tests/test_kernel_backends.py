@@ -795,10 +795,12 @@ class KernelBackendTests(unittest.TestCase):
             set_kernel_backend,
             kernel_backend_context,
         )
+        import importlib
         import unsloth.kernels.fp8 as fp8_mod
         import unsloth.kernels.swiglu as swiglu_mod
         import unsloth.kernels.layernorm as layernorm_mod
-        import unsloth.kernels.grouped_gemm as gg_mod
+
+        gg_mod = importlib.import_module("unsloth.kernels.grouped_gemm")
 
         default_act = fp8_mod._resolved_act_quant
         default_swiglu = swiglu_mod._resolved_swiglu_fg

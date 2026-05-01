@@ -154,6 +154,8 @@ from .import_fixes import (
     disable_torchcodec_if_broken,
     disable_broken_wandb,
     patch_peft_weight_converter_compatibility,
+    patch_sdpa_without_triton,
+    patch_finegrained_fp8_without_triton,
 )
 
 fix_xformers_performance_issue()
@@ -178,6 +180,8 @@ patch_torchcodec_audio_decoder()
 disable_torchcodec_if_broken()
 disable_broken_wandb()
 patch_peft_weight_converter_compatibility()
+patch_sdpa_without_triton()
+patch_finegrained_fp8_without_triton()
 
 del fix_xformers_performance_issue
 del fix_vllm_aimv2_issue
@@ -200,6 +204,8 @@ del patch_torchcodec_audio_decoder
 del disable_torchcodec_if_broken
 del disable_broken_wandb
 del patch_peft_weight_converter_compatibility
+del patch_sdpa_without_triton
+del patch_finegrained_fp8_without_triton
 
 # Torch 2.4 has including_emulation
 if DEVICE_TYPE == "cuda":

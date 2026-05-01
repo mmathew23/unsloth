@@ -21,7 +21,11 @@ import math
 import cuda.tile as ct
 import torch
 
+# UNSLOTH_TILEGYM_DIFF_REVIEW: TileGym imports register_impl from
+# tilegym.backend and passes torch.cuda.current_stream() directly. Local code
+# uses Unsloth's backend adapter and CuTile stream-handle wrapper.
 from ._adapter import register_impl
+from ._stream import current_cuda_stream
 
 from .ct_ops import MAX_FUSED_SIZE
 from .ct_ops import calculate_settings
@@ -259,7 +263,7 @@ class _Fast_CrossEntropyLoss_CT(torch.autograd.Function):
         DO_SOFTCAPPING = bool(logit_softcapping != 0)
         DO_LOGIT_SCALING = bool(logit_scaling != 0)
 
-        stream = torch.cuda.current_stream()
+        stream = current_cuda_stream()
 
         if n_chunks == 1:
             # Small vocabs <= 65536 (Llama, Mistral)
@@ -337,7 +341,7 @@ class _Fast_CrossEntropyLoss_CT(torch.autograd.Function):
         # saved tensors (violates PyTorch autograd version tracking)
         grad_logits = torch.empty_like(logits)
 
-        stream = torch.cuda.current_stream()
+        stream = current_cuda_stream()
         ct.launch(
             stream,
             (n_rows, n_blocks, 1),

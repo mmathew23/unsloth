@@ -12,7 +12,7 @@ Full LayerNorm (with bias) CuTile kernels.
 
 CuTile kernels:
   - _layernorm_forward_ct_1d: 1D gather/scatter forward with autotune over occupancy.
-    Uses cuda.tile_experimental.autotune_launch to search occupancy=[1, 2, 4, 8].
+    Uses host-side occupancy selection; exhaustive tuning is opt-in.
     Low occupancy (occ=1, 102 regs) optimal for sparse grids (small n_rows);
     high occupancy (occ=4, 62 regs) optimal for dense grids (large n_rows).
     Both produce flat load_ptr_tko IR (matching NVT pattern), avoiding tensor_view/
@@ -22,16 +22,25 @@ CuTile kernels:
 """
 
 import cuda.tile as ct
-import cuda.tile_experimental as ct_experimental
 import torch
 
 from ._adapter import register_impl
+from ._stream import current_cuda_stream
 
 from .ct_ops import autotune_configs
+from .ct_ops import select_launch_config
 from .ct_ops import calculate_settings
 
 ConstInt = ct.Constant[int]
 ConstFloat = ct.Constant[float]
+
+# UNSLOTH_TILEGYM_DIFF_REVIEW: TileGym calls exhaustive_search directly for
+# layernorm launches. Local code routes through select_launch_config so the
+# default avoids per-shape tuning overhead; set
+# UNSLOTH_CUTILE_EXHAUSTIVE_TUNE=1 to review/profile TileGym's exhaustive path.
+# Module-level tune caches: (direction, n_rows, n_cols, dtype, TILE_N, device) -> tuned_kernel
+_layernorm_fwd_tune_cache: dict = {}
+_layernorm_bwd_tune_cache: dict = {}
 
 
 def _layernorm_forward_ct_1d_body(Y, X, W, b, r, mu, n_cols, eps, TILE_N):
@@ -99,10 +108,10 @@ def _layernorm_forward_ct_1d(
     eps: ConstFloat,
     TILE_N: ConstInt,
 ):
-    """1D LayerNorm forward with autotune over occupancy.
+    """1D LayerNorm forward with host-selected occupancy.
 
-    Bare @ct.kernel — occupancy is injected at runtime by autotune_launch via
-    hints_fn. Search space: occupancy=[1, 2, 4, 8].
+    Production defaults to one occupancy config to avoid per-shape tuning.
+    Exhaustive occupancy tuning is available through select_launch_config.
     Low occupancy (occ=1, 102 regs) optimal for sparse grids (small n_rows);
     high occupancy (occ=4, 62 regs) optimal for dense grids (large n_rows).
     """
@@ -118,9 +127,9 @@ def _layernorm_backward_ct_1d_body(dX, dY, X, W, r, mu, n_cols, TILE_N):
     Scalar loads for inv_var and mean via ct.gather().item() — no reshapes.
 
     IMPORTANT: dX and dY must be separate tensors (not aliased) because
-    autotune_launch runs the kernel multiple times to benchmark occupancy
-    configs. In-place (dX == dY) would corrupt dY on the first trial,
-    causing subsequent trials to read garbage and produce explosive outputs.
+    optional exhaustive tuning can run the kernel multiple times. In-place
+    (dX == dY) would corrupt dY on the first trial, causing subsequent trials
+    to read garbage and produce explosive outputs.
 
     Optimized formulation (avoids materializing normed vector):
       xhat = x - mean
@@ -181,10 +190,9 @@ def _layernorm_backward_ct_1d(
     n_cols: ConstInt,
     TILE_N: ConstInt,
 ):
-    """1D LayerNorm backward with autotune over occupancy.
+    """1D LayerNorm backward with host-selected occupancy.
 
-    Bare @ct.kernel — occupancy is injected at runtime by autotune_launch via
-    hints_fn. Search space: occupancy=[1, 2, 4, 8].
+    Production defaults to one occupancy config to avoid per-shape tuning.
     """
     _layernorm_backward_ct_1d_body(dX, dY, X, W, r, mu, n_cols, TILE_N)
 
@@ -194,6 +202,9 @@ class _Fast_Layernorm_CT(torch.autograd.Function):
     def forward(ctx, X, W, b, eps):
         shape = X.shape
         dim = shape[-1]
+        # UNSLOTH_TILEGYM_DIFF_REVIEW: TileGym uses view() here. reshape()
+        # preserves identical behavior for contiguous inputs and avoids errors
+        # if Unsloth passes a non-contiguous tensor.
         X = X.reshape(-1, dim)
         n_rows, n_cols = X.shape
         TILE_N = calculate_settings(n_cols)
@@ -202,14 +213,28 @@ class _Fast_Layernorm_CT(torch.autograd.Function):
         r = torch.empty(n_rows, dtype=torch.float32, device=X.device)
         mu = torch.empty(n_rows, dtype=torch.float32, device=X.device)
 
-        stream = torch.cuda.current_stream()
-        ct_experimental.autotune_launch(
+        stream = current_cuda_stream()
+        fwd_cache_key = (n_rows, n_cols, X.dtype, TILE_N, str(X.device))
+        if fwd_cache_key not in _layernorm_fwd_tune_cache:
+            result = select_launch_config(
+                list(autotune_configs()),
+                stream,
+                lambda cfg: (n_rows,),
+                _layernorm_forward_ct_1d,
+                lambda cfg: (Y, X, W, b, r, mu, n_cols, eps, TILE_N),
+                lambda cfg: {"occupancy": cfg.occupancy},
+            )
+            best_cfg = result.best.config
+            _layernorm_fwd_tune_cache[fwd_cache_key] = ct.kernel(
+                _layernorm_forward_ct_1d._pyfunc,
+                occupancy=best_cfg.occupancy,
+            )
+        tuned_fwd_kernel = _layernorm_fwd_tune_cache[fwd_cache_key]
+        ct.launch(
             stream,
-            grid_fn=lambda cfg: (n_rows,),
-            kernel=_layernorm_forward_ct_1d,
-            args_fn=lambda cfg: (Y, X, W, b, r, mu, n_cols, eps, TILE_N),
-            hints_fn=lambda cfg: {"occupancy": cfg.occupancy},
-            search_space=autotune_configs,
+            (n_rows,),
+            tuned_fwd_kernel,
+            (Y, X, W, b, r, mu, n_cols, eps, TILE_N),
         )
 
         ctx.eps = eps
@@ -221,25 +246,43 @@ class _Fast_Layernorm_CT(torch.autograd.Function):
     def backward(ctx, dY):
         shape = dY.shape
         dim = shape[-1]
+        # UNSLOTH_TILEGYM_DIFF_REVIEW: TileGym uses view() here; keep reshape()
+        # for the same non-contiguous safety rationale as the forward path.
         dY = dY.reshape(-1, dim)
         X, W, r, mu = ctx.saved_tensors
         n_rows, n_cols = dY.shape
 
-        # Separate output buffer — autotune_launch runs the kernel multiple
-        # times to benchmark occupancy configs, so in-place (dX == dY) would
+        # Separate output buffer — optional exhaustive tuning can run the kernel multiple
+        # times, so in-place (dX == dY) would
         # corrupt dY on the first trial and produce garbage on subsequent ones.
         dX = torch.empty_like(dY)
 
-        stream = torch.cuda.current_stream()
-        ct_experimental.autotune_launch(
+        stream = current_cuda_stream()
+        bwd_cache_key = (n_rows, n_cols, dY.dtype, ctx.TILE_N, str(dY.device))
+        if bwd_cache_key not in _layernorm_bwd_tune_cache:
+            result = select_launch_config(
+                list(autotune_configs()),
+                stream,
+                lambda cfg: (n_rows,),
+                _layernorm_backward_ct_1d,
+                lambda cfg: (dX, dY, X, W, r, mu, n_cols, ctx.TILE_N),
+                lambda cfg: {"occupancy": cfg.occupancy},
+            )
+            best_cfg = result.best.config
+            _layernorm_bwd_tune_cache[bwd_cache_key] = ct.kernel(
+                _layernorm_backward_ct_1d._pyfunc,
+                occupancy=best_cfg.occupancy,
+            )
+        tuned_bwd_kernel = _layernorm_bwd_tune_cache[bwd_cache_key]
+        ct.launch(
             stream,
-            grid_fn=lambda cfg: (n_rows,),
-            kernel=_layernorm_backward_ct_1d,
-            args_fn=lambda cfg: (dX, dY, X, W, r, mu, n_cols, ctx.TILE_N),
-            hints_fn=lambda cfg: {"occupancy": cfg.occupancy},
-            search_space=autotune_configs,
+            (n_rows,),
+            tuned_bwd_kernel,
+            (dX, dY, X, W, r, mu, n_cols, ctx.TILE_N),
         )
 
+        # UNSLOTH_TILEGYM_DIFF_REVIEW: TileGym returns view(*shape). reshape()
+        # is equivalent for contiguous dX and safer if layout assumptions change.
         return dX.reshape(*shape), None, None, None, None
 
 

@@ -21,7 +21,11 @@ import cuda.tile as ct
 import torch
 from cuda.tile._numeric_semantics import RoundingMode as RMd
 
+# UNSLOTH_TILEGYM_DIFF_REVIEW: TileGym imports register_impl from
+# tilegym.backend and passes torch.cuda.current_stream() directly. Local code
+# uses Unsloth's backend adapter and CuTile stream-handle wrapper.
 from ._adapter import register_impl
+from ._stream import current_cuda_stream
 
 from .ct_ops import autotune_configs
 from .ct_ops import next_power_of_2
@@ -359,7 +363,7 @@ def weight_dequant_block(x: torch.Tensor, s: torch.Tensor, block_size: int = 128
     grid_n = math.ceil(N / block_size)
 
     ct.launch(
-        torch.cuda.current_stream(),
+        current_cuda_stream(),
         (grid_m, grid_n, 1),
         weight_dequant_kernel_ct,
         (x, s, y, M, N, block_size),
@@ -377,7 +381,7 @@ def act_quant(x: torch.Tensor, block_size: int = 128) -> tuple[torch.Tensor, tor
 
     n_blocks = x.numel() // block_size
     ct.launch(
-        torch.cuda.current_stream(),
+        current_cuda_stream(),
         (n_blocks, 1, 1),
         act_quant_kernel_ct,
         (x.reshape(-1), y.reshape(-1), s.reshape(-1), block_size),
@@ -421,7 +425,7 @@ def w8a8_block_fp8_matmul_cutile(
     grid_n = math.ceil(N / block_n)
 
     ct.launch(
-        torch.cuda.current_stream(),
+        current_cuda_stream(),
         (grid_m * grid_n, 1, 1),
         w8a8_block_fp8_matmul_kernel_ct_tma,
         (

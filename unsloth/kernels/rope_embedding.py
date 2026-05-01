@@ -13,9 +13,10 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import sys
 import torch
 from ..device_type import DEVICE_COUNT
-from ._backend_registry import dispatch_kernel, register_kernel_backend
+from ._backend_registry import register_kernel_backend
 from ._optional_triton import HAS_TRITON, tl, triton
 from .utils import calculate_settings, torch_gpu_device, torch_device_stream
 
@@ -425,15 +426,37 @@ register_kernel_backend(
 
 _resolved_fast_rope_embedding = None
 _resolved_rope_embedding = None
+fast_rope_embedding_default = None
+rope_embedding_default = None
+
+
+def _make_fast_rope_embedding_default(impl):
+    @torch.compiler.disable
+    def _fast_rope_embedding_default(Q, K, cos, sin, rope_embedding_indices = None):
+        Q_out, K_out = impl(Q, K, cos, sin, rope_embedding_indices)
+        if DEVICE_COUNT > 1 and Q.device.type == "cuda":
+            torch_device_stream(Q.device).synchronize()
+        return Q_out, K_out
+    return _fast_rope_embedding_default
+
+
+def _patch_rope_embedding_hot_imports() -> None:
+    for name, module in tuple(sys.modules.items()):
+        if name.startswith("unsloth.models."):
+            if hasattr(module, "fast_rope_embedding"):
+                module.fast_rope_embedding = fast_rope_embedding_default
+            if hasattr(module, "rope_embedding"):
+                module.rope_embedding = rope_embedding_default
 
 
 def _rebind_rope_embedding_aliases(backend=None) -> None:
     """Hook fired by `_backend_registry` when the global backend changes
     or when a new backend impl is registered. Re-resolves `_resolved_*`
     aliases for this module from the registry. Falls back to `None` so
-    the entry point routes through `dispatch_kernel`, preserving today's
-    behavior for explicit `backend=` callers."""
+    the entry point calls eager directly. Backend selection happens via
+    registry state/rebinding, not per-call kwargs."""
     global _resolved_fast_rope_embedding, _resolved_rope_embedding
+    global fast_rope_embedding_default, rope_embedding_default
     try:
         from ._backend_registry import get_kernel_impl
         _resolved_fast_rope_embedding = get_kernel_impl("unsloth.rope_embedding_qk")
@@ -444,6 +467,16 @@ def _rebind_rope_embedding_aliases(backend=None) -> None:
         _resolved_rope_embedding = get_kernel_impl("unsloth.rope_embedding")
     except Exception:
         _resolved_rope_embedding = None
+    # NVIDIA_REVIEW: model hot paths receive direct backend symbols. The public
+    # functions below remain explicit-backend entry points but are not exported
+    # through `unsloth.kernels` for traced model execution.
+    fast_impl = _resolved_fast_rope_embedding or _fast_rope_embedding_eager
+    rope_impl = _resolved_rope_embedding or _rope_embedding_eager
+    fast_rope_embedding_default = _make_fast_rope_embedding_default(fast_impl)
+    rope_embedding_default = rope_impl
+    globals()["fast_rope_embedding"] = fast_rope_embedding_default
+    globals()["rope_embedding"] = rope_embedding_default
+    _patch_rope_embedding_hot_imports()
 
 
 # Initial bind.
@@ -466,44 +499,22 @@ def fast_rope_embedding(
     cos,
     sin,
     rope_embedding_indices = None,
-    *,
-    backend = None,
 ):
-    if backend is None and _resolved_fast_rope_embedding is not None:
-        Q_out, K_out = _resolved_fast_rope_embedding(Q, K, cos, sin, rope_embedding_indices)
-    else:
-        Q_out, K_out = dispatch_kernel(
-            "unsloth.rope_embedding_qk",
-            Q,
-            K,
-            cos,
-            sin,
-            rope_embedding_indices,
-            backend = backend,
-        )
-    if DEVICE_COUNT > 1 and Q.device.type == "cuda":
-        torch_device_stream(Q.device).synchronize()
-    return Q_out, K_out
+    return fast_rope_embedding_default(Q, K, cos, sin, rope_embedding_indices)
 
 
 @torch.compiler.disable
-def rope_embedding(Q, cos, sin, *, backend = None):
+def rope_embedding(Q, cos, sin):
     """Single-Q rotary position embedding through the pluggable backend.
 
     Q is ``(batch, seq_len, n_heads, head_dim)``. cos/sin are the rotary
     factors (any shape that broadcasts against Q's last two dims after
-    ``.squeeze()``). Falls back triton -> eager when the requested backend
-    is unavailable.
+    ``.squeeze()``). Backend selection is controlled through registry state.
     """
-    if backend is None and _resolved_rope_embedding is not None:
-        return _resolved_rope_embedding(Q, cos, sin)
-    return dispatch_kernel(
-        "unsloth.rope_embedding",
-        Q,
-        cos,
-        sin,
-        backend = backend,
-    )
+    return rope_embedding_default(Q, cos, sin)
+
+
+_rebind_rope_embedding_aliases()
 
 
 class Fast_RoPE_Embedding_QK(torch.autograd.Function):

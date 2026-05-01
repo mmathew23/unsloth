@@ -1,4 +1,5 @@
 import json
+import importlib
 import os
 import statistics
 import sys
@@ -18,25 +19,20 @@ os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 os.environ.setdefault("UNSLOTH_SKIP_MODEL_IMPORTS", "1")
 
 from unsloth.kernels import is_kernel_backend_available
-from unsloth.kernels._backend_registry import get_kernel_backend
-from unsloth.kernels.cross_entropy_loss import fast_cross_entropy_loss
-from unsloth.kernels.geglu import (
-    geglu_approx_backward_kernel,
-    geglu_approx_forward_kernel,
-    geglu_exact_backward_kernel,
-    geglu_exact_forward_kernel,
-)
-from unsloth.kernels.grouped_gemm import grouped_gemm
+from unsloth.kernels._backend_registry import get_kernel_backend, kernel_backend_context
+cross_entropy_module = importlib.import_module("unsloth.kernels.cross_entropy_loss")
+geglu_module = importlib.import_module("unsloth.kernels.geglu")
+grouped_gemm_module = importlib.import_module("unsloth.kernels.grouped_gemm")
+layernorm_module = importlib.import_module("unsloth.kernels.layernorm")
+rms_layernorm_module = importlib.import_module("unsloth.kernels.rms_layernorm")
+rope_embedding_module = importlib.import_module("unsloth.kernels.rope_embedding")
+swiglu_module = importlib.import_module("unsloth.kernels.swiglu")
 from unsloth.kernels.moe.grouped_gemm.kernels.tuning import (
     KernelConfigBackward_dW,
     KernelConfigBackward_dX,
     KernelConfigForward,
 )
-from unsloth.kernels.layernorm import fast_layernorm
 from unsloth.kernels.moe.grouped_gemm.reference.moe_ops import get_routing_indices
-from unsloth.kernels.rms_layernorm import fast_rms_layernorm
-from unsloth.kernels.rope_embedding import fast_rope_embedding
-from unsloth.kernels.swiglu import swiglu_DWf_DW_dfg_kernel, swiglu_fg_kernel
 
 
 CUDA_AVAILABLE = torch.cuda.is_available()
@@ -227,6 +223,108 @@ def _resolve_requested_backend(kernel_name: str, requested_backend: str, *, rope
     return get_kernel_backend(kernel_name, backend = requested_backend)
 
 
+def _call_kernel_with_backend(requested_backend: str, module, attr: str, *args, **kwargs):
+    with kernel_backend_context(global_backend = requested_backend):
+        return getattr(module, attr)(*args, **kwargs)
+
+
+def _fast_layernorm_for_backend(requested_backend: str, layernorm, X):
+    return _call_kernel_with_backend(
+        requested_backend,
+        layernorm_module,
+        "fast_layernorm",
+        layernorm,
+        X,
+    )
+
+
+def _fast_rms_layernorm_for_backend(requested_backend: str, layernorm, X, *, gemma: bool = False):
+    return _call_kernel_with_backend(
+        requested_backend,
+        rms_layernorm_module,
+        "fast_rms_layernorm",
+        layernorm,
+        X,
+        gemma = gemma,
+    )
+
+
+def _swiglu_fg_for_backend(requested_backend: str, e, g):
+    return _call_kernel_with_backend(
+        requested_backend,
+        swiglu_module,
+        "swiglu_fg_kernel",
+        e,
+        g,
+    )
+
+
+def _swiglu_backward_for_backend(requested_backend: str, DW, e, g):
+    return _call_kernel_with_backend(
+        requested_backend,
+        swiglu_module,
+        "swiglu_DWf_DW_dfg_kernel",
+        DW,
+        e,
+        g,
+    )
+
+
+def _geglu_forward_for_backend(requested_backend: str, kind: str, gate, up):
+    return _call_kernel_with_backend(
+        requested_backend,
+        geglu_module,
+        f"geglu_{kind}_forward_kernel",
+        gate,
+        up,
+    )
+
+
+def _geglu_backward_for_backend(requested_backend: str, kind: str, DW, e, g):
+    return _call_kernel_with_backend(
+        requested_backend,
+        geglu_module,
+        f"geglu_{kind}_backward_kernel",
+        DW,
+        e,
+        g,
+    )
+
+
+def _cross_entropy_for_backend(requested_backend: str, logits, labels, **kwargs):
+    return _call_kernel_with_backend(
+        requested_backend,
+        cross_entropy_module,
+        "fast_cross_entropy_loss",
+        logits,
+        labels,
+        **kwargs,
+    )
+
+
+def _grouped_gemm_for_backend(requested_backend: str, *args, **kwargs):
+    return _call_kernel_with_backend(
+        requested_backend,
+        grouped_gemm_module,
+        "grouped_gemm",
+        *args,
+        **kwargs,
+    )
+
+
+def _rope_for_backend(requested_backend: str, Q, K, cos, sin, **kwargs):
+    return _call_kernel_with_backend(
+        requested_backend,
+        rope_embedding_module,
+        "fast_rope_embedding",
+        Q,
+        K,
+        cos,
+        sin,
+        **kwargs,
+    )
+
+
 def _cuda_runtime_metadata():
     if not CUDA_AVAILABLE:
         return {
@@ -271,7 +369,7 @@ def test_layernorm_backend_numerics_hard_case():
     grad_out = torch.randn_like(X_base)
 
     ref_x = _clone_for_backend(X_base, requires_grad = True)
-    ref_out = fast_layernorm(layernorm, ref_x, backend = "eager")
+    ref_out = _fast_layernorm_for_backend("eager", layernorm, ref_x)
     ref_out.backward(grad_out)
     ref_grad = ref_x.grad.detach().clone()
     ref_out = ref_out.detach().clone()
@@ -280,7 +378,7 @@ def test_layernorm_backend_numerics_hard_case():
         if backend == "eager":
             continue
         X = _clone_for_backend(X_base, requires_grad = True)
-        out = fast_layernorm(layernorm, X, backend = backend)
+        out = _fast_layernorm_for_backend(backend, layernorm, X)
         out.backward(grad_out)
         _assert_close(f"layernorm output [{backend}]", out, ref_out)
         _assert_close(f"layernorm grad [{backend}]", X.grad, ref_grad)
@@ -299,7 +397,7 @@ def test_layernorm_supported_dtypes(dtype: torch.dtype):
     grad_out = torch.randn_like(x_base)
 
     ref_x = _clone_for_backend(x_base, requires_grad = True)
-    ref_out = fast_layernorm(layernorm, ref_x, backend = "eager")
+    ref_out = _fast_layernorm_for_backend("eager", layernorm, ref_x)
     ref_out.backward(_clone_grad(grad_out))
     ref_grad = ref_x.grad.detach().clone()
     ref_out = ref_out.detach().clone()
@@ -308,7 +406,7 @@ def test_layernorm_supported_dtypes(dtype: torch.dtype):
         if backend == "eager":
             continue
         x = _clone_for_backend(x_base, requires_grad = True)
-        out = fast_layernorm(layernorm, x, backend = backend)
+        out = _fast_layernorm_for_backend(backend, layernorm, x)
         out.backward(_clone_grad(grad_out))
         _assert_close(f"layernorm dtype={dtype} output [{backend}]", out, ref_out)
         _assert_close(f"layernorm dtype={dtype} grad [{backend}]", x.grad, ref_grad)
@@ -328,7 +426,7 @@ def test_rmsnorm_backend_numerics_hard_case(gemma: bool):
     grad_out = torch.randn_like(X_base)
 
     ref_x = _clone_for_backend(X_base, requires_grad = True)
-    ref_out = fast_rms_layernorm(layernorm, ref_x, gemma = gemma, backend = "eager")
+    ref_out = _fast_rms_layernorm_for_backend("eager", layernorm, ref_x, gemma = gemma)
     ref_out.backward(grad_out)
     ref_grad = ref_x.grad.detach().clone()
     ref_out = ref_out.detach().clone()
@@ -337,7 +435,7 @@ def test_rmsnorm_backend_numerics_hard_case(gemma: bool):
         if backend == "eager":
             continue
         X = _clone_for_backend(X_base, requires_grad = True)
-        out = fast_rms_layernorm(layernorm, X, gemma = gemma, backend = backend)
+        out = _fast_rms_layernorm_for_backend(backend, layernorm, X, gemma = gemma)
         out.backward(grad_out)
         _assert_close(f"rmsnorm output [{backend}, gemma={gemma}]", out, ref_out)
         _assert_close(f"rmsnorm grad [{backend}, gemma={gemma}]", X.grad, ref_grad)
@@ -358,7 +456,7 @@ def test_rmsnorm_supported_dtypes(dtype: torch.dtype, gemma: bool):
     grad_out = torch.randn_like(x_base)
 
     ref_x = _clone_for_backend(x_base, requires_grad = True)
-    ref_out = fast_rms_layernorm(layernorm, ref_x, gemma = gemma, backend = "eager")
+    ref_out = _fast_rms_layernorm_for_backend("eager", layernorm, ref_x, gemma = gemma)
     ref_out.backward(_clone_grad(grad_out))
     ref_grad = ref_x.grad.detach().clone()
     ref_out = ref_out.detach().clone()
@@ -367,7 +465,7 @@ def test_rmsnorm_supported_dtypes(dtype: torch.dtype, gemma: bool):
         if backend == "eager":
             continue
         x = _clone_for_backend(x_base, requires_grad = True)
-        out = fast_rms_layernorm(layernorm, x, gemma = gemma, backend = backend)
+        out = _fast_rms_layernorm_for_backend(backend, layernorm, x, gemma = gemma)
         out.backward(_clone_grad(grad_out))
         _assert_close(f"rmsnorm dtype={dtype} gemma={gemma} output [{backend}]", out, ref_out)
         _assert_close(f"rmsnorm dtype={dtype} gemma={gemma} grad [{backend}]", x.grad, ref_grad)
@@ -381,30 +479,30 @@ def test_swiglu_backend_numerics_hard_case():
     e_base = torch.randn(3, 11, 96, device = CUDA_DEVICE, dtype = torch.bfloat16)
     g_base = torch.randn(3, 11, 96, device = CUDA_DEVICE, dtype = torch.bfloat16)
 
-    ref_out = swiglu_fg_kernel(e_base, g_base, backend = "eager")
+    ref_out = _swiglu_fg_for_backend("eager", e_base, g_base)
     for backend in AVAILABLE_BACKENDS:
         if backend == "eager":
             continue
-        out = swiglu_fg_kernel(e_base, g_base, backend = backend)
+        out = _swiglu_fg_for_backend(backend, e_base, g_base)
         _assert_close(f"swiglu forward [{backend}]", out, ref_out)
 
     DW_base = torch.randn(33, 96, device = CUDA_DEVICE, dtype = torch.bfloat16)
     e2_base = torch.randn(33, 96, device = CUDA_DEVICE, dtype = torch.bfloat16)
     g2_base = torch.randn(33, 96, device = CUDA_DEVICE, dtype = torch.bfloat16)
-    ref_h, ref_df, ref_de = swiglu_DWf_DW_dfg_kernel(
+    ref_h, ref_df, ref_de = _swiglu_backward_for_backend(
+        "eager",
         _clone_for_backend(DW_base),
         _clone_for_backend(e2_base),
         _clone_for_backend(g2_base),
-        backend = "eager",
     )
     for backend in AVAILABLE_BACKENDS:
         if backend == "eager":
             continue
-        h, df, de = swiglu_DWf_DW_dfg_kernel(
+        h, df, de = _swiglu_backward_for_backend(
+            backend,
             _clone_for_backend(DW_base),
             _clone_for_backend(e2_base),
             _clone_for_backend(g2_base),
-            backend = backend,
         )
         _assert_close(f"swiglu backward h [{backend}]", h, ref_h)
         _assert_close(f"swiglu backward df [{backend}]", df, ref_df)
@@ -419,30 +517,30 @@ def test_swiglu_supported_dtypes(dtype: torch.dtype):
 
     e_base = torch.randn(2, 9, 64, device = CUDA_DEVICE, dtype = dtype)
     g_base = torch.randn(2, 9, 64, device = CUDA_DEVICE, dtype = dtype)
-    ref_out = swiglu_fg_kernel(e_base, g_base, backend = "eager")
+    ref_out = _swiglu_fg_for_backend("eager", e_base, g_base)
     for backend in AVAILABLE_BACKENDS:
         if backend == "eager":
             continue
-        out = swiglu_fg_kernel(e_base, g_base, backend = backend)
+        out = _swiglu_fg_for_backend(backend, e_base, g_base)
         _assert_close(f"swiglu dtype={dtype} forward [{backend}]", out, ref_out)
 
     dw_base = torch.randn(18, 64, device = CUDA_DEVICE, dtype = dtype)
     e2_base = torch.randn(18, 64, device = CUDA_DEVICE, dtype = dtype)
     g2_base = torch.randn(18, 64, device = CUDA_DEVICE, dtype = dtype)
-    ref_h, ref_df, ref_de = swiglu_DWf_DW_dfg_kernel(
+    ref_h, ref_df, ref_de = _swiglu_backward_for_backend(
+        "eager",
         _clone_for_backend(dw_base),
         _clone_for_backend(e2_base),
         _clone_for_backend(g2_base),
-        backend = "eager",
     )
     for backend in AVAILABLE_BACKENDS:
         if backend == "eager":
             continue
-        h, df, de = swiglu_DWf_DW_dfg_kernel(
+        h, df, de = _swiglu_backward_for_backend(
+            backend,
             _clone_for_backend(dw_base),
             _clone_for_backend(e2_base),
             _clone_for_backend(g2_base),
-            backend = backend,
         )
         _assert_close(f"swiglu dtype={dtype} backward h [{backend}]", h, ref_h)
         _assert_close(f"swiglu dtype={dtype} backward df [{backend}]", df, ref_df)
@@ -451,42 +549,44 @@ def test_swiglu_supported_dtypes(dtype: torch.dtype):
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason = "CUDA backend comparison requires CUDA.")
 @pytest.mark.parametrize(
-    "forward_fn,backward_fn,name",
+    "name",
     [
-        (geglu_exact_forward_kernel, geglu_exact_backward_kernel, "exact"),
-        (geglu_approx_forward_kernel, geglu_approx_backward_kernel, "approx"),
+        "exact",
+        "approx",
     ],
 )
-def test_geglu_backend_numerics_hard_case(forward_fn, backward_fn, name: str):
+def test_geglu_backend_numerics_hard_case(name: str):
     _require_multiple_backends()
     _set_seed()
 
     gate = torch.randn(3, 13, 80, device = CUDA_DEVICE, dtype = torch.bfloat16)
     up = torch.randn(3, 13, 80, device = CUDA_DEVICE, dtype = torch.bfloat16)
-    ref_out = forward_fn(gate, up, backend = "eager")
+    ref_out = _geglu_forward_for_backend("eager", name, gate, up)
     for backend in AVAILABLE_BACKENDS:
         if backend == "eager":
             continue
-        out = forward_fn(gate, up, backend = backend)
+        out = _geglu_forward_for_backend(backend, name, gate, up)
         _assert_close(f"geglu {name} forward [{backend}]", out, ref_out)
 
     DW = torch.randn(39, 80, device = CUDA_DEVICE, dtype = torch.bfloat16)
     e = torch.randn(39, 80, device = CUDA_DEVICE, dtype = torch.bfloat16)
     g = torch.randn(39, 80, device = CUDA_DEVICE, dtype = torch.bfloat16)
-    ref_h, ref_df, ref_de = backward_fn(
+    ref_h, ref_df, ref_de = _geglu_backward_for_backend(
+        "eager",
+        name,
         _clone_for_backend(DW),
         _clone_for_backend(e),
         _clone_for_backend(g),
-        backend = "eager",
     )
     for backend in AVAILABLE_BACKENDS:
         if backend == "eager":
             continue
-        h, df, de = backward_fn(
+        h, df, de = _geglu_backward_for_backend(
+            backend,
+            name,
             _clone_for_backend(DW),
             _clone_for_backend(e),
             _clone_for_backend(g),
-            backend = backend,
         )
         _assert_close(f"geglu {name} backward h [{backend}]", h, ref_h)
         _assert_close(f"geglu {name} backward df [{backend}]", df, ref_df)
@@ -496,42 +596,44 @@ def test_geglu_backend_numerics_hard_case(forward_fn, backward_fn, name: str):
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason = "CUDA backend comparison requires CUDA.")
 @pytest.mark.parametrize("dtype", LOW_PRECISION_DTYPES)
 @pytest.mark.parametrize(
-    "forward_fn,backward_fn,name",
+    "name",
     [
-        (geglu_exact_forward_kernel, geglu_exact_backward_kernel, "exact"),
-        (geglu_approx_forward_kernel, geglu_approx_backward_kernel, "approx"),
+        "exact",
+        "approx",
     ],
 )
-def test_geglu_supported_dtypes(dtype: torch.dtype, forward_fn, backward_fn, name: str):
+def test_geglu_supported_dtypes(dtype: torch.dtype, name: str):
     _require_multiple_backends()
     _set_seed()
 
     gate = torch.randn(2, 7, 64, device = CUDA_DEVICE, dtype = dtype)
     up = torch.randn(2, 7, 64, device = CUDA_DEVICE, dtype = dtype)
-    ref_out = forward_fn(gate, up, backend = "eager")
+    ref_out = _geglu_forward_for_backend("eager", name, gate, up)
     for backend in AVAILABLE_BACKENDS:
         if backend == "eager":
             continue
-        out = forward_fn(gate, up, backend = backend)
+        out = _geglu_forward_for_backend(backend, name, gate, up)
         _assert_close(f"geglu {name} dtype={dtype} forward [{backend}]", out, ref_out)
 
     dw = torch.randn(14, 64, device = CUDA_DEVICE, dtype = dtype)
     e = torch.randn(14, 64, device = CUDA_DEVICE, dtype = dtype)
     g = torch.randn(14, 64, device = CUDA_DEVICE, dtype = dtype)
-    ref_h, ref_df, ref_de = backward_fn(
+    ref_h, ref_df, ref_de = _geglu_backward_for_backend(
+        "eager",
+        name,
         _clone_for_backend(dw),
         _clone_for_backend(e),
         _clone_for_backend(g),
-        backend = "eager",
     )
     for backend in AVAILABLE_BACKENDS:
         if backend == "eager":
             continue
-        h, df, de = backward_fn(
+        h, df, de = _geglu_backward_for_backend(
+            backend,
+            name,
             _clone_for_backend(dw),
             _clone_for_backend(e),
             _clone_for_backend(g),
-            backend = backend,
         )
         _assert_close(f"geglu {name} dtype={dtype} backward h [{backend}]", h, ref_h)
         _assert_close(f"geglu {name} dtype={dtype} backward df [{backend}]", df, ref_df)
@@ -563,12 +665,12 @@ def test_cross_entropy_backend_numerics_hard_cases(batch, seq_len, vocab_size, s
         labels.view(-1)[-1] = -100
 
     ref_logits = _clone_for_backend(logits_base, requires_grad = True)
-    ref_loss = fast_cross_entropy_loss(
+    ref_loss = _cross_entropy_for_backend(
+        "eager",
         ref_logits,
         labels,
         logit_softcapping = softcap,
         logit_scaling = scale,
-        backend = "eager",
     )
     ref_loss.backward()
     ref_grad = ref_logits.grad.detach().clone()
@@ -582,12 +684,12 @@ def test_cross_entropy_backend_numerics_hard_cases(batch, seq_len, vocab_size, s
         if backend == "eager":
             continue
         logits = _clone_for_backend(logits_base, requires_grad = True)
-        loss = fast_cross_entropy_loss(
+        loss = _cross_entropy_for_backend(
+            backend,
             logits,
             labels,
             logit_softcapping = softcap,
             logit_scaling = scale,
-            backend = backend,
         )
         loss.backward()
         _assert_close(
@@ -612,7 +714,7 @@ def test_cross_entropy_supported_dtypes(dtype: torch.dtype):
     labels[1, -1] = -100
 
     ref_logits = _clone_for_backend(logits_base, requires_grad = True)
-    ref_loss = fast_cross_entropy_loss(ref_logits, labels, backend = "eager")
+    ref_loss = _cross_entropy_for_backend("eager", ref_logits, labels)
     ref_loss.backward()
     ref_grad = ref_logits.grad.detach().clone()
     ref_loss = ref_loss.detach().clone()
@@ -621,7 +723,7 @@ def test_cross_entropy_supported_dtypes(dtype: torch.dtype):
         if backend == "eager":
             continue
         logits = _clone_for_backend(logits_base, requires_grad = True)
-        loss = fast_cross_entropy_loss(logits, labels, backend = backend)
+        loss = _cross_entropy_for_backend(backend, logits, labels)
         loss.backward()
         _assert_close(f"cross entropy dtype={dtype} loss [{backend}]", loss, ref_loss)
         _assert_close(f"cross entropy dtype={dtype} grad [{backend}]", logits.grad, ref_grad)
@@ -654,7 +756,8 @@ def test_grouped_gemm_backend_numerics(dtype: torch.dtype):
     ref_x = _clone_for_backend(x_base, requires_grad = True)
     ref_w_up = _clone_for_backend(w_up_base, requires_grad = True)
     ref_w_down = _clone_for_backend(w_down_base, requires_grad = True)
-    ref_up = grouped_gemm(
+    ref_up = _grouped_gemm_for_backend(
+        "eager",
         ref_x,
         ref_w_up,
         m_sizes,
@@ -665,10 +768,10 @@ def test_grouped_gemm_backend_numerics(dtype: torch.dtype):
         kernel_config_bwd_dX = first_gemm_bwd_dx,
         kernel_config_bwd_dW = first_gemm_bwd_dw,
         autotune = False,
-        backend = "eager",
     )
     ref_mid = torch.nn.functional.silu(ref_up)
-    ref_out = grouped_gemm(
+    ref_out = _grouped_gemm_for_backend(
+        "eager",
         ref_mid,
         ref_w_down,
         m_sizes,
@@ -680,7 +783,6 @@ def test_grouped_gemm_backend_numerics(dtype: torch.dtype):
         kernel_config_bwd_dW = second_gemm_bwd_dw,
         autotune = False,
         is_first_gemm = False,
-        backend = "eager",
     )
     ref_loss = ref_out.float().square().mean()
     ref_loss.backward()
@@ -695,7 +797,8 @@ def test_grouped_gemm_backend_numerics(dtype: torch.dtype):
         x = _clone_for_backend(x_base, requires_grad = True)
         w_up = _clone_for_backend(w_up_base, requires_grad = True)
         w_down = _clone_for_backend(w_down_base, requires_grad = True)
-        up = grouped_gemm(
+        up = _grouped_gemm_for_backend(
+            backend,
             x,
             w_up,
             m_sizes,
@@ -706,10 +809,10 @@ def test_grouped_gemm_backend_numerics(dtype: torch.dtype):
             kernel_config_bwd_dX = first_gemm_bwd_dx,
             kernel_config_bwd_dW = first_gemm_bwd_dw,
             autotune = False,
-            backend = backend,
         )
         mid = torch.nn.functional.silu(up)
-        out = grouped_gemm(
+        out = _grouped_gemm_for_backend(
+            backend,
             mid,
             w_down,
             m_sizes,
@@ -721,7 +824,6 @@ def test_grouped_gemm_backend_numerics(dtype: torch.dtype):
             kernel_config_bwd_dW = second_gemm_bwd_dw,
             autotune = False,
             is_first_gemm = False,
-            backend = backend,
         )
         loss = out.float().square().mean()
         loss.backward()
@@ -762,7 +864,8 @@ def test_grouped_gemm_triton_small_glm4_dims():
     ref_x = _clone_for_backend(x_base, requires_grad = True)
     ref_w_up = _clone_for_backend(w_up_base, requires_grad = True)
     ref_w_down = _clone_for_backend(w_down_base, requires_grad = True)
-    ref_up = grouped_gemm(
+    ref_up = _grouped_gemm_for_backend(
+        "eager",
         ref_x,
         ref_w_up,
         m_sizes,
@@ -770,11 +873,11 @@ def test_grouped_gemm_triton_small_glm4_dims():
         gather_indices = gather_indices,
         permute_x = True,
         autotune = True,
-        backend = "eager",
     )
     ref_gate, ref_up_proj = ref_up.chunk(2, dim = -1)
     ref_mid = torch.nn.functional.silu(ref_gate) * ref_up_proj
-    ref_out = grouped_gemm(
+    ref_out = _grouped_gemm_for_backend(
+        "eager",
         ref_mid,
         ref_w_down,
         m_sizes,
@@ -783,7 +886,6 @@ def test_grouped_gemm_triton_small_glm4_dims():
         permute_y = True,
         autotune = True,
         is_first_gemm = False,
-        backend = "eager",
     )
     ref_loss = ref_out.float().square().mean()
     ref_loss.backward()
@@ -791,7 +893,8 @@ def test_grouped_gemm_triton_small_glm4_dims():
     tri_x = _clone_for_backend(x_base, requires_grad = True)
     tri_w_up = _clone_for_backend(w_up_base, requires_grad = True)
     tri_w_down = _clone_for_backend(w_down_base, requires_grad = True)
-    tri_up = grouped_gemm(
+    tri_up = _grouped_gemm_for_backend(
+        "triton",
         tri_x,
         tri_w_up,
         m_sizes,
@@ -799,11 +902,11 @@ def test_grouped_gemm_triton_small_glm4_dims():
         gather_indices = gather_indices,
         permute_x = True,
         autotune = True,
-        backend = "triton",
     )
     tri_gate, tri_up_proj = tri_up.chunk(2, dim = -1)
     tri_mid = torch.nn.functional.silu(tri_gate) * tri_up_proj
-    tri_out = grouped_gemm(
+    tri_out = _grouped_gemm_for_backend(
+        "triton",
         tri_mid,
         tri_w_down,
         m_sizes,
@@ -812,7 +915,6 @@ def test_grouped_gemm_triton_small_glm4_dims():
         permute_y = True,
         autotune = True,
         is_first_gemm = False,
-        backend = "triton",
     )
     tri_loss = tri_out.float().square().mean()
     tri_loss.backward()
@@ -841,12 +943,12 @@ def test_rope_backend_numerics_hard_case():
 
     ref_q = _clone_for_backend(q_base, requires_grad = True)
     ref_k = _clone_for_backend(k_base, requires_grad = True)
-    ref_q_out, ref_k_out = fast_rope_embedding(
+    ref_q_out, ref_k_out = _rope_for_backend(
+        "eager",
         ref_q,
         ref_k,
         cos,
         sin,
-        backend = "eager",
     )
     torch.autograd.backward((ref_q_out, ref_k_out), (_clone_grad(grad_q), _clone_grad(grad_k)))
     ref_q_grad = ref_q.grad.detach().clone()
@@ -859,12 +961,12 @@ def test_rope_backend_numerics_hard_case():
             continue
         q = _clone_for_backend(q_base, requires_grad = True)
         k = _clone_for_backend(k_base, requires_grad = True)
-        q_out, k_out = fast_rope_embedding(
+        q_out, k_out = _rope_for_backend(
+            backend,
             q,
             k,
             cos,
             sin,
-            backend = backend,
         )
         torch.autograd.backward((q_out, k_out), (_clone_grad(grad_q), _clone_grad(grad_k)))
         _assert_close(f"rope q output [{backend}]", q_out, ref_q_out)
@@ -888,7 +990,7 @@ def test_rope_supported_dtypes(dtype: torch.dtype):
 
     ref_q = _clone_for_backend(q_base, requires_grad = True)
     ref_k = _clone_for_backend(k_base, requires_grad = True)
-    ref_q_out, ref_k_out = fast_rope_embedding(ref_q, ref_k, cos, sin, backend = "eager")
+    ref_q_out, ref_k_out = _rope_for_backend("eager", ref_q, ref_k, cos, sin)
     torch.autograd.backward((ref_q_out, ref_k_out), (_clone_grad(grad_q), _clone_grad(grad_k)))
     ref_q_grad = ref_q.grad.detach().clone()
     ref_k_grad = ref_k.grad.detach().clone()
@@ -900,7 +1002,7 @@ def test_rope_supported_dtypes(dtype: torch.dtype):
             continue
         q = _clone_for_backend(q_base, requires_grad = True)
         k = _clone_for_backend(k_base, requires_grad = True)
-        q_out, k_out = fast_rope_embedding(q, k, cos, sin, backend = backend)
+        q_out, k_out = _rope_for_backend(backend, q, k, cos, sin)
         torch.autograd.backward((q_out, k_out), (_clone_grad(grad_q), _clone_grad(grad_k)))
         _assert_close(f"rope dtype={dtype} q output [{backend}]", q_out, ref_q_out)
         _assert_close(f"rope dtype={dtype} k output [{backend}]", k_out, ref_k_out)
@@ -938,7 +1040,7 @@ def test_rope_nonstandard_cos_stride_hard_case(dtype: torch.dtype):
             continue
         q = _clone_for_backend(q_base, requires_grad = True)
         k = _clone_for_backend(k_base, requires_grad = True)
-        q_out, k_out = fast_rope_embedding(q, k, cos_full, sin_full, backend = backend)
+        q_out, k_out = _rope_for_backend(backend, q, k, cos_full, sin_full)
         torch.autograd.backward((q_out, k_out), (_clone_grad(grad_q), _clone_grad(grad_k)))
         _assert_close(f"rope nonstandard cos stride q output [{backend}, dtype={dtype}]", q_out, ref_q_out)
         _assert_close(f"rope nonstandard cos stride k output [{backend}, dtype={dtype}]", k_out, ref_k_out)
@@ -975,7 +1077,7 @@ def test_rope_non_power_of_2_head_dim_hard_case(dtype: torch.dtype, head_dim: in
             continue
         q = _clone_for_backend(q_base, requires_grad = True)
         k = _clone_for_backend(k_base, requires_grad = True)
-        q_out, k_out = fast_rope_embedding(q, k, cos, sin, backend = backend)
+        q_out, k_out = _rope_for_backend(backend, q, k, cos, sin)
         torch.autograd.backward((q_out, k_out), (_clone_grad(grad_q), _clone_grad(grad_k)))
         _assert_close(f"rope non-power2 q output [{backend}, dtype={dtype}, head_dim={head_dim}]", q_out, ref_q_out)
         _assert_close(f"rope non-power2 k output [{backend}, dtype={dtype}, head_dim={head_dim}]", k_out, ref_k_out)
@@ -998,13 +1100,13 @@ def test_rope_backend_indices_correctness_hard_case():
 
     ref_q = _clone_for_backend(q_base, requires_grad = True)
     ref_k = _clone_for_backend(k_base, requires_grad = True)
-    ref_q_out, ref_k_out = fast_rope_embedding(
+    ref_q_out, ref_k_out = _rope_for_backend(
+        "eager",
         ref_q,
         ref_k,
         cos,
         sin,
         rope_embedding_indices = rope_indices,
-        backend = "eager",
     )
     torch.autograd.backward((ref_q_out, ref_k_out), (_clone_grad(grad_q), _clone_grad(grad_k)))
     ref_q_grad = ref_q.grad.detach().clone()
@@ -1017,13 +1119,13 @@ def test_rope_backend_indices_correctness_hard_case():
             continue
         q = _clone_for_backend(q_base, requires_grad = True)
         k = _clone_for_backend(k_base, requires_grad = True)
-        q_out, k_out = fast_rope_embedding(
+        q_out, k_out = _rope_for_backend(
+            backend,
             q,
             k,
             cos,
             sin,
             rope_embedding_indices = rope_indices,
-            backend = backend,
         )
         torch.autograd.backward((q_out, k_out), (_clone_grad(grad_q), _clone_grad(grad_k)))
         _assert_close(f"rope indices q output [{backend}]", q_out, ref_q_out)
@@ -1044,7 +1146,7 @@ def test_backend_performance_smoke_and_report():
     def layernorm_closure(backend):
         def _run():
             x = x_base.detach().clone()
-            out = fast_layernorm(layernorm, x, backend = backend)
+            out = _fast_layernorm_for_backend(backend, layernorm, x)
             torch.cuda.synchronize()
             return out
 
@@ -1057,12 +1159,12 @@ def test_backend_performance_smoke_and_report():
     def cross_entropy_closure(backend):
         def _run():
             logits = logits_base.detach().clone().requires_grad_(True)
-            loss = fast_cross_entropy_loss(
+            loss = _cross_entropy_for_backend(
+                backend,
                 logits,
                 labels,
                 logit_softcapping = 3.0,
                 logit_scaling = 1.15,
-                backend = backend,
             )
             loss.backward()
             torch.cuda.synchronize()
@@ -1078,12 +1180,12 @@ def test_backend_performance_smoke_and_report():
         def _run():
             q = q_base.detach().clone().requires_grad_(True)
             k = k_base.detach().clone().requires_grad_(True)
-            q_out, k_out = fast_rope_embedding(
+            q_out, k_out = _rope_for_backend(
+                backend,
                 q,
                 k,
                 cos,
                 sin,
-                backend = backend,
             )
             (q_out.float().sum() + k_out.float().sum()).backward()
             torch.cuda.synchronize()
@@ -1158,13 +1260,13 @@ def test_backend_performance_stress_and_numerics_report():
 
         def run_layernorm(backend):
             x = _clone_for_backend(x_base, requires_grad = True)
-            out = fast_layernorm(layernorm, x, backend = backend)
+            out = _fast_layernorm_for_backend(backend, layernorm, x)
             out.backward(_clone_grad(grad_out))
             return out.detach().clone(), x.grad.detach().clone()
 
         ref_out, ref_grad = run_layernorm("eager")
         eager_metrics = _benchmark_cuda_detailed(
-            lambda: fast_layernorm(layernorm, x_base.detach().clone(), backend = "eager"),
+            lambda: _fast_layernorm_for_backend("eager", layernorm, x_base.detach().clone()),
             warmup = STRESS_WARMUP,
             iters = STRESS_ITERS,
         )
@@ -1201,7 +1303,7 @@ def test_backend_performance_stress_and_numerics_report():
             grad_error = _max_abs_rel(grad, ref_grad)
             effective_backend = _resolve_requested_backend("unsloth.layernorm", backend)
             metrics = _benchmark_cuda_detailed(
-                lambda backend = backend: fast_layernorm(layernorm, x_base.detach().clone(), backend = backend),
+                lambda backend = backend: _fast_layernorm_for_backend(backend, layernorm, x_base.detach().clone()),
                 warmup = STRESS_WARMUP,
                 iters = STRESS_ITERS,
             )
@@ -1261,24 +1363,24 @@ def test_backend_performance_stress_and_numerics_report():
 
         def run_cross_entropy(backend):
             logits = _clone_for_backend(logits_base, requires_grad = True)
-            loss = fast_cross_entropy_loss(
+            loss = _cross_entropy_for_backend(
+                backend,
                 logits,
                 labels,
                 logit_softcapping = case["softcap"],
                 logit_scaling = case["scale"],
-                backend = backend,
             )
             loss.backward()
             return loss.detach().clone(), logits.grad.detach().clone()
 
         ref_loss, ref_grad = run_cross_entropy("eager")
         eager_metrics = _benchmark_cuda_detailed(
-            lambda: fast_cross_entropy_loss(
+            lambda: _cross_entropy_for_backend(
+                "eager",
                 logits_base.detach().clone().requires_grad_(True),
                 labels,
                 logit_softcapping = case["softcap"],
                 logit_scaling = case["scale"],
-                backend = "eager",
             ).backward(),
             warmup = STRESS_WARMUP,
             iters = STRESS_ITERS,
@@ -1326,12 +1428,12 @@ def test_backend_performance_stress_and_numerics_report():
             grad_error = _max_abs_rel(grad, ref_grad)
             effective_backend = _resolve_requested_backend("unsloth.cross_entropy_loss", backend)
             metrics = _benchmark_cuda_detailed(
-                lambda backend = backend: fast_cross_entropy_loss(
+                lambda backend = backend: _cross_entropy_for_backend(
+                    backend,
                     logits_base.detach().clone().requires_grad_(True),
                     labels,
                     logit_softcapping = case["softcap"],
                     logit_scaling = case["scale"],
-                    backend = backend,
                 ).backward(),
                 warmup = STRESS_WARMUP,
                 iters = STRESS_ITERS,
@@ -1426,13 +1528,13 @@ def test_backend_performance_stress_and_numerics_report():
         def run_rope(backend):
             q = _clone_for_backend(q_base, requires_grad = True)
             k = _clone_for_backend(k_base, requires_grad = True)
-            q_out, k_out = fast_rope_embedding(
+            q_out, k_out = _rope_for_backend(
+                backend,
                 q,
                 k,
                 cos,
                 sin,
                 rope_embedding_indices = rope_indices,
-                backend = backend,
             )
             torch.autograd.backward((q_out, k_out), (_clone_grad(grad_q), _clone_grad(grad_k)))
             return q_out.detach().clone(), k_out.detach().clone(), q.grad.detach().clone(), k.grad.detach().clone()
@@ -1441,13 +1543,13 @@ def test_backend_performance_stress_and_numerics_report():
         eager_metrics = _benchmark_cuda_detailed(
             lambda: (
                 lambda q, k: torch.autograd.backward(
-                    fast_rope_embedding(
+                    _rope_for_backend(
+                        "eager",
                         q,
                         k,
                         cos,
                         sin,
                         rope_embedding_indices = rope_indices,
-                        backend = "eager",
                     ),
                     (_clone_grad(grad_q), _clone_grad(grad_k)),
                 )
@@ -1503,13 +1605,13 @@ def test_backend_performance_stress_and_numerics_report():
             metrics = _benchmark_cuda_detailed(
                 lambda backend = backend: (
                     lambda q, k: torch.autograd.backward(
-                        fast_rope_embedding(
+                        _rope_for_backend(
+                            backend,
                             q,
                             k,
                             cos,
                             sin,
                             rope_embedding_indices = rope_indices,
-                            backend = backend,
                         ),
                         (_clone_grad(grad_q), _clone_grad(grad_k)),
                     )

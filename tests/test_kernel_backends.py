@@ -30,15 +30,15 @@ from unsloth.kernels import (
     set_kernel_backend,
     set_kernel_backend_for_op,
 )
-from unsloth.kernels.grouped_gemm import grouped_gemm
+grouped_gemm_module = importlib.import_module("unsloth.kernels.grouped_gemm")
 from unsloth.kernels.moe.grouped_gemm.reference.moe_ops import (
     get_routing_indices,
     permute,
     torch_grouped_gemm,
     unpermute,
 )
-from unsloth.kernels.layernorm import fast_layernorm
-from unsloth.kernels.swiglu import swiglu_fg_kernel
+layernorm_module = importlib.import_module("unsloth.kernels.layernorm")
+swiglu_module = importlib.import_module("unsloth.kernels.swiglu")
 import unsloth.kernels.fp8 as fp8_module
 import unsloth.kernels._backend_registry as backend_registry
 
@@ -61,6 +61,9 @@ class KernelBackendTests(unittest.TestCase):
             self.assertTrue(reason)
 
     def test_runtime_override_selects_custom_backend_for_low_level_op(self):
+        import importlib
+
+        swiglu_mod = importlib.import_module("unsloth.kernels.swiglu")
         register_kernel_backend(
             "unsloth.swiglu_fg",
             "dummy",
@@ -70,11 +73,14 @@ class KernelBackendTests(unittest.TestCase):
         g = torch.full((2, 3), 4.0)
 
         with kernel_backend_context(global_backend = "dummy"):
-            out = swiglu_fg_kernel(e, g)
+            out = swiglu_mod.swiglu_fg_kernel(e, g)
 
         self.assertTrue(torch.equal(out, e + 2 * g))
 
     def test_runtime_override_selects_custom_backend_for_module_style_op(self):
+        import importlib
+
+        layernorm_mod = importlib.import_module("unsloth.kernels.layernorm")
         captured = {}
 
         def _dummy_layernorm(X, W, b, eps):
@@ -87,7 +93,8 @@ class KernelBackendTests(unittest.TestCase):
 
         layernorm = torch.nn.LayerNorm(4)
         X = torch.zeros(2, 4)
-        out = fast_layernorm(layernorm, X, backend = "dummy")
+        with kernel_backend_context(global_backend = "dummy"):
+            out = layernorm_mod.fast_layernorm(layernorm, X)
 
         self.assertEqual(captured["weight_shape"], (4,))
         self.assertEqual(captured["bias_shape"], (4,))
@@ -307,7 +314,7 @@ class KernelBackendTests(unittest.TestCase):
 
         e = torch.ones(1, 2)
         g = torch.full((1, 2), 3.0)
-        out = swiglu_fg_kernel(e, g)
+        out = swiglu_module.swiglu_fg_kernel(e, g)
 
         self.assertTrue(torch.equal(out, e - g))
 
@@ -410,16 +417,16 @@ class KernelBackendTests(unittest.TestCase):
         m_sizes, gather_indices = get_routing_indices(selected_experts, 2)
         m_sizes = m_sizes.to(dtype = torch.int32)
 
-        actual_up = grouped_gemm(
-            X,
-            W_up,
-            m_sizes,
-            topk = 2,
-            gather_indices = gather_indices,
-            permute_x = True,
-            backend = "eager",
-            autotune = True,
-        )
+        with kernel_backend_context(global_backend = "eager"):
+            actual_up = grouped_gemm_module.grouped_gemm(
+                X,
+                W_up,
+                m_sizes,
+                topk = 2,
+                gather_indices = gather_indices,
+                permute_x = True,
+                autotune = True,
+            )
         expected_up = torch_grouped_gemm(
             permute(X, gather_indices, 2),
             W_up,
@@ -429,16 +436,16 @@ class KernelBackendTests(unittest.TestCase):
         torch.testing.assert_close(actual_up, expected_up)
 
         W_down = torch.randn(2, 4, 6)
-        actual_down = grouped_gemm(
-            actual_up,
-            W_down,
-            m_sizes,
-            topk = 2,
-            gather_indices = gather_indices,
-            permute_y = True,
-            backend = "eager",
-            autotune = True,
-        )
+        with kernel_backend_context(global_backend = "eager"):
+            actual_down = grouped_gemm_module.grouped_gemm(
+                actual_up,
+                W_down,
+                m_sizes,
+                topk = 2,
+                gather_indices = gather_indices,
+                permute_y = True,
+                autotune = True,
+            )
         expected_down = unpermute(
             torch_grouped_gemm(actual_up, W_down, m_sizes, transpose = True),
             gather_indices,
@@ -479,25 +486,25 @@ class KernelBackendTests(unittest.TestCase):
         W = torch.randn(2, 6, 4)
         m_sizes = torch.tensor([3, 3], dtype = torch.int32)
         gather_indices = torch.arange(6, dtype = torch.int32)
-        out = grouped_gemm(
-            X,
-            W,
-            m_sizes,
-            topk = 2,
-            gather_indices = gather_indices,
-            permute_x = True,
-            kernel_config_fwd = "fwd_config",
-            kernel_config_bwd_dX = "dx_config",
-            kernel_config_bwd_dW = "dw_config",
-            autotune = True,
-            backend = "dummy",
-        )
+        with kernel_backend_context(global_backend = "dummy"):
+            out = grouped_gemm_module.grouped_gemm(
+                X,
+                W,
+                m_sizes,
+                topk = 2,
+                gather_indices = gather_indices,
+                permute_x = True,
+                kernel_config_fwd = "fwd_config",
+                kernel_config_bwd_dX = "dx_config",
+                kernel_config_bwd_dW = "dw_config",
+                autotune = True,
+            )
 
-        # Single dispatch -> backend receives X, W, m_sizes, topk positionally
-        # and the rest as kwargs. Triton-only kwargs are present but expected
-        # to be absorbed by each backend (eager/cutile use **_unused).
+        # Static dispatch preserves the Python call shape: X, W, and m_sizes
+        # are positional while topk and backend-specific options remain kwargs.
         self.assertEqual(tuple(out.shape), (6, 6))
-        self.assertEqual(captured["num_args"], 4)
+        self.assertEqual(captured["num_args"], 3)
+        self.assertEqual(captured["kwargs"]["topk"], 2)
         for key in (
             "gather_indices",
             "permute_x",
@@ -516,17 +523,17 @@ class KernelBackendTests(unittest.TestCase):
         X = torch.randn(6, 4)
         W = torch.randn(2, 4, 4)
         m_sizes = torch.tensor([3, 3], dtype = torch.int32)
-        out = grouped_gemm(
-            X,
-            W,
-            m_sizes,
-            topk = 1,
-            kernel_config_fwd = "ignored",
-            kernel_config_bwd_dX = "ignored",
-            kernel_config_bwd_dW = "ignored",
-            autotune = True,
-            backend = "eager",
-        )
+        with kernel_backend_context(global_backend = "eager"):
+            out = grouped_gemm_module.grouped_gemm(
+                X,
+                W,
+                m_sizes,
+                topk = 1,
+                kernel_config_fwd = "ignored",
+                kernel_config_bwd_dX = "ignored",
+                kernel_config_bwd_dW = "ignored",
+                autotune = True,
+            )
         self.assertEqual(out.shape[-1], W.shape[-2])
 
     def test_requested_backend_runtime_failure_is_surfaced(self):
@@ -544,6 +551,7 @@ class KernelBackendTests(unittest.TestCase):
         script = textwrap.dedent(
             f"""
             import builtins
+            import importlib
             import os
             import sys
             from pathlib import Path
@@ -567,31 +575,32 @@ class KernelBackendTests(unittest.TestCase):
 
             import torch
             import unsloth.kernels._backend_registry as backend_registry
-            from unsloth.kernels import get_kernel_backend
-            from unsloth.kernels.cross_entropy_loss import fast_cross_entropy_loss
-            from unsloth.kernels.layernorm import fast_layernorm
-            from unsloth.kernels.rope_embedding import fast_rope_embedding
-            from unsloth.kernels.swiglu import swiglu_fg_kernel
+            from unsloth.kernels import get_kernel_backend, kernel_backend_context
+            cross_entropy_mod = importlib.import_module("unsloth.kernels.cross_entropy_loss")
+            layernorm_mod = importlib.import_module("unsloth.kernels.layernorm")
+            rope_mod = importlib.import_module("unsloth.kernels.rope_embedding")
+            swiglu_mod = importlib.import_module("unsloth.kernels.swiglu")
 
             backend_registry._AVAILABILITY_CHECKS["cutile"] = lambda: (False, "cutile blocked for test")
             assert get_kernel_backend("unsloth.cross_entropy_loss", backend="cutile") == "eager"
 
             x = torch.randn(2, 3, 8)
             ln = torch.nn.LayerNorm(8)
-            y = fast_layernorm(ln, x, backend="cutile")
-            z = swiglu_fg_kernel(x, x, backend="cutile")
+            with kernel_backend_context(global_backend="cutile"):
+                y = layernorm_mod.fast_layernorm(ln, x)
+                z = swiglu_mod.swiglu_fg_kernel(x, x)
 
-            logits = torch.randn(2, 7, 17, requires_grad=True)
-            labels = torch.randint(0, 17, (2, 7))
-            labels[0, 0] = -100
-            loss = fast_cross_entropy_loss(logits, labels, backend="cutile")
-            loss.backward()
+                logits = torch.randn(2, 7, 17, requires_grad=True)
+                labels = torch.randint(0, 17, (2, 7))
+                labels[0, 0] = -100
+                loss = cross_entropy_mod.fast_cross_entropy_loss(logits, labels)
+                loss.backward()
 
-            q = torch.randn(2, 4, 9, 32)
-            k = torch.randn(2, 2, 9, 32)
-            cos = torch.randn(9, 32)
-            sin = torch.randn(9, 32)
-            q_out, k_out = fast_rope_embedding(q, k, cos, sin, backend="cutile")
+                q = torch.randn(2, 4, 9, 32)
+                k = torch.randn(2, 2, 9, 32)
+                cos = torch.randn(9, 32)
+                sin = torch.randn(9, 32)
+                q_out, k_out = rope_mod.fast_rope_embedding(q, k, cos, sin)
 
             assert y.shape == x.shape
             assert z.shape == x.shape
@@ -613,53 +622,6 @@ class KernelBackendTests(unittest.TestCase):
             msg = completed.stdout + completed.stderr,
         )
 
-    @unittest.skip(
-        "TODO: post static-binding refactor, the fp8_linear hot path bypasses "
-        "get_kernel_backend for backend=None and resolves via the rebound "
-        "_BAKED_BLOCK_FP8_BACKEND constant. The 'patch get_kernel_backend' "
-        "approach in this test no longer applies. Rebind-rebased coverage "
-        "lives in test_kernel_backend_runtime_switch_rebinds_aliases."
-    )
-    def test_fp8_block_path_preserves_resolved_backend(self):
-        X = torch.randn(2, 4)
-        weight = torch.randn(4, 4)
-        weight_scale = torch.ones(1, 1)
-        captured = {}
-
-        def _fake_block(X, weight, weight_scale, bias = None, *, backend = None):
-            captured["backend"] = backend
-            return torch.zeros(X.shape[:-1] + (weight.shape[0],), dtype = X.dtype)
-
-        with patch.object(fp8_module, "get_kernel_backend", return_value = "triton"):
-            with patch.object(fp8_module, "fp8_block_quant_linear", side_effect = _fake_block):
-                fp8_module.fp8_linear(X, weight, weight_scale, backend = "cutile")
-
-        self.assertEqual(captured["backend"], "triton")
-
-    @unittest.skip(
-        "TODO: post static-binding refactor, the fp8_linear hot path bypasses "
-        "get_kernel_backend for backend=None. See "
-        "test_kernel_backend_runtime_switch_rebinds_aliases for the new contract."
-    )
-    def test_fp8_rowwise_path_preserves_resolved_backend(self):
-        # When rowwise FBGEMM ops ARE available, the resolved backend must be
-        # forwarded through the row-wise dispatch (was always-call-fbgemm).
-        X = torch.randn(2, 4)
-        weight = torch.randn(4, 4)
-        weight_scale = torch.ones(4, 1)
-        captured = {}
-
-        def _fake_rowwise(X, weight, weight_scale, bias = None, *, backend = None):
-            captured["backend"] = backend
-            return torch.zeros(X.shape[:-1] + (weight.shape[0],), dtype = X.dtype)
-
-        with patch.object(fp8_module, "_HAS_FBGEMM_ROWWISE", True):
-            with patch.object(fp8_module, "get_kernel_backend", return_value = "triton"):
-                with patch.object(fp8_module, "fbgemm_fp8_linear", side_effect = _fake_rowwise):
-                    fp8_module.fp8_linear(X, weight, weight_scale, backend = "cutile")
-
-        self.assertEqual(captured["backend"], "triton")
-
     def test_fp8_rowwise_eager_fallback_warns_once(self):
         """When FBGEMM rowwise is missing AND the user asked for non-eager,
         the eager fallback must emit a one-shot warning so the perf surprise
@@ -673,12 +635,11 @@ class KernelBackendTests(unittest.TestCase):
 
         with patch.object(fp8_module, "_HAS_FBGEMM_ROWWISE", False):
             with patch.object(fp8_module, "_warned_fp8_rowwise_eager_fallback", False):
-                with patch.object(fp8_module, "get_kernel_backend", return_value = "cutile"):
-                    with patch.object(fp8_module, "_fp8_linear_eager", side_effect = _fake_eager):
-                        with patch.object(fp8_module.logger, "warning") as warn:
-                            fp8_module.fp8_linear(X, weight, weight_scale, backend = "cutile")
-                            fp8_module.fp8_linear(X, weight, weight_scale, backend = "cutile")
-                            fp8_module.fp8_linear(X, weight, weight_scale, backend = "cutile")
+                with patch.object(fp8_module, "_fp8_linear_eager", side_effect = _fake_eager):
+                    with patch.object(fp8_module.logger, "warning") as warn:
+                        fp8_module.fp8_linear(X, weight, weight_scale)
+                        fp8_module.fp8_linear(X, weight, weight_scale)
+                        fp8_module.fp8_linear(X, weight, weight_scale)
                 self.assertEqual(
                     warn.call_count, 1,
                     "Row-wise FP8 → eager fallback warning must fire exactly once "
@@ -687,27 +648,6 @@ class KernelBackendTests(unittest.TestCase):
                 msg = warn.call_args[0][0]
                 self.assertIn("fbgemm_gpu", msg)
                 self.assertIn("eager", msg)
-
-    def test_fp8_rowwise_eager_fallback_does_not_warn_when_user_picked_eager(self):
-        """If the user explicitly resolved to eager, they got what they asked
-        for — no surprise, no warning, regardless of FBGEMM presence."""
-        X = torch.randn(2, 4)
-        weight = torch.randn(4, 4)
-        weight_scale = torch.ones(4, 1)
-
-        def _fake_eager(X, weight, weight_scale, bias = None):
-            return torch.zeros(X.shape[:-1] + (weight.shape[0],), dtype = X.dtype)
-
-        with patch.object(fp8_module, "_HAS_FBGEMM_ROWWISE", False):
-            with patch.object(fp8_module, "_warned_fp8_rowwise_eager_fallback", False):
-                with patch.object(fp8_module, "get_kernel_backend", return_value = "eager"):
-                    with patch.object(fp8_module, "_fp8_linear_eager", side_effect = _fake_eager):
-                        with patch.object(fp8_module.logger, "warning") as warn:
-                            fp8_module.fp8_linear(X, weight, weight_scale, backend = "eager")
-                self.assertEqual(
-                    warn.call_count, 0,
-                    "Explicit eager request must NOT emit a fallback warning.",
-                )
 
     def test_fp8_rowwise_falls_to_eager_when_fbgemm_rowwise_missing(self):
         """Regression: cutile-only install (no fbgemm_gpu) used to crash with
@@ -734,55 +674,32 @@ class KernelBackendTests(unittest.TestCase):
                     with patch.object(fp8_module, "fbgemm_fp8_linear", side_effect = _explode_rowwise):
                         # Pre-fix: would call _explode_rowwise → AttributeError.
                         # Post-fix: guard routes to _fake_eager.
-                        fp8_module.fp8_linear(X, weight, weight_scale, backend = "cutile")
+                        fp8_module.fp8_linear(X, weight, weight_scale)
 
         self.assertEqual(
             eager_called["n"], 1,
             "Row-wise FP8 must fall to eager when FBGEMM rowwise op is absent.",
         )
 
-    def test_fp8_block_path_cutile_uses_fp8_block_quant_linear(self):
-        # Regression: cutile must route through fp8_block_quant_linear
-        # (which is FBGEMM when probed OK, else registry-dispatched torch impl)
-        # so a CuTile selection still benefits from FBGEMM when installed.
+    def test_fp8_block_path_uses_fp8_block_quant_linear(self):
+        # Block FP8 must route through fp8_block_quant_linear; backend-specific
+        # act/matmul symbols are already rebound before this call.
         X = torch.randn(2, 4)
         weight = torch.randn(4, 4)
         weight_scale = torch.ones(1, 1)
         captured = {}
 
-        def _fake_block(X, weight, weight_scale, bias = None, *, backend = None):
-            captured["backend"] = backend
+        def _fake_block(X, weight, weight_scale, bias = None):
+            captured["called"] = True
             return torch.zeros(X.shape[:-1] + (weight.shape[0],), dtype = X.dtype)
 
-        with patch.object(fp8_module, "get_kernel_backend", return_value = "cutile"):
-            with patch.object(fp8_module, "fp8_block_quant_linear", side_effect = _fake_block) as block_impl:
-                with patch.object(fp8_module, "fp8_torch_block_quant_forward") as torch_block_impl:
-                    fp8_module.fp8_linear(X, weight, weight_scale, backend = "cutile")
+        with patch.object(fp8_module, "fp8_block_quant_linear", side_effect = _fake_block) as block_impl:
+            with patch.object(fp8_module, "fp8_torch_block_quant_forward") as torch_block_impl:
+                fp8_module.fp8_linear(X, weight, weight_scale)
 
         block_impl.assert_called_once()
         torch_block_impl.assert_not_called()
-        self.assertEqual(captured["backend"], "cutile")
-
-    @unittest.skip(
-        "TODO: post static-binding refactor, the fp8_linear hot path bypasses "
-        "get_kernel_backend for backend=None and resolves via the rebound "
-        "_BAKED_BLOCK_FP8_BACKEND constant. The 'patch get_kernel_backend' "
-        "approach in this test no longer applies. Eager-fallback coverage "
-        "now lives in test_kernel_backend_runtime_switch_rebinds_aliases "
-        "(set_kernel_backend('eager') rebinds the dispatcher aliases)."
-    )
-    def test_fp8_eager_fallback_uses_eager_linear(self):
-        X = torch.randn(2, 4)
-        weight = torch.randn(4, 4)
-        weight_scale = torch.ones(1, 1)
-
-        with patch.object(fp8_module, "get_kernel_backend", return_value = "eager"):
-            with patch.object(fp8_module, "_fp8_linear_eager", return_value = torch.ones(2, 4)) as eager_impl:
-                out = fp8_module.fp8_linear(X, weight, weight_scale, backend = "cutile")
-
-        eager_impl.assert_called_once()
-        self.assertTrue(torch.equal(out, torch.ones(2, 4)))
-
+        self.assertTrue(captured["called"])
 
     def test_kernel_backend_runtime_switch_rebinds_aliases(self):
         """After `set_kernel_backend(...)` mutates the global ContextVar,
@@ -834,6 +751,132 @@ class KernelBackendTests(unittest.TestCase):
         # Exiting the context restores the outer alias.
         self.assertIs(fp8_mod._resolved_act_quant, default_act)
 
+    def test_static_default_hot_symbols_are_exported_callables(self):
+        import importlib
+
+        ce_mod = importlib.import_module("unsloth.kernels.cross_entropy_loss")
+        fast_lora_mod = importlib.import_module("unsloth.kernels.fast_lora")
+        geglu_mod = importlib.import_module("unsloth.kernels.geglu")
+        gg_mod = importlib.import_module("unsloth.kernels.grouped_gemm")
+        rms_mod = importlib.import_module("unsloth.kernels.rms_layernorm")
+        rope_mod = importlib.import_module("unsloth.kernels.rope_embedding")
+        swiglu_mod = importlib.import_module("unsloth.kernels.swiglu")
+
+        for default_symbol in (
+            ce_mod.fast_cross_entropy_loss_default,
+            gg_mod.grouped_gemm_default,
+            rms_mod.fast_rms_layernorm_default,
+            rope_mod.fast_rope_embedding_default,
+            rope_mod.rope_embedding_default,
+            swiglu_mod.swiglu_fg_kernel_default,
+            swiglu_mod.swiglu_DWf_DW_dfg_kernel_default,
+            geglu_mod.geglu_exact_forward_kernel_default,
+            geglu_mod.geglu_exact_backward_kernel_default,
+            geglu_mod.geglu_approx_forward_kernel_default,
+            geglu_mod.geglu_approx_backward_kernel_default,
+        ):
+            self.assertTrue(callable(default_symbol))
+
+        self.assertIs(ce_mod.fast_cross_entropy_loss, ce_mod.fast_cross_entropy_loss_default)
+        self.assertIs(gg_mod.grouped_gemm, gg_mod.grouped_gemm_default)
+        self.assertIs(rms_mod.fast_rms_layernorm, rms_mod.fast_rms_layernorm_default)
+        self.assertIs(rope_mod.fast_rope_embedding, rope_mod.fast_rope_embedding_default)
+        self.assertIs(rope_mod.rope_embedding, rope_mod.rope_embedding_default)
+        self.assertIs(swiglu_mod.swiglu_fg_kernel, swiglu_mod.swiglu_fg_kernel_default)
+        self.assertIs(
+            swiglu_mod.swiglu_DWf_DW_dfg_kernel,
+            swiglu_mod.swiglu_DWf_DW_dfg_kernel_default,
+        )
+        self.assertIs(geglu_mod.geglu_exact_forward_kernel, geglu_mod.geglu_exact_forward_kernel_default)
+        self.assertIs(geglu_mod.geglu_exact_backward_kernel, geglu_mod.geglu_exact_backward_kernel_default)
+        self.assertIs(geglu_mod.geglu_approx_forward_kernel, geglu_mod.geglu_approx_forward_kernel_default)
+        self.assertIs(geglu_mod.geglu_approx_backward_kernel, geglu_mod.geglu_approx_backward_kernel_default)
+
+        self.assertIs(fast_lora_mod.swiglu_fg_kernel, swiglu_mod.swiglu_fg_kernel_default)
+        self.assertIs(
+            fast_lora_mod.swiglu_DWf_DW_dfg_kernel,
+            swiglu_mod.swiglu_DWf_DW_dfg_kernel_default,
+        )
+        self.assertIs(
+            fast_lora_mod.geglu_exact_forward_kernel,
+            geglu_mod.geglu_exact_forward_kernel_default,
+        )
+        self.assertIs(
+            fast_lora_mod.geglu_approx_backward_kernel,
+            geglu_mod.geglu_approx_backward_kernel_default,
+        )
+
+    def test_static_default_hot_symbols_fall_back_to_direct_eager_not_dispatcher(self):
+        import importlib
+
+        ce_mod = importlib.import_module("unsloth.kernels.cross_entropy_loss")
+        fast_lora_mod = importlib.import_module("unsloth.kernels.fast_lora")
+        geglu_mod = importlib.import_module("unsloth.kernels.geglu")
+        gg_mod = importlib.import_module("unsloth.kernels.grouped_gemm")
+        rms_mod = importlib.import_module("unsloth.kernels.rms_layernorm")
+        rope_mod = importlib.import_module("unsloth.kernels.rope_embedding")
+        swiglu_mod = importlib.import_module("unsloth.kernels.swiglu")
+
+        def _closure_has(fn, target):
+            while hasattr(fn, "__wrapped__"):
+                fn = fn.__wrapped__
+            return any(cell.cell_contents is target for cell in (fn.__closure__ or ()))
+
+        try:
+            with patch.object(backend_registry, "get_kernel_impl", side_effect = RuntimeError("blocked")):
+                ce_mod._rebind_cross_entropy_aliases()
+                geglu_mod._rebind_geglu_aliases()
+                gg_mod._rebind_grouped_gemm_aliases()
+                rms_mod._rebind_rms_layernorm_aliases()
+                rope_mod._rebind_rope_embedding_aliases()
+                swiglu_mod._rebind_swiglu_aliases()
+
+            self.assertIs(ce_mod.fast_cross_entropy_loss_default, ce_mod._fast_cross_entropy_loss_eager)
+            self.assertIs(gg_mod.grouped_gemm_default, gg_mod._grouped_gemm_eager)
+            self.assertTrue(
+                _closure_has(rms_mod.fast_rms_layernorm_default, rms_mod._fast_rms_layernorm_eager)
+            )
+            self.assertIs(rope_mod.rope_embedding_default, rope_mod._rope_embedding_eager)
+            if rope_mod.DEVICE_COUNT <= 1:
+                self.assertTrue(
+                    _closure_has(
+                        rope_mod.fast_rope_embedding_default,
+                        rope_mod._fast_rope_embedding_eager,
+                    )
+                )
+            self.assertIs(swiglu_mod.swiglu_fg_kernel_default, swiglu_mod._swiglu_fg_eager)
+            self.assertIs(
+                swiglu_mod.swiglu_DWf_DW_dfg_kernel_default,
+                swiglu_mod._swiglu_DWf_DW_dfg_eager,
+            )
+            self.assertIs(
+                geglu_mod.geglu_exact_forward_kernel_default,
+                geglu_mod._geglu_exact_forward_eager,
+            )
+            self.assertIs(
+                fast_lora_mod.swiglu_fg_kernel,
+                swiglu_mod.swiglu_fg_kernel_default,
+            )
+        finally:
+            ce_mod._rebind_cross_entropy_aliases()
+            geglu_mod._rebind_geglu_aliases()
+            gg_mod._rebind_grouped_gemm_aliases()
+            rms_mod._rebind_rms_layernorm_aliases()
+            rope_mod._rebind_rope_embedding_aliases()
+            swiglu_mod._rebind_swiglu_aliases()
+
+    def test_utils_fp8_lazy_binding_replaces_wrapper_symbols(self):
+        import importlib
+
+        fp8_real = importlib.import_module("unsloth.kernels.fp8")
+        utils_mod = importlib.import_module("unsloth.kernels.utils")
+
+        bound_weight_dequant, bound_fp8_linear = utils_mod._bind_fp8_symbols()
+
+        self.assertIs(bound_weight_dequant, fp8_real.weight_dequant)
+        self.assertIs(bound_fp8_linear, fp8_real.fp8_linear)
+        self.assertIs(utils_mod.weight_dequant, fp8_real.weight_dequant)
+        self.assertIs(utils_mod.fp8_linear, fp8_real.fp8_linear)
 
     def test_fp8_block_path_forwards_bias(self):
         # The dispatcher must forward a non-None bias kwarg into
@@ -845,14 +888,13 @@ class KernelBackendTests(unittest.TestCase):
         bias = torch.randn(4)
         captured = {}
 
-        def _fake_block(X, weight, weight_scale, bias = None, *, backend = None):
+        def _fake_block(X, weight, weight_scale, bias = None):
             captured["bias_id"] = id(bias) if bias is not None else None
             captured["bias_is_none"] = bias is None
             return torch.zeros(X.shape[:-1] + (weight.shape[0],), dtype = X.dtype)
 
-        with patch.object(fp8_module, "get_kernel_backend", return_value = "triton"):
-            with patch.object(fp8_module, "fp8_block_quant_linear", side_effect = _fake_block):
-                fp8_module.fp8_linear(X, weight, weight_scale, bias = bias, backend = "cutile")
+        with patch.object(fp8_module, "fp8_block_quant_linear", side_effect = _fake_block):
+            fp8_module.fp8_linear(X, weight, weight_scale, bias = bias)
 
         self.assertFalse(
             captured["bias_is_none"],
@@ -868,9 +910,9 @@ class KernelBackendTests(unittest.TestCase):
         weight = torch.randn(4, 4, dtype = torch.float32)
         weight_scale = torch.ones(1, 1, dtype = torch.float32)
 
-        with patch.object(fp8_module, "get_kernel_backend", return_value = "eager"):
-            out_no_bias = fp8_module.fp8_linear(X, weight, weight_scale, bias = None, backend = "eager")
-            out_default = fp8_module.fp8_linear(X, weight, weight_scale, backend = "eager")
+        with kernel_backend_context(global_backend = "eager"):
+            out_no_bias = fp8_module.fp8_linear(X, weight, weight_scale, bias = None)
+            out_default = fp8_module.fp8_linear(X, weight, weight_scale)
 
         self.assertTrue(torch.equal(out_no_bias, out_default))
 
@@ -894,8 +936,8 @@ class KernelBackendTests(unittest.TestCase):
         weight, weight_scale, bias = self._make_block_quant_linear(128, 64, bias = True)
         X = torch.randn(4, 16, 128, dtype = torch.float32, device = weight.device)
 
-        with patch.object(fp8_module, "get_kernel_backend", return_value = "eager"):
-            out = fp8_module.fp8_linear(X, weight, weight_scale, bias = bias, backend = "eager")
+        with kernel_backend_context(global_backend = "eager"):
+            out = fp8_module.fp8_linear(X, weight, weight_scale, bias = bias)
 
         ref = X @ weight.T + bias
         self.assertEqual(out.shape, ref.shape)
@@ -913,7 +955,7 @@ class KernelBackendTests(unittest.TestCase):
         X = torch.randn(4, 16, 128, dtype = torch.bfloat16, device = weight_fp8.device, requires_grad = True)
         bias_p = bias.detach().clone().to(torch.bfloat16).requires_grad_(True)
 
-        out = fp8_module.FP8BlockQuantLinear.apply(X, weight_fp8, weight_scale, bias_p, "triton")
+        out = fp8_module.FP8BlockQuantLinear.apply(X, weight_fp8, weight_scale, bias_p)
         out.sum().backward()
 
         self.assertIsNotNone(bias_p.grad, "d_bias must not be None when bias is provided.")
@@ -938,7 +980,7 @@ class KernelBackendTests(unittest.TestCase):
         bias = torch.randn(out_features, dtype = torch.bfloat16, device = "cuda", requires_grad = True)
         X = torch.randn(2, 8, in_features, dtype = torch.bfloat16, device = "cuda", requires_grad = True)
 
-        out = fp8_module.FbgemmFp8Linear_matmul.apply(X, weight_fp8, weight_scale, bias, "triton")
+        out = fp8_module.FbgemmFp8Linear_matmul.apply(X, weight_fp8, weight_scale, bias)
         out.sum().backward()
 
         self.assertIsNotNone(bias.grad, "FbgemmFp8Linear_matmul.backward must populate d_bias.")
@@ -964,7 +1006,7 @@ class KernelBackendTests(unittest.TestCase):
         bias = torch.randn(out_features, dtype = torch.bfloat16, device = "cuda", requires_grad = True)
         X = torch.randn(2, 8, in_features, dtype = torch.bfloat16, device = "cuda", requires_grad = True)
 
-        out = fp8_module.FP8_fbgemm_block_linear.apply(X, weight_fp8, weight_scale, bias, "triton")
+        out = fp8_module.FP8_fbgemm_block_linear.apply(X, weight_fp8, weight_scale, bias)
         out.sum().backward()
 
         self.assertIsNotNone(bias.grad, "FP8_fbgemm_block_linear.backward must populate d_bias.")

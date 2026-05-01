@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
 import torch
-from ._backend_registry import dispatch_kernel, register_kernel_backend
+from ._backend_registry import register_kernel_backend
 from ._optional_triton import HAS_TRITON, tl, triton
 from .utils import calculate_settings, torch_gpu_device
 
@@ -278,20 +279,46 @@ register_kernel_backend(
 
 
 _resolved_fast_rms_layernorm = None
+fast_rms_layernorm_default = None
+
+
+def _make_fast_rms_layernorm_default(impl):
+    @torch.compiler.disable
+    def _fast_rms_layernorm_default(layernorm, X: torch.Tensor, gemma: bool = False):
+        W: torch.Tensor = layernorm.weight
+        eps: float = (
+            layernorm.variance_epsilon
+            if hasattr(layernorm, "variance_epsilon")
+            else layernorm.eps
+        )
+        return impl(X, W, eps, gemma)
+    return _fast_rms_layernorm_default
+
+
+def _patch_rms_layernorm_hot_imports() -> None:
+    for name, module in tuple(sys.modules.items()):
+        if name.startswith("unsloth.models.") and hasattr(module, "fast_rms_layernorm"):
+            module.fast_rms_layernorm = fast_rms_layernorm_default
 
 
 def _rebind_rms_layernorm_aliases(backend=None) -> None:
     """Hook fired by `_backend_registry` when the global backend changes
     or when a new backend impl is registered. Re-resolves `_resolved_*`
-    aliases for this module from the registry. Falls back to `None` so
-    the entry point routes through `dispatch_kernel`, preserving today's
-    behavior for explicit `backend=` callers."""
-    global _resolved_fast_rms_layernorm
+    aliases for this module from the registry. Falls back to eager. Backend
+    selection happens via registry state/rebinding, not per-call kwargs."""
+    global _resolved_fast_rms_layernorm, fast_rms_layernorm_default
     try:
         from ._backend_registry import get_kernel_impl
         _resolved_fast_rms_layernorm = get_kernel_impl("unsloth.rms_layernorm")
     except Exception:
         _resolved_fast_rms_layernorm = None
+    # NVIDIA_REVIEW: model hot paths import `fast_rms_layernorm_default`,
+    # which closes over the resolved backend implementation and does not enter
+    # the explicit-backend dispatcher used by the public API below.
+    impl = _resolved_fast_rms_layernorm or _fast_rms_layernorm_eager
+    fast_rms_layernorm_default = _make_fast_rms_layernorm_default(impl)
+    globals()["fast_rms_layernorm"] = fast_rms_layernorm_default
+    _patch_rms_layernorm_hot_imports()
 
 
 # Initial bind.
@@ -307,30 +334,15 @@ except Exception:
     pass
 
 
-@torch.compiler.disable
 def fast_rms_layernorm(
     layernorm,
     X: torch.Tensor,
     gemma: bool = False,
-    *,
-    backend = None,
 ):
-    W: torch.Tensor = layernorm.weight
-    eps: float = (
-        layernorm.variance_epsilon
-        if hasattr(layernorm, "variance_epsilon")
-        else layernorm.eps
-    )
-    if backend is None and _resolved_fast_rms_layernorm is not None:
-        return _resolved_fast_rms_layernorm(X, W, eps, gemma)
-    return dispatch_kernel(
-        "unsloth.rms_layernorm",
-        X,
-        W,
-        eps,
-        gemma,
-        backend = backend,
-    )
+    return fast_rms_layernorm_default(layernorm, X, gemma)
+
+
+_rebind_rms_layernorm_aliases()
 
 
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
@@ -338,7 +350,7 @@ from transformers.models.llama.modeling_llama import LlamaRMSNorm
 
 class Unsloth_LlamaRMSNorm(LlamaRMSNorm):
     def forward(self, X):
-        return fast_rms_layernorm(self, X, gemma = False)
+        return fast_rms_layernorm_default(self, X, gemma = False)
 
 
 try:

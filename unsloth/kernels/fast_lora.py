@@ -23,12 +23,15 @@ from .utils import (
     torch_amp_custom_fwd,
     torch_amp_custom_bwd,
 )
-from .swiglu import swiglu_DWf_DW_dfg_kernel, swiglu_fg_kernel
+from .swiglu import (
+    swiglu_DWf_DW_dfg_kernel_default as swiglu_DWf_DW_dfg_kernel,
+    swiglu_fg_kernel_default as swiglu_fg_kernel,
+)
 from .geglu import (
-    geglu_approx_backward_kernel,
-    geglu_approx_forward_kernel,
-    geglu_exact_backward_kernel,
-    geglu_exact_forward_kernel,
+    geglu_approx_backward_kernel_default as geglu_approx_backward_kernel,
+    geglu_approx_forward_kernel_default as geglu_approx_forward_kernel,
+    geglu_exact_backward_kernel_default as geglu_exact_backward_kernel,
+    geglu_exact_forward_kernel_default as geglu_exact_forward_kernel,
 )
 
 

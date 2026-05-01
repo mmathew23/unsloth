@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
 import torch
 
-from ._backend_registry import dispatch_kernel, register_kernel_backend
+from ._backend_registry import register_kernel_backend
 from ._optional_triton import HAS_TRITON
 from .moe.grouped_gemm.reference.moe_ops import (
     get_routing_indices,
@@ -87,21 +88,32 @@ register_kernel_backend(
 # Module-level alias rebound by hook on backend change. None when no
 # implementation is registered for the resolved global backend yet.
 _resolved_grouped_gemm = None
+grouped_gemm_default = None
+
+
+def _patch_grouped_gemm_hot_imports() -> None:
+    for name, module in tuple(sys.modules.items()):
+        if name.startswith("unsloth.models.") and hasattr(module, "grouped_gemm"):
+            module.grouped_gemm = grouped_gemm_default
 
 
 def _rebind_grouped_gemm_aliases(backend = None) -> None:
     """Hook fired by `_backend_registry` when the global backend changes
     or when a new backend impl is registered. Looks up the resolved impl
     for the current global backend and pins it to the module-level alias.
-    Falls back to `None` so the entry point routes through `dispatch_kernel`,
-    preserving today's behavior for explicit `backend=` callers and runtime
-    switches that aren't yet supported."""
-    global _resolved_grouped_gemm
+    Falls back to eager. Backend selection happens via registry
+    state/rebinding, not per-call kwargs."""
+    global _resolved_grouped_gemm, grouped_gemm_default
     try:
         from ._backend_registry import get_kernel_impl
         _resolved_grouped_gemm = get_kernel_impl("unsloth.grouped_gemm")
     except Exception:
         _resolved_grouped_gemm = None
+    # NVIDIA_REVIEW: MoE model paths import this resolved implementation
+    # directly; explicit backend routing remains confined to `grouped_gemm`.
+    grouped_gemm_default = _resolved_grouped_gemm or _grouped_gemm_eager
+    globals()["grouped_gemm"] = grouped_gemm_default
+    _patch_grouped_gemm_hot_imports()
 
 
 # Initial bind. Wrapped so module load never fails if no backend is loaded yet.
@@ -136,30 +148,8 @@ def grouped_gemm(
     is_first_gemm: bool = True,
     dX_only: bool = False,
     dW_only: bool = False,
-    *,
-    backend: str | None = None,
 ) -> torch.Tensor:
-    if backend is None and _resolved_grouped_gemm is not None:
-        return _resolved_grouped_gemm(
-            X,
-            W,
-            m_sizes,
-            topk,
-            gather_indices = gather_indices,
-            permute_x = permute_x,
-            permute_y = permute_y,
-            topk_weights = topk_weights,
-            fuse_mul_post = fuse_mul_post,
-            kernel_config_fwd = kernel_config_fwd,
-            kernel_config_bwd_dX = kernel_config_bwd_dX,
-            kernel_config_bwd_dW = kernel_config_bwd_dW,
-            autotune = autotune,
-            is_first_gemm = is_first_gemm,
-            dX_only = dX_only,
-            dW_only = dW_only,
-        )
-    return dispatch_kernel(
-        "unsloth.grouped_gemm",
+    return grouped_gemm_default(
         X,
         W,
         m_sizes,
@@ -176,5 +166,7 @@ def grouped_gemm(
         is_first_gemm = is_first_gemm,
         dX_only = dX_only,
         dW_only = dW_only,
-        backend = backend,
     )
+
+
+_rebind_grouped_gemm_aliases()

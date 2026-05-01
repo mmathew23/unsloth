@@ -892,6 +892,7 @@ def grouped_gemm_cutile(
     is_first_gemm: bool = True,
     dX_only: bool = False,
     dW_only: bool = False,
+    **_unused,
 ) -> torch.Tensor:
     """
     CuTile grouped GEMM for MoE.

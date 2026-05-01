@@ -62,6 +62,7 @@ _RESOLVE_CACHE: dict[tuple[str, str | None, str, str | None, str | None], str] =
 # aliases).
 GlobalBackendChangeHook = Callable[[str | None], None]
 _GLOBAL_BACKEND_CHANGE_HOOKS: list[GlobalBackendChangeHook] = []
+_GLOBAL_BACKEND_CHANGE_HOOK_KEYS: dict[tuple[str, str], GlobalBackendChangeHook] = {}
 
 
 def register_global_backend_change_hook(fn: GlobalBackendChangeHook) -> None:
@@ -82,9 +83,15 @@ def register_global_backend_change_hook(fn: GlobalBackendChangeHook) -> None:
     """
     if not callable(fn):
         raise TypeError("Backend change hook must be callable.")
+    hook_key = (getattr(fn, "__module__", ""), getattr(fn, "__qualname__", repr(fn)))
     with _LOCK:
-        if fn not in _GLOBAL_BACKEND_CHANGE_HOOKS:
-            _GLOBAL_BACKEND_CHANGE_HOOKS.append(fn)
+        previous = _GLOBAL_BACKEND_CHANGE_HOOK_KEYS.get(hook_key)
+        if previous is fn:
+            return
+        if previous in _GLOBAL_BACKEND_CHANGE_HOOKS:
+            _GLOBAL_BACKEND_CHANGE_HOOKS.remove(previous)
+        _GLOBAL_BACKEND_CHANGE_HOOK_KEYS[hook_key] = fn
+        _GLOBAL_BACKEND_CHANGE_HOOKS.append(fn)
 
 
 def _fire_global_backend_change_hooks() -> None:
@@ -372,12 +379,13 @@ def clear_backend_load_cache(backend: str | None = None) -> None:
             _BACKEND_LOAD_RESULT.clear()
             _LOADED_BACKENDS.clear()
             _invalidate_resolve_cache()
-            return
-        backend_name = _normalize_backend_name(backend)
-        if backend_name is not None:
-            _BACKEND_LOAD_RESULT.pop(backend_name, None)
-            _LOADED_BACKENDS.discard(backend_name)
-            _invalidate_resolve_cache()
+        else:
+            backend_name = _normalize_backend_name(backend)
+            if backend_name is not None:
+                _BACKEND_LOAD_RESULT.pop(backend_name, None)
+                _LOADED_BACKENDS.discard(backend_name)
+                _invalidate_resolve_cache()
+    _fire_global_backend_change_hooks()
 
 
 def is_kernel_backend_available(backend: str) -> tuple[bool, str | None]:

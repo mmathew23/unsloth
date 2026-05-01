@@ -75,6 +75,11 @@ from transformers.modeling_attn_mask_utils import (
     _prepare_4d_causal_attention_mask_for_sdpa,
 )
 from ..kernels import *
+from ..kernels.cross_entropy_loss import (
+    fast_cross_entropy_loss_default as fast_cross_entropy_loss,
+)
+from ..kernels.rms_layernorm import fast_rms_layernorm_default as fast_rms_layernorm
+from ..kernels.rope_embedding import fast_rope_embedding_default as fast_rope_embedding
 from ..tokenizer_utils import *
 from .vision import FastBaseModel
 

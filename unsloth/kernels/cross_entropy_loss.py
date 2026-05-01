@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
 import torch
 import torch.nn.functional as F
-from ._backend_registry import dispatch_kernel, register_kernel_backend
+from ._backend_registry import register_kernel_backend
 from ._optional_triton import HAS_TRITON, tl, triton
 from .utils import (
     calculate_settings,
@@ -494,20 +495,35 @@ register_kernel_backend(
 
 
 _resolved_fast_cross_entropy_loss = None
+fast_cross_entropy_loss_default = None
+
+
+def _patch_cross_entropy_hot_imports() -> None:
+    for name, module in tuple(sys.modules.items()):
+        if name.startswith("unsloth.models.") and hasattr(module, "fast_cross_entropy_loss"):
+            module.fast_cross_entropy_loss = fast_cross_entropy_loss_default
 
 
 def _rebind_cross_entropy_aliases(backend=None) -> None:
     """Hook fired by `_backend_registry` when the global backend changes
     or when a new backend impl is registered. Re-resolves `_resolved_*`
     aliases for this module from the registry. Falls back to `None` so
-    the entry point routes through `dispatch_kernel`, preserving today's
-    behavior for explicit `backend=` callers."""
-    global _resolved_fast_cross_entropy_loss
+    the entry point calls eager directly. Backend selection happens via
+    registry state/rebinding, not per-call kwargs."""
+    global _resolved_fast_cross_entropy_loss, fast_cross_entropy_loss_default
     try:
         from ._backend_registry import get_kernel_impl
         _resolved_fast_cross_entropy_loss = get_kernel_impl("unsloth.cross_entropy_loss")
     except Exception:
         _resolved_fast_cross_entropy_loss = None
+    # NVIDIA_REVIEW: model loss paths use the resolved backend implementation
+    # directly. Backend selection is controlled by registry state, not per-call
+    # `backend=` kwargs.
+    fast_cross_entropy_loss_default = (
+        _resolved_fast_cross_entropy_loss or _fast_cross_entropy_loss_eager
+    )
+    globals()["fast_cross_entropy_loss"] = fast_cross_entropy_loss_default
+    _patch_cross_entropy_hot_imports()
 
 
 # Initial bind.
@@ -529,20 +545,17 @@ def fast_cross_entropy_loss(
     logit_softcapping = 0,
     logit_scaling = 0,
     n_items = None,
-    *,
-    backend = None,
 ):
-    if backend is None and _resolved_fast_cross_entropy_loss is not None:
-        return _resolved_fast_cross_entropy_loss(logits, labels, logit_softcapping, logit_scaling, n_items)
-    return dispatch_kernel(
-        "unsloth.cross_entropy_loss",
+    return fast_cross_entropy_loss_default(
         logits,
         labels,
         logit_softcapping,
         logit_scaling,
         n_items,
-        backend = backend,
     )
+
+
+_rebind_cross_entropy_aliases()
 
 
 if (Version(torch.__version__) < Version("2.4.0")) and not hasattr(

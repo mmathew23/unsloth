@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
 import torch
 import torch.nn.functional as F
-from ._backend_registry import dispatch_kernel, register_kernel_backend
+from ._backend_registry import register_kernel_backend
 from ._optional_triton import HAS_TRITON, tl, triton
 from .utils import calculate_settings, torch_gpu_device
 
@@ -184,6 +185,15 @@ register_kernel_backend("unsloth.swiglu_bwd", "eager", _swiglu_DWf_DW_dfg_eager)
 # implementation is registered for the resolved global backend yet.
 _resolved_swiglu_fg = None
 _resolved_swiglu_bwd = None
+swiglu_fg_kernel_default = None
+swiglu_DWf_DW_dfg_kernel_default = None
+
+
+def _patch_swiglu_hot_imports() -> None:
+    fast_lora_mod = sys.modules.get("unsloth.kernels.fast_lora")
+    if fast_lora_mod is not None:
+        fast_lora_mod.swiglu_fg_kernel = swiglu_fg_kernel_default
+        fast_lora_mod.swiglu_DWf_DW_dfg_kernel = swiglu_DWf_DW_dfg_kernel_default
 
 
 def _rebind_swiglu_aliases(backend = None) -> None:
@@ -191,9 +201,9 @@ def _rebind_swiglu_aliases(backend = None) -> None:
     or when a new backend impl is registered. Looks up the resolved impl
     for the current global backend and pins it to the module-level aliases.
     Falls back to `None` so the entry point routes through `dispatch_kernel`,
-    preserving today's behavior for explicit `backend=` callers and runtime
-    switches that aren't yet supported."""
+    preserving runtime backend switches without a per-call backend kwarg."""
     global _resolved_swiglu_fg, _resolved_swiglu_bwd
+    global swiglu_fg_kernel_default, swiglu_DWf_DW_dfg_kernel_default
     try:
         from ._backend_registry import get_kernel_impl
         _resolved_swiglu_fg = get_kernel_impl("unsloth.swiglu_fg")
@@ -204,6 +214,14 @@ def _rebind_swiglu_aliases(backend = None) -> None:
         _resolved_swiglu_bwd = get_kernel_impl("unsloth.swiglu_bwd")
     except Exception:
         _resolved_swiglu_bwd = None
+    # NVIDIA_REVIEW: hot LoRA paths use these backend-specific symbols, not the
+    # public backend dispatcher below. This keeps explicit backend selection out
+    # of torch-traced training/generate call shapes.
+    swiglu_fg_kernel_default = _resolved_swiglu_fg or _swiglu_fg_eager
+    swiglu_DWf_DW_dfg_kernel_default = _resolved_swiglu_bwd or _swiglu_DWf_DW_dfg_eager
+    globals()["swiglu_fg_kernel"] = swiglu_fg_kernel_default
+    globals()["swiglu_DWf_DW_dfg_kernel"] = swiglu_DWf_DW_dfg_kernel_default
+    _patch_swiglu_hot_imports()
 
 
 # Initial bind. Wrapped so module load never fails if no backend is loaded yet.
@@ -221,13 +239,12 @@ except Exception:
     pass
 
 
-def swiglu_fg_kernel(e, g, *, backend = None):
-    if backend is None and _resolved_swiglu_fg is not None:
-        return _resolved_swiglu_fg(e, g)
-    return dispatch_kernel("unsloth.swiglu_fg", e, g, backend = backend)
+def swiglu_fg_kernel(e, g):
+    return swiglu_fg_kernel_default(e, g)
 
 
-def swiglu_DWf_DW_dfg_kernel(DW, e, g, *, backend = None):
-    if backend is None and _resolved_swiglu_bwd is not None:
-        return _resolved_swiglu_bwd(DW, e, g)
-    return dispatch_kernel("unsloth.swiglu_bwd", DW, e, g, backend = backend)
+def swiglu_DWf_DW_dfg_kernel(DW, e, g):
+    return swiglu_DWf_DW_dfg_kernel_default(DW, e, g)
+
+
+_rebind_swiglu_aliases()

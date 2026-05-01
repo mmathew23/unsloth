@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
 import torch
 import torch.nn.functional as F
-from ._backend_registry import dispatch_kernel, register_kernel_backend
+from ._backend_registry import register_kernel_backend
 from ._optional_triton import HAS_TRITON, tl, triton
 from .utils import (
     calculate_settings,
@@ -386,6 +387,19 @@ _resolved_geglu_exact_fg = None
 _resolved_geglu_exact_bwd = None
 _resolved_geglu_approx_fg = None
 _resolved_geglu_approx_bwd = None
+geglu_exact_forward_kernel_default = None
+geglu_exact_backward_kernel_default = None
+geglu_approx_forward_kernel_default = None
+geglu_approx_backward_kernel_default = None
+
+
+def _patch_geglu_hot_imports() -> None:
+    fast_lora_mod = sys.modules.get("unsloth.kernels.fast_lora")
+    if fast_lora_mod is not None:
+        fast_lora_mod.geglu_exact_forward_kernel = geglu_exact_forward_kernel_default
+        fast_lora_mod.geglu_exact_backward_kernel = geglu_exact_backward_kernel_default
+        fast_lora_mod.geglu_approx_forward_kernel = geglu_approx_forward_kernel_default
+        fast_lora_mod.geglu_approx_backward_kernel = geglu_approx_backward_kernel_default
 
 
 def _rebind_geglu_aliases(backend = None) -> None:
@@ -393,10 +407,11 @@ def _rebind_geglu_aliases(backend = None) -> None:
     or when a new backend impl is registered. Looks up the resolved impl
     for the current global backend and pins it to the module-level aliases.
     Falls back to `None` so the entry point routes through `dispatch_kernel`,
-    preserving today's behavior for explicit `backend=` callers and runtime
-    switches that aren't yet supported."""
+    preserving runtime backend switches without a per-call backend kwarg."""
     global _resolved_geglu_exact_fg, _resolved_geglu_exact_bwd
     global _resolved_geglu_approx_fg, _resolved_geglu_approx_bwd
+    global geglu_exact_forward_kernel_default, geglu_exact_backward_kernel_default
+    global geglu_approx_forward_kernel_default, geglu_approx_backward_kernel_default
     from ._backend_registry import get_kernel_impl
     try:
         _resolved_geglu_exact_fg = get_kernel_impl("unsloth.geglu_exact_forward")
@@ -414,6 +429,18 @@ def _rebind_geglu_aliases(backend = None) -> None:
         _resolved_geglu_approx_bwd = get_kernel_impl("unsloth.geglu_approx_backward")
     except Exception:
         _resolved_geglu_approx_bwd = None
+    # NVIDIA_REVIEW: LoRA hot paths receive these backend-specific symbols
+    # directly. Backend selection happens via registry rebinding, not per-call
+    # `backend=` dispatch.
+    geglu_exact_forward_kernel_default = _resolved_geglu_exact_fg or _geglu_exact_forward_eager
+    geglu_exact_backward_kernel_default = _resolved_geglu_exact_bwd or _geglu_exact_backward_eager
+    geglu_approx_forward_kernel_default = _resolved_geglu_approx_fg or _geglu_approx_forward_eager
+    geglu_approx_backward_kernel_default = _resolved_geglu_approx_bwd or _geglu_approx_backward_eager
+    globals()["geglu_exact_forward_kernel"] = geglu_exact_forward_kernel_default
+    globals()["geglu_exact_backward_kernel"] = geglu_exact_backward_kernel_default
+    globals()["geglu_approx_forward_kernel"] = geglu_approx_forward_kernel_default
+    globals()["geglu_approx_backward_kernel"] = geglu_approx_backward_kernel_default
+    _patch_geglu_hot_imports()
 
 
 # Initial bind. Wrapped so module load never fails if no backend is loaded yet.
@@ -431,47 +458,20 @@ except Exception:
     pass
 
 
-def geglu_exact_forward_kernel(gate, up, *, backend = None):
-    if backend is None and _resolved_geglu_exact_fg is not None:
-        return _resolved_geglu_exact_fg(gate, up)
-    return dispatch_kernel(
-        "unsloth.geglu_exact_forward",
-        gate,
-        up,
-        backend = backend,
-    )
+def geglu_exact_forward_kernel(gate, up):
+    return geglu_exact_forward_kernel_default(gate, up)
 
 
-def geglu_exact_backward_kernel(DW, e, g, *, backend = None):
-    if backend is None and _resolved_geglu_exact_bwd is not None:
-        return _resolved_geglu_exact_bwd(DW, e, g)
-    return dispatch_kernel(
-        "unsloth.geglu_exact_backward",
-        DW,
-        e,
-        g,
-        backend = backend,
-    )
+def geglu_exact_backward_kernel(DW, e, g):
+    return geglu_exact_backward_kernel_default(DW, e, g)
 
 
-def geglu_approx_forward_kernel(gate, up, *, backend = None):
-    if backend is None and _resolved_geglu_approx_fg is not None:
-        return _resolved_geglu_approx_fg(gate, up)
-    return dispatch_kernel(
-        "unsloth.geglu_approx_forward",
-        gate,
-        up,
-        backend = backend,
-    )
+def geglu_approx_forward_kernel(gate, up):
+    return geglu_approx_forward_kernel_default(gate, up)
 
 
-def geglu_approx_backward_kernel(DW, e, g, *, backend = None):
-    if backend is None and _resolved_geglu_approx_bwd is not None:
-        return _resolved_geglu_approx_bwd(DW, e, g)
-    return dispatch_kernel(
-        "unsloth.geglu_approx_backward",
-        DW,
-        e,
-        g,
-        backend = backend,
-    )
+def geglu_approx_backward_kernel(DW, e, g):
+    return geglu_approx_backward_kernel_default(DW, e, g)
+
+
+_rebind_geglu_aliases()

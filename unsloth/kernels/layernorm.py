@@ -15,7 +15,7 @@
 
 import torch
 import torch.nn.functional as F
-from ._backend_registry import dispatch_kernel, register_kernel_backend
+from ._backend_registry import register_kernel_backend
 from ._optional_triton import HAS_TRITON, tl, triton
 from .utils import calculate_settings, torch_gpu_device
 
@@ -194,21 +194,41 @@ register_kernel_backend("unsloth.layernorm", "eager", _fast_layernorm_eager)
 # Module-level alias rebound by hook on backend change. None when no
 # implementation is registered for the resolved global backend yet.
 _resolved_fast_layernorm = None
+fast_layernorm_default = None
+
+
+def _make_fast_layernorm_default(impl):
+    def _fast_layernorm_default(layernorm, X):
+        assert layernorm.elementwise_affine is True
+        W = layernorm.weight
+        bias = layernorm.bias
+        eps = (
+            layernorm.variance_epsilon
+            if hasattr(layernorm, "variance_epsilon")
+            else layernorm.eps
+        )
+        return impl(X, W, bias, eps)
+    return _fast_layernorm_default
 
 
 def _rebind_layernorm_aliases(backend = None) -> None:
     """Hook fired by `_backend_registry` when the global backend changes
     or when a new backend impl is registered. Looks up the resolved impl
     for the current global backend and pins it to the module-level alias.
-    Falls back to `None` so the entry point routes through `dispatch_kernel`,
-    preserving today's behavior for explicit `backend=` callers and runtime
-    switches that aren't yet supported."""
-    global _resolved_fast_layernorm
+    Falls back to `None` so the entry point calls eager directly. Backend
+    selection happens via registry state/rebinding, not per-call kwargs."""
+    global _resolved_fast_layernorm, fast_layernorm_default
     try:
         from ._backend_registry import get_kernel_impl
         _resolved_fast_layernorm = get_kernel_impl("unsloth.layernorm")
     except Exception:
         _resolved_fast_layernorm = None
+    # NVIDIA_REVIEW: bind the exported callable to a concrete backend adapter.
+    # The call path must not branch on backend or enter a dispatcher.
+    fast_layernorm_default = _make_fast_layernorm_default(
+        _resolved_fast_layernorm or _fast_layernorm_eager
+    )
+    globals()["fast_layernorm"] = fast_layernorm_default
 
 
 # Initial bind. Wrapped so module load never fails if no backend is loaded yet.
@@ -226,25 +246,11 @@ except Exception:
     pass
 
 
-def fast_layernorm(layernorm, X, *, backend = None):
-    assert layernorm.elementwise_affine is True
-    W = layernorm.weight
-    bias = layernorm.bias
-    eps = (
-        layernorm.variance_epsilon
-        if hasattr(layernorm, "variance_epsilon")
-        else layernorm.eps
-    )
-    if backend is None and _resolved_fast_layernorm is not None:
-        return _resolved_fast_layernorm(X, W, bias, eps)
-    return dispatch_kernel(
-        "unsloth.layernorm",
-        X,
-        W,
-        bias,
-        eps,
-        backend = backend,
-    )
+def fast_layernorm(layernorm, X):
+    return fast_layernorm_default(layernorm, X)
+
+
+_rebind_layernorm_aliases()
 
 
 def patch_layernorm():

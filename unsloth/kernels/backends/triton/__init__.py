@@ -1,6 +1,7 @@
 """Built-in Triton kernel backend registrations."""
 
 from ._adapter import register_impl
+from .._manifests import TRITON_EXPECTED_OPS as EXPECTED_OPS
 from ..._optional_triton import HAS_TRITON
 from ...cross_entropy_loss import _triton_fast_cross_entropy_loss
 from ...fp8 import (
@@ -22,25 +23,6 @@ from ...swiglu import (
     _triton_swiglu_DWf_DW_dfg_kernel,
     _triton_swiglu_fg_kernel,
 )
-
-EXPECTED_OPS = (
-    "unsloth.act_quant",
-    "unsloth.cross_entropy_loss",
-    "unsloth.geglu_approx_backward",
-    "unsloth.geglu_approx_forward",
-    "unsloth.geglu_exact_backward",
-    "unsloth.geglu_exact_forward",
-    "unsloth.grouped_gemm",
-    "unsloth.layernorm",
-    "unsloth.rms_layernorm",
-    "unsloth.rope_embedding",
-    "unsloth.rope_embedding_qk",
-    "unsloth.swiglu_bwd",
-    "unsloth.swiglu_fg",
-    "unsloth.w8a8_block_fp8_matmul",
-    "unsloth.weight_dequant",
-)
-
 
 _REGISTRATIONS = {
     "unsloth.act_quant":             _triton_act_quant,

@@ -6,6 +6,7 @@
 
 # Shared CuTile op helpers (sigmoid, erf, etc.)
 from . import ct_ops  # noqa: F401
+from .._manifests import CUTILE_EXPECTED_OPS as EXPECTED_OPS
 from .cross_entropy_loss import cross_entropy_loss as cross_entropy_loss_fn
 from .fp8 import act_quant
 from .fp8 import w8a8_block_fp8_matmul_cutile
@@ -22,28 +23,6 @@ from .rope_embedding import rope_embedding_qk
 from .swiglu import swiglu_bwd
 from .swiglu import swiglu_fg
 
-# UNSLOTH_TILEGYM_DIFF_REVIEW: TileGym's suite package only exports kernels.
-# Unsloth's backend registry expects an explicit operation manifest and loader
-# hook, so keep these local unless TileGym grows an equivalent backend API.
-EXPECTED_OPS = (
-    "unsloth.act_quant",
-    "unsloth.cross_entropy_loss",
-    "unsloth.geglu_approx_backward",
-    "unsloth.geglu_approx_forward",
-    "unsloth.geglu_exact_backward",
-    "unsloth.geglu_exact_forward",
-    "unsloth.grouped_gemm",
-    "unsloth.layernorm",
-    "unsloth.rms_layernorm",
-    "unsloth.rope_embedding",
-    "unsloth.rope_embedding_qk",
-    "unsloth.swiglu_bwd",
-    "unsloth.swiglu_fg",
-    "unsloth.w8a8_block_fp8_matmul",
-    "unsloth.weight_dequant",
-)
-
-
 def load_backend() -> None:
     return None
 
@@ -51,6 +30,7 @@ __all__ = [
     "act_quant",
     "cross_entropy_loss_fn",
     "ct_ops",
+    "EXPECTED_OPS",
     "geglu_approx_backward",
     "geglu_approx_forward",
     "geglu_exact_backward",

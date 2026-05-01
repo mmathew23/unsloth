@@ -402,12 +402,18 @@ class KernelBackendTests(unittest.TestCase):
         self.assertEqual(first, second)
 
     def test_grouped_gemm_explicit_cutile_request_falls_to_eager(self):
+        original_check = backend_registry._AVAILABILITY_CHECKS.get("cutile")
         backend_registry._AVAILABILITY_CHECKS["cutile"] = lambda: (False, "blocked")
 
-        backend = get_kernel_backend("unsloth.grouped_gemm", backend = "cutile")
+        try:
+            backend = get_kernel_backend("unsloth.grouped_gemm", backend = "cutile")
 
-        self.assertEqual(backend, "eager")
-        backend_registry._AVAILABILITY_CHECKS.pop("cutile", None)
+            self.assertEqual(backend, "eager")
+        finally:
+            if original_check is None:
+                backend_registry._AVAILABILITY_CHECKS.pop("cutile", None)
+            else:
+                backend_registry._AVAILABILITY_CHECKS["cutile"] = original_check
 
     def test_grouped_gemm_eager_matches_reference(self):
         torch.manual_seed(3407)

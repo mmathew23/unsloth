@@ -1,11 +1,20 @@
+import os
+import sys
 import unittest
 from pathlib import Path
 
-from unsloth.kernels import describe_kernel_backends, ensure_backend_loaded, is_kernel_backend_available
-from unsloth.kernels.backends.cutile import EXPECTED_OPS as CUTILE_EXPECTED_OPS
-from unsloth.kernels.backends.triton import EXPECTED_OPS as TRITON_EXPECTED_OPS
-
 ROOT = Path(__file__).resolve().parents[2]
+for package_root in (ROOT / "unsloth", ROOT / "unsloth-zoo"):
+    package_root_str = str(package_root)
+    if package_root_str not in sys.path:
+        sys.path.insert(0, package_root_str)
+
+os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
+os.environ.setdefault("UNSLOTH_SKIP_MODEL_IMPORTS", "1")
+
+from unsloth.kernels import describe_kernel_backends, ensure_backend_loaded, is_kernel_backend_available
+from unsloth.kernels.backends._manifests import CUTILE_EXPECTED_OPS, TRITON_EXPECTED_OPS
+
 CUTILE_DIR = ROOT / "unsloth" / "unsloth" / "kernels" / "backends" / "cutile"
 
 
@@ -14,7 +23,7 @@ class KernelBackendArchitectureTests(unittest.TestCase):
         vendored_files = sorted(
             path
             for path in CUTILE_DIR.glob("*.py")
-            if path.name not in {"__init__.py", "_adapter.py", "ct_ops.py"}
+            if path.name not in {"__init__.py", "ct_ops.py"} and not path.name.startswith("_")
         )
         self.assertTrue(vendored_files)
 

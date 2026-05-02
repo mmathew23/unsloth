@@ -351,6 +351,9 @@ _DTYPE_TO_INT = {
 
 @register_impl("unsloth.weight_dequant", backend="cutile")
 def weight_dequant_block(x: torch.Tensor, s: torch.Tensor, block_size: int = 128, dtype=torch.bfloat16) -> torch.Tensor:
+    # NVIDIA_REVIEW: Keep this as the original CuTile dequant implementation.
+    # Qwen3 FP8 SFT currently shows lower model-level grad norms when this
+    # backend is selected, even though isolated dequant probes match Triton.
     if not x.is_contiguous():
         x = x.contiguous()
     if not s.is_contiguous():

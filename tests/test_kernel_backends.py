@@ -922,6 +922,29 @@ class KernelBackendTests(unittest.TestCase):
 
         self.assertTrue(torch.equal(out_no_bias, out_default))
 
+    def test_fp8_eager_block_dequant_does_not_transpose_square_scales(self):
+        # Square matrices have symmetric expected/reversed scale shapes. The
+        # eager fallback must prefer the actual expected shape, otherwise Qwen3
+        # FP8 square projections dequantize with transposed block scales.
+        block_size = 128
+        x = torch.ones((256, 256), dtype = torch.float8_e4m3fn)
+        scales = torch.tensor(
+            [[1.0, 2.0], [3.0, 4.0]],
+            dtype = torch.float32,
+        )
+
+        out = fp8_module._weight_dequant_block_eager(
+            x,
+            scales,
+            block_size = block_size,
+            dtype = torch.float32,
+        )
+
+        self.assertEqual(out[0, 0].item(), 1.0)
+        self.assertEqual(out[0, 128].item(), 2.0)
+        self.assertEqual(out[128, 0].item(), 3.0)
+        self.assertEqual(out[128, 128].item(), 4.0)
+
     def _make_block_quant_linear(self, in_features, out_features, bias):
         # Synthetic block-quant linear: float weights paired with all-ones
         # block scales so the FP8 path is exercised but the dequant collapses

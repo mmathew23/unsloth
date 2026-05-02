@@ -115,15 +115,19 @@ def _weight_dequant_block_eager(
         s = s.contiguous()
     M, N = x.shape
     expected_shape = (math.ceil(M / block_size), math.ceil(N / block_size))
-    if s.shape == expected_shape[::-1]:
+    if s.shape == expected_shape:
+        pass
+    elif s.shape == expected_shape[::-1]:
         s = s.t().contiguous()
-    elif s.shape != expected_shape:
+    else:
         raise ValueError(
             f"Scale shape {s.shape} is incompatible with weight shape {x.shape} and block size {block_size}"
         )
     row_scales = torch.repeat_interleave(s, block_size, dim = 0)[:M]
     full_scales = torch.repeat_interleave(row_scales, block_size, dim = 1)[:, :N]
-    return x.to(dtype = dtype) * full_scales.to(dtype = dtype)
+    return (x.to(dtype = torch.float32) * full_scales.to(dtype = torch.float32)).to(
+        dtype = dtype
+    )
 
 
 register_kernel_backend(
@@ -858,6 +862,21 @@ def _fp8_linear_eager(X, weight, weight_scale, bias = None):
     return output
 
 
+@torch.compiler.disable
+def _fp8_linear_training_autograd(X, weight, weight_scale, bias = None):
+    # NVIDIA_REVIEW: `matmul_lora` uses `fp8_linear` while training. Keeping
+    # that path on the raw autograd.Function avoids Dynamo dropping the
+    # block-FP8 dX on compiled Triton wrappers, and keeps cutile/triton
+    # gradients on the same implementation.
+    return FP8BlockQuantLinear.apply(X, weight, weight_scale, bias)
+
+
+def _fp8_linear_runtime(X, weight, weight_scale, bias = None):
+    if torch.is_grad_enabled() and X.requires_grad:
+        return _fp8_linear_training_autograd(X, weight, weight_scale, bias)
+    return _fp8_linear_static(X, weight, weight_scale, bias)
+
+
 def _has_rowwise_fbgemm_ops() -> bool:
     """Return True iff ``torch.ops.fbgemm.f8f8bf16_rowwise`` is available.
 
@@ -1033,7 +1052,7 @@ def _rebind_fp8_aliases(backend = None) -> None:
         globals()["fp8_linear"] = (
             _fp8_linear_eager
             if _BAKED_BLOCK_FP8_BACKEND == "eager"
-            else _fp8_linear_static
+            else _fp8_linear_runtime
         )
     _patch_fp8_hot_imports()
 
@@ -1159,6 +1178,11 @@ if FP8Linear is not None:
     if fp8_block_quant_linear is fp8_torch_block_quant_forward:
         _hot_block_fp8 = _fp8_torch_block_quant_forward_lean
         def _patched_block_fp8(self, X):
+            if torch.is_grad_enabled() and X.requires_grad:
+                # NVIDIA_REVIEW: training needs the explicit autograd boundary
+                # above. The compiled lean wrapper is kept for no-grad
+                # inference/generation where PyPI call-shape parity matters.
+                return _fp8_linear_training_autograd(X, self.weight, self.weight_scale_inv)
             return _hot_block_fp8(X, self.weight, self.weight_scale_inv)
         FP8Linear.forward = _patched_block_fp8
     else:

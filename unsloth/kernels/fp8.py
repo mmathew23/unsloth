@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+from contextvars import ContextVar
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import math
 from ._backend_registry import (
-    dispatch_kernel,
     get_kernel_backend,
     get_kernel_impl,
     register_global_backend_change_hook,
@@ -143,7 +143,8 @@ def weight_dequant_block(
     block_size: int = 128,
     dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    return _weight_dequant_block_default(x, s, block_size, dtype)
+    impl = _get_fp8_alias_bindings()["weight_dequant_block"]
+    return impl(x, s, block_size, dtype)
 
 
 def weight_dequant(
@@ -232,7 +233,8 @@ def act_quant(
     x: torch.Tensor,
     block_size: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return _act_quant_default(x, block_size)
+    impl = _get_fp8_alias_bindings()["act_quant"]
+    return impl(x, block_size)
 
 
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/quantization/fp8_kernel.py
@@ -457,7 +459,8 @@ def fp8_block_matmul(
     block_size: tuple[int, int],
     output_dtype: torch.dtype = torch.bfloat16,
 ):
-    return _fp8_block_matmul_default(
+    impl = _get_fp8_alias_bindings()["fp8_block_matmul"]
+    return impl(
         act_q,
         weight_q,
         act_scale,
@@ -558,16 +561,10 @@ def fp8_torch_block_quant_forward(X, weight, weight_scale, bias = None):
 #
 # This Function is only reached from `module_forward_patch`'s `weight_scale_inv`
 # branch when `fp8_block_quant_linear is fp8_torch_block_quant_forward` — i.e.
-# when the fbgemm block-quant rebind did NOT happen.  Whatever block-fp8 backend
-# is resolved (triton today, cutile / future kernels later) gets baked into the
-# module-level `_BAKED_BLOCK_FP8_BACKEND` constant below and passed down to
-# `act_quant` / `fp8_block_matmul`. With a non-None backend kwarg those calls
-# either hit their local early-exit fast paths (triton, eager) or go through
-# `dispatch_kernel` with the backend already resolved — either way they skip
-# the `_RUNTIME_GLOBAL_BACKEND.get()` ContextVar read, which dynamo can't trace
-# and which would otherwise spawn a fresh compile region per FP8 layer per
-# decoded token inside HF generate's static-cache loop (the "compile_id=1,
-# Region 1/X" we were chasing in the GRPO -10% gap).
+# when the fbgemm block-quant rebind did NOT happen. Generated cache modules
+# clone this Function with backend-local `act_quant` / `fp8_block_matmul`
+# callables before tracing. Direct public calls keep context-local correctness
+# through the stable module-level dispatchers below.
 class FP8BlockQuantLinearLean(torch.autograd.Function):
     @staticmethod
     def forward(ctx, X, weight, weight_scale):
@@ -605,12 +602,9 @@ class FP8BlockQuantLinearLean(torch.autograd.Function):
         if not weight.is_contiguous():
             weight = weight.contiguous()
 
-        # Hot path: `act_quant` / `fp8_block_matmul` constant-fold
-        # `backend is None` and dispatch via `_resolved_act_quant` /
-        # `_resolved_fp8_block_matmul` — same call shape PyPI uses (one
-        # ID_MATCH guard per alias, no ContextVar.get(), no graph break).
-        # The aliases are rebound by `_rebind_fp8_aliases` whenever the
-        # global backend changes.
+        # Generated cache modules replace `act_quant` / `fp8_block_matmul`
+        # with concrete runtime-local functions before tracing. Direct public
+        # calls route through context-local dispatchers for correctness.
         qinput, scale = act_quant(X, block_size[1])
         output = fp8_block_matmul(
             qinput,
@@ -946,35 +940,46 @@ except:
 _KNOWN_LOCAL_BACKENDS = ("triton", "eager", "cutile")
 
 
-# Block-FP8 backend resolved once at module load time and threaded through
-# `fp8_linear` (see L1041 below). The `if backend is None: resolved_backend
-# = _BAKED_BLOCK_FP8_BACKEND` branch prevents `fp8_linear`'s `@torch_compile`
-# body from reaching `_RUNTIME_GLOBAL_BACKEND.get()` (a ContextVar.get()
-# that dynamo can't trace), so the body compiles into a single graph
-# instead of two split by `torch_dynamo_resume_in_fp8_linear`.
-#
-# This constant is rebound by `_rebind_fp8_aliases` whenever the global
-# backend changes — keep it in sync with the dispatcher hot-path aliases
-# below so a runtime `set_kernel_backend("cutile")` re-routes everything.
+# Block-FP8 backend metadata for the current context. Generated cache modules
+# bind concrete FP8 callables before tracing; public module-level dispatchers
+# keep context-local correctness for direct calls and tests.
 try:
     _BAKED_BLOCK_FP8_BACKEND = get_kernel_backend("unsloth.w8a8_block_fp8_matmul")
 except Exception:
     _BAKED_BLOCK_FP8_BACKEND = None
 
 
-# Module-level aliases for the dispatcher hot path. Bound at import via
-# `_rebind_fp8_aliases` and rebound by the registry hook on every
-# `set_kernel_backend` / `kernel_backend_context` transition. Each
-# dispatcher entry point (`act_quant`, `fp8_block_matmul`,
-# `weight_dequant_block`) constant-folds `backend is None` to a direct call
-# of the resolved alias — one ID_MATCH guard per alias, no kwargs, no
-# ContextVar reads, no graph break inside `@torch_compile` callers.
+# Context-local aliases for public FP8 dispatchers. `_resolved_*` and
+# `*_default` are retained as current-context metadata for tests/debugging,
+# but public dispatch behavior reads `_FP8_ALIAS_BINDINGS`, not process-global
+# function rebinding.
 _resolved_act_quant = None
 _resolved_fp8_block_matmul = None
 _resolved_weight_dequant_block = None
 _act_quant_default = _act_quant_eager
 _fp8_block_matmul_default = _w8a8_block_fp8_matmul_eager
 _weight_dequant_block_default = _weight_dequant_block_eager
+_FP8_ALIAS_BINDINGS = ContextVar("unsloth_fp8_alias_bindings", default = None)
+
+
+def _fallback_fp8_alias_bindings():
+    return {
+        "act_quant": _act_quant_eager,
+        "fp8_block_matmul": _w8a8_block_fp8_matmul_eager,
+        "weight_dequant_block": _weight_dequant_block_eager,
+        "block_fp8_backend": None,
+    }
+
+
+def _get_fp8_alias_bindings():
+    bindings = _FP8_ALIAS_BINDINGS.get()
+    if bindings is None:
+        try:
+            _rebind_fp8_aliases()
+            bindings = _FP8_ALIAS_BINDINGS.get()
+        except Exception:
+            bindings = None
+    return bindings or _fallback_fp8_alias_bindings()
 
 
 def _patch_fp8_hot_imports() -> None:
@@ -988,7 +993,7 @@ def _patch_fp8_hot_imports() -> None:
 
 
 def _rebind_fp8_aliases(backend = None) -> None:
-    """Rebind dispatcher aliases from the registry. Called at module load
+    """Resolve dispatcher aliases from the registry. Called at module load
     and as a hook from `set_kernel_backend` / `kernel_backend_context` /
     `register_kernel_backend` / `ensure_backend_loaded`.
 
@@ -999,14 +1004,12 @@ def _rebind_fp8_aliases(backend = None) -> None:
         preference (matches the original branch at L487-504).
       * `_resolved_weight_dequant_block` — backed by `unsloth.weight_dequant`.
 
-    Also refreshes `_BAKED_BLOCK_FP8_BACKEND` so the `fp8_linear`
-    `if backend is None: resolved_backend = _BAKED_BLOCK_FP8_BACKEND` branch
-    stays consistent with the dispatcher aliases.
+    Also refreshes `_BAKED_BLOCK_FP8_BACKEND` so direct `fp8_linear` calls
+    stay consistent with the dispatcher aliases.
 
-    Falls back to `None` for any alias whose registry lookup fails (e.g.
-    the requested backend has no implementation registered). The dispatcher
-    entry points then route through `dispatch_kernel`, preserving today's
-    fallback behavior.
+    Bindings are stored in a ContextVar so `kernel_backend_context(...)`
+    remains thread/async-context local instead of rewriting process-global
+    `act_quant` / `fp8_block_matmul` / `weight_dequant_block` symbols.
     """
     global _resolved_act_quant, _resolved_fp8_block_matmul
     global _resolved_weight_dequant_block, _BAKED_BLOCK_FP8_BACKEND
@@ -1038,9 +1041,6 @@ def _rebind_fp8_aliases(backend = None) -> None:
     _weight_dequant_block_default = (
         _resolved_weight_dequant_block or _weight_dequant_block_eager
     )
-    globals()["act_quant"] = _act_quant_default
-    globals()["fp8_block_matmul"] = _fp8_block_matmul_default
-    globals()["weight_dequant_block"] = _weight_dequant_block_default
     # Keep the baked block-FP8 backend constant in sync with the static aliases.
     try:
         _BAKED_BLOCK_FP8_BACKEND = get_kernel_backend(
@@ -1048,18 +1048,20 @@ def _rebind_fp8_aliases(backend = None) -> None:
         )
     except Exception:
         _BAKED_BLOCK_FP8_BACKEND = None
-    if "fp8_linear" in globals():
-        globals()["fp8_linear"] = (
-            _fp8_linear_eager
-            if _BAKED_BLOCK_FP8_BACKEND == "eager"
-            else _fp8_linear_runtime
-        )
+    _FP8_ALIAS_BINDINGS.set(
+        {
+            "act_quant": _act_quant_default,
+            "fp8_block_matmul": _fp8_block_matmul_default,
+            "weight_dequant_block": _weight_dequant_block_default,
+            "block_fp8_backend": _BAKED_BLOCK_FP8_BACKEND,
+        }
+    )
     _patch_fp8_hot_imports()
 
 
 # Initial bind. Wrapped in try/except so module load never fails when no
-# backend has registered yet — the dispatcher entry points then route
-# through `dispatch_kernel`, which has its own fallback chain.
+# backend has registered yet — the dispatcher entry points then use local eager
+# fallbacks until the registry can resolve a backend for the current context.
 try:
     _rebind_fp8_aliases()
 except Exception:
@@ -1067,7 +1069,8 @@ except Exception:
 
 
 # Register hook so `set_kernel_backend(...)` and `kernel_backend_context(...)`
-# transitions rebind the aliases without callers needing to re-import.
+# transitions refresh the current context's aliases without callers needing to
+# re-import.
 try:
     register_global_backend_change_hook(_rebind_fp8_aliases)
 except Exception:
@@ -1076,9 +1079,9 @@ except Exception:
 
 @torch_compile
 def _fp8_linear_static(X, weight, weight_scale, bias = None):
-    # NVIDIA_REVIEW: no per-call backend kwarg and no backend branch here.
-    # `_rebind_fp8_aliases` chooses concrete act/dequant/matmul symbols at
-    # import or when the user changes backend state.
+    # NVIDIA_REVIEW: no per-call backend kwarg and no backend branch here for
+    # generated-cache modules. They bind concrete runtime-local FP8 callables
+    # before tracing; direct public calls use the context-local wrappers.
     # Per-tensor quantization: single scalar scale for entire weight
     # Block quantized FP8: 2D scale tensor with multiple columns
     if weight_scale.numel() == 1 or (
@@ -1111,14 +1114,20 @@ def _fp8_linear_static(X, weight, weight_scale, bias = None):
     return out
 
 
-fp8_linear = _fp8_linear_static
+def fp8_linear(X, weight, weight_scale, bias = None):
+    bindings = _get_fp8_alias_bindings()
+    if bindings["block_fp8_backend"] == "eager":
+        return _fp8_linear_eager(X, weight, weight_scale, bias)
+    return _fp8_linear_runtime(X, weight, weight_scale, bias)
+
+
 _rebind_fp8_aliases()
 
 
 def module_forward_patch(scale_attr = "weight_scale"):
-    # Resolve the implementation shape once. Backend-specific lower-level
-    # kernels are static symbols rebound by `_rebind_fp8_aliases`; no per-call
-    # backend kwarg is threaded through this patched forward.
+    # Resolve the implementation shape once. Generated-cache modules bind
+    # backend-specific lower-level kernels before tracing; direct public calls
+    # use context-local dispatchers.
 
     if scale_attr == "weight_scale_inv":
         # FP8Linear → block quantization. When the resolved pointer is the

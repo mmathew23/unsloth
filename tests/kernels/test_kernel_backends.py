@@ -3,6 +3,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import textwrap
 import unittest
 import warnings
@@ -852,6 +853,61 @@ class KernelBackendTests(unittest.TestCase):
             self.assertIs(fp8_mod._resolved_act_quant, fp8_mod._act_quant_eager)
         # Exiting the context restores the outer alias.
         self.assertIs(fp8_mod._resolved_act_quant, default_act)
+
+    def test_fp8_public_dispatch_is_context_local_across_threads(self):
+        backend_a = "thread_fp8_a"
+        backend_b = "thread_fp8_b"
+
+        def _act_a(X, block_size):
+            return torch.full_like(X, 1), torch.ones(1, dtype = X.dtype)
+
+        def _act_b(X, block_size):
+            return torch.full_like(X, 2), torch.ones(1, dtype = X.dtype)
+
+        register_kernel_backend("unsloth.act_quant", backend_a, _act_a)
+        register_kernel_backend("unsloth.act_quant", backend_b, _act_b)
+
+        a_ready = threading.Event()
+        b_ready = threading.Event()
+        release_b = threading.Event()
+        results = {}
+        errors = []
+
+        def _worker_a():
+            try:
+                with kernel_backend_context(global_backend = backend_a):
+                    a_ready.set()
+                    self.assertTrue(b_ready.wait(timeout = 5))
+                    y, _ = fp8_module.act_quant(torch.zeros(1, 128), 128)
+                    results["a"] = float(y.flatten()[0])
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                release_b.set()
+
+        def _worker_b():
+            try:
+                self.assertTrue(a_ready.wait(timeout = 5))
+                with kernel_backend_context(global_backend = backend_b):
+                    b_ready.set()
+                    self.assertTrue(release_b.wait(timeout = 5))
+                    y, _ = fp8_module.act_quant(torch.zeros(1, 128), 128)
+                    results["b"] = float(y.flatten()[0])
+            except Exception as exc:
+                errors.append(exc)
+
+        thread_a = threading.Thread(target = _worker_a)
+        thread_b = threading.Thread(target = _worker_b)
+        thread_a.start()
+        thread_b.start()
+        thread_a.join(timeout = 10)
+        thread_b.join(timeout = 10)
+
+        self.assertFalse(thread_a.is_alive())
+        self.assertFalse(thread_b.is_alive())
+        if errors:
+            raise errors[0]
+        self.assertEqual(results, {"a": 1.0, "b": 2.0})
 
     def test_static_default_hot_symbols_are_exported_callables(self):
         import importlib

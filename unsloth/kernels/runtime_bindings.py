@@ -47,24 +47,6 @@ def _get_backend(name: str) -> str | None:
         return None
 
 
-def _make_weight_dequant(weight_dequant_block: KernelCallable) -> KernelCallable:
-    import torch
-
-    def _weight_dequant(x: torch.Tensor, s: torch.Tensor, dtype = torch.bfloat16):
-        if s.numel() == 1:
-            return x.to(dtype) * s.view(1, 1).to(dtype)
-        if s.ndim == 2 and s.shape[1] == 1:
-            if x.shape[0] == s.shape[0]:
-                return x.to(dtype) * s.to(dtype)
-            if x.shape[1] == s.shape[0]:
-                y = x.t().to(dtype) * s.to(dtype)
-                return y.t()
-            raise ValueError(f"Incompatible shapes {x.shape = }, {s.shape = }")
-        return weight_dequant_block(x, s, dtype = dtype)
-
-    return _weight_dequant
-
-
 def resolve_kernel_runtime_bindings() -> KernelRuntimeBindings:
     """Resolve concrete callables for generated-cache module globals.
 
@@ -139,7 +121,7 @@ def resolve_kernel_runtime_bindings() -> KernelRuntimeBindings:
         "unsloth.weight_dequant",
         fp8_mod._weight_dequant_block_eager,
     )
-    weight_dequant = _make_weight_dequant(weight_dequant_block)
+    weight_dequant = fp8_mod.weight_dequant
     block_fp8_backend = _get_backend("unsloth.w8a8_block_fp8_matmul")
     fp8_linear = (
         fp8_mod._fp8_linear_eager

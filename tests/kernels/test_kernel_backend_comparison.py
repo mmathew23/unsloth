@@ -10,12 +10,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 for repo in (ROOT / "unsloth", ROOT / "unsloth-zoo"):
     if str(repo) not in sys.path:
         sys.path.insert(0, str(repo))
-
-os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 
 from unsloth.kernels import is_kernel_backend_available
 from unsloth.kernels._backend_registry import get_kernel_backend, kernel_backend_context

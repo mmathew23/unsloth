@@ -8,12 +8,10 @@ from unittest.mock import patch
 import torch
 import torch.nn.functional as F
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 for repo in (ROOT / "unsloth", ROOT / "unsloth-zoo"):
     if str(repo) not in sys.path:
         sys.path.insert(0, str(repo))
-
-os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 
 from unsloth.kernels import clear_kernel_backend_overrides, kernel_backend_context
 from unsloth.models import glm4_moe

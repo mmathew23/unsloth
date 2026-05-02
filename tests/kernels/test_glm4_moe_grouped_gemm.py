@@ -1,17 +1,10 @@
 import os
-import sys
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
-
-ROOT = Path(__file__).resolve().parents[3]
-for repo in (ROOT / "unsloth", ROOT / "unsloth-zoo"):
-    if str(repo) not in sys.path:
-        sys.path.insert(0, str(repo))
 
 from unsloth.kernels import clear_kernel_backend_overrides, kernel_backend_context
 from unsloth.models import glm4_moe

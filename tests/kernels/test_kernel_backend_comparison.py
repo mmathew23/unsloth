@@ -11,25 +11,32 @@ import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[3]
-for repo in (ROOT / "unsloth", ROOT / "unsloth-zoo"):
-    if str(repo) not in sys.path:
-        sys.path.insert(0, str(repo))
 
 from unsloth.kernels import is_kernel_backend_available
 from unsloth.kernels._backend_registry import get_kernel_backend, kernel_backend_context
 cross_entropy_module = importlib.import_module("unsloth.kernels.cross_entropy_loss")
 geglu_module = importlib.import_module("unsloth.kernels.geglu")
 grouped_gemm_module = importlib.import_module("unsloth.kernels.grouped_gemm")
-grouped_gemm_interface = importlib.import_module("unsloth.kernels.moe.grouped_gemm.interface")
+try:
+    grouped_gemm_interface = importlib.import_module("unsloth.kernels.moe.grouped_gemm.interface")
+except ModuleNotFoundError as exc:
+    if exc.name != "triton":
+        raise
+    grouped_gemm_interface = None
 layernorm_module = importlib.import_module("unsloth.kernels.layernorm")
 rms_layernorm_module = importlib.import_module("unsloth.kernels.rms_layernorm")
 rope_embedding_module = importlib.import_module("unsloth.kernels.rope_embedding")
 swiglu_module = importlib.import_module("unsloth.kernels.swiglu")
-from unsloth.kernels.moe.grouped_gemm.kernels.tuning import (
-    KernelConfigBackward_dW,
-    KernelConfigBackward_dX,
-    KernelConfigForward,
-)
+try:
+    from unsloth.kernels.moe.grouped_gemm.kernels.tuning import (
+        KernelConfigBackward_dW,
+        KernelConfigBackward_dX,
+        KernelConfigForward,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != "triton":
+        raise
+    KernelConfigBackward_dW = KernelConfigBackward_dX = KernelConfigForward = None
 from unsloth.kernels.moe.grouped_gemm.reference.moe_ops import get_routing_indices
 
 
@@ -744,12 +751,16 @@ def test_grouped_gemm_backend_numerics(dtype: torch.dtype):
     m_sizes, gather_indices = get_routing_indices(selected_experts, 2)
     m_sizes = m_sizes.to(device = CUDA_DEVICE, dtype = torch.int32)
     gather_indices = gather_indices.to(device = CUDA_DEVICE, dtype = torch.int32)
-    first_gemm_fwd = KernelConfigForward(permute_x = True)
-    first_gemm_bwd_dx = KernelConfigBackward_dX(permute_x = True)
-    first_gemm_bwd_dw = KernelConfigBackward_dW(permute_x = True)
-    second_gemm_fwd = KernelConfigForward(permute_y = True)
-    second_gemm_bwd_dx = KernelConfigBackward_dX(permute_y = True)
-    second_gemm_bwd_dw = KernelConfigBackward_dW(permute_y = True)
+    if KernelConfigForward is None:
+        first_gemm_fwd = first_gemm_bwd_dx = first_gemm_bwd_dw = None
+        second_gemm_fwd = second_gemm_bwd_dx = second_gemm_bwd_dw = None
+    else:
+        first_gemm_fwd = KernelConfigForward(permute_x = True)
+        first_gemm_bwd_dx = KernelConfigBackward_dX(permute_x = True)
+        first_gemm_bwd_dw = KernelConfigBackward_dW(permute_x = True)
+        second_gemm_fwd = KernelConfigForward(permute_y = True)
+        second_gemm_bwd_dx = KernelConfigBackward_dX(permute_y = True)
+        second_gemm_bwd_dw = KernelConfigBackward_dW(permute_y = True)
 
     ref_x = _clone_for_backend(x_base, requires_grad = True)
     ref_w_up = _clone_for_backend(w_up_base, requires_grad = True)
@@ -840,6 +851,8 @@ def test_grouped_gemm_triton_small_glm4_dims():
     available, reason = is_kernel_backend_available("triton")
     if not available:
         pytest.skip(reason or "Triton is unavailable.")
+    if grouped_gemm_interface is None:
+        pytest.skip("Triton grouped-GEMM interface is unavailable.")
     _set_seed()
 
     x_base = torch.randn(4, 16, device = CUDA_DEVICE, dtype = torch.bfloat16)

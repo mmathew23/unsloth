@@ -20,6 +20,22 @@ warnings.filterwarnings(
     category = FutureWarning,
     module = r"transformers\.utils\.hub",
 )
+warnings.filterwarnings(
+    "ignore",
+    message = r"Unsloth: Triton (?:could not be imported .*|is not installed\.) Triton-backed kernels are unavailable; use CuTile or other non-Triton backends\.",
+    category = UserWarning,
+    module = r"unsloth",
+)
+warnings.filterwarnings(
+    "ignore",
+    message = r"numpy\.core is deprecated and has been renamed to numpy\._core\..*",
+    category = DeprecationWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message = r"builtin type swigvarlink has no __module__ attribute",
+    category = DeprecationWarning,
+)
 
 
 def pytest_configure(config):
@@ -36,3 +52,22 @@ def pytest_configure(config):
         "filterwarnings",
         r"ignore:Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers\..*:FutureWarning:transformers\.utils\.hub",
     )
+    config.addinivalue_line(
+        "filterwarnings",
+        r"ignore:.*Triton.*Triton-backed kernels are unavailable.*CuTile.*:UserWarning:unsloth",
+    )
+    config.addinivalue_line(
+        "filterwarnings",
+        r"ignore:numpy\.core is deprecated and has been renamed to numpy\._core\..*:DeprecationWarning",
+    )
+    config.addinivalue_line(
+        "filterwarnings",
+        r"ignore:builtin type swigvarlink has no __module__ attribute:DeprecationWarning",
+    )
+
+
+# Kernel tests import torch directly in several modules. Import Unsloth first
+# here so those tests follow the same import-order contract as user code.
+# The active environment must provide the matching unsloth_zoo package; do not
+# add sibling source trees to sys.path here or packaging mismatches get hidden.
+import unsloth  # noqa: F401, E402

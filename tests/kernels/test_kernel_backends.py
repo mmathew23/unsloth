@@ -6,16 +6,13 @@ import sys
 import textwrap
 import unittest
 import warnings
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
 import torch
 
 ROOT = Path(__file__).resolve().parents[3]
-for repo in (ROOT / "unsloth", ROOT / "unsloth-zoo"):
-    if str(repo) not in sys.path:
-        sys.path.insert(0, str(repo))
 
 from unsloth.kernels import (
     clear_kernel_backend_overrides,
@@ -361,7 +358,13 @@ class KernelBackendTests(unittest.TestCase):
 
     def test_per_op_override_beats_global_backend(self):
         register_kernel_backend("unsloth.swiglu_fg", "dummy", lambda e, g: e - g)
-        with _expect_backend_fallback_warnings(self, "cutile"):
+        cutile_available, _ = is_kernel_backend_available("cutile")
+        warning_context = (
+            nullcontext()
+            if cutile_available
+            else _expect_backend_fallback_warnings(self, "cutile")
+        )
+        with warning_context:
             set_kernel_backend("cutile")
             set_kernel_backend_for_op("swiglu_fg", "dummy")
 

@@ -1,14 +1,5 @@
-import sys
 import unittest
-from pathlib import Path
 from unittest.mock import patch
-
-
-ROOT = Path(__file__).resolve().parents[3]
-for package_root in (ROOT / "unsloth", ROOT / "unsloth-zoo"):
-    package_root_str = str(package_root)
-    if package_root_str not in sys.path:
-        sys.path.insert(0, package_root_str)
 
 
 class CompileBackendSettingsTests(unittest.TestCase):

@@ -237,7 +237,10 @@ elif DEVICE_TYPE == "xpu":
 # if "SPACE_AUTHOR_NAME" not in os.environ and "SPACE_REPO_NAME" not in os.environ:
 try:
     import triton
-except ModuleNotFoundError:
+except Exception as exc:
+    warnings.warn(
+        f"Unsloth: Triton could not be imported ({exc!r}). Triton-backed kernels are unavailable; use CuTile or other non-Triton backends."
+    )
     triton = None
 
 if DEVICE_TYPE == "cuda":

@@ -27,6 +27,7 @@ from unsloth.kernels import (
     kernel_backend_context,
     register_kernel_backend,
     set_kernel_backend,
+    set_kernel_backends,
     set_kernel_backend_for_op,
 )
 grouped_gemm_module = importlib.import_module("unsloth.kernels.grouped_gemm")
@@ -58,6 +59,17 @@ class KernelBackendTests(unittest.TestCase):
         self.assertIsInstance(available, bool)
         if not available:
             self.assertTrue(reason)
+
+    def test_set_kernel_backends_preserves_global_when_only_overrides_are_set(self):
+        set_kernel_backend("dummy_global")
+        set_kernel_backends(overrides = {"unsloth.swiglu_fg": "dummy_op"})
+
+        state = backend_registry.get_kernel_backend_state()
+        self.assertEqual(state["runtime_global_backend"], "dummy_global")
+        self.assertEqual(
+            state["runtime_overrides"]["unsloth.swiglu_fg"],
+            "dummy_op",
+        )
 
     def test_runtime_override_selects_custom_backend_for_low_level_op(self):
         import importlib

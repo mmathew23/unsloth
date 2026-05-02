@@ -131,42 +131,7 @@ except Exception:
     pass
 
 
-def grouped_gemm(
-    X: torch.Tensor,
-    W: torch.Tensor,
-    m_sizes: torch.Tensor,
-    topk: int,
-    gather_indices: torch.Tensor | None = None,
-    permute_x: bool = False,
-    permute_y: bool = False,
-    topk_weights: torch.Tensor | None = None,
-    fuse_mul_post: bool = False,
-    kernel_config_fwd = None,
-    kernel_config_bwd_dX = None,
-    kernel_config_bwd_dW = None,
-    autotune: bool = False,
-    is_first_gemm: bool = True,
-    dX_only: bool = False,
-    dW_only: bool = False,
-) -> torch.Tensor:
-    return grouped_gemm_default(
-        X,
-        W,
-        m_sizes,
-        topk,
-        gather_indices = gather_indices,
-        permute_x = permute_x,
-        permute_y = permute_y,
-        topk_weights = topk_weights,
-        fuse_mul_post = fuse_mul_post,
-        kernel_config_fwd = kernel_config_fwd,
-        kernel_config_bwd_dX = kernel_config_bwd_dX,
-        kernel_config_bwd_dW = kernel_config_bwd_dW,
-        autotune = autotune,
-        is_first_gemm = is_first_gemm,
-        dX_only = dX_only,
-        dW_only = dW_only,
-    )
-
-
+# Export `grouped_gemm` as the currently resolved backend alias. This is
+# intentionally rebound instead of wrapping so hot imports keep the direct call
+# shape chosen by `_rebind_grouped_gemm_aliases`.
 _rebind_grouped_gemm_aliases()

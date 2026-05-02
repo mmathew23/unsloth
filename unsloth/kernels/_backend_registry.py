@@ -666,9 +666,12 @@ def set_kernel_backend_for_op(name: str, backend: str | None) -> None:
     _fire_global_backend_change_hooks()
 
 
+_UNSET: Any = object()
+
+
 def set_kernel_backends(
     *,
-    global_backend: str | None = None,
+    global_backend: Any = _UNSET,
     overrides: dict[str, str | None] | None = None,
 ) -> None:
     """Set the global backend and/or per-kernel overrides. Setter only — returns ``None``.
@@ -686,7 +689,8 @@ def set_kernel_backends(
     the ``UNSLOTH_KERNEL_BACKEND`` and ``UNSLOTH_KERNEL_BACKEND_OVERRIDES``
     environment variables.
     """
-    set_kernel_backend(global_backend)
+    if global_backend is not _UNSET:
+        set_kernel_backend(global_backend)
     if overrides is None:
         return
     for kernel_name, backend_name in overrides.items():
@@ -704,9 +708,6 @@ def clear_kernel_backend_overrides() -> None:
     _RUNTIME_GLOBAL_BACKEND.set(None)
     _RUNTIME_KERNEL_OVERRIDES.set({})
     _fire_global_backend_change_hooks()
-
-
-_UNSET: Any = object()
 
 
 @contextlib.contextmanager

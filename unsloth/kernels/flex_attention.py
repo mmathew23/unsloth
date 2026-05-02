@@ -101,7 +101,6 @@ if not HAS_FLEX_ATTENTION:
         slow_attention_softcapping = torch.compile(
             _slow_attention_softcapping_impl,
             fullgraph=True, dynamic=True, options=torch_compile_options,
-            backend=_KERNEL_COMPILE_BACKEND,
         )
     else:
         slow_attention_softcapping = _slow_attention_softcapping_impl

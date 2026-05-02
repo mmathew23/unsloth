@@ -1109,13 +1109,13 @@ def fix_triton_compiled_kernel_missing_attrs():
     """
     try:
         import torch
-    except (ImportError, ModuleNotFoundError):
+    except Exception:
         return
 
     try:
         import triton
         import triton.compiler.compiler as triton_compiler
-    except (ImportError, ModuleNotFoundError):
+    except Exception:
         return
 
     # Only needed when the CompiledKernel class lacks num_ctas as a direct attr

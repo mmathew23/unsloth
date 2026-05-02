@@ -44,8 +44,6 @@ from ..kernels.rms_layernorm import fast_rms_layernorm_default as fast_rms_layer
 from ..kernels.grouped_gemm import grouped_gemm_default as grouped_gemm
 from ..kernels.moe.grouped_gemm.reference.moe_ops import get_routing_indices
 
-HAS_GROUPED_GEMM = True
-
 
 # Import transformers GLM4 MoE Lite classes
 try:
@@ -167,52 +165,48 @@ def _glm4_moe_fast_forward(self, hidden_states):
             topk_indices, self.n_routed_experts
         )
 
-    # Use grouped GEMM for expert computation
-    if HAS_GROUPED_GEMM:
-        # Cast hidden_states to match expert weights dtype
-        # Under autocast, hidden_states may be fp32 while weights are bf16
-        hidden_states = hidden_states.to(self.experts.gate_up_proj.dtype)
+    # Use grouped GEMM for expert computation. The grouped-gemm module always
+    # exposes an implementation, falling back through the backend registry to
+    # eager when accelerated backends are unavailable.
+    hidden_states = hidden_states.to(self.experts.gate_up_proj.dtype)
 
-        # First grouped GEMM: gate_up_proj with permute_x
-        # Input: [num_tokens, hidden_dim] -> Output: [total_tokens, 2*intermediate_dim]
-        intermediate = grouped_gemm(
-            X = hidden_states,
-            W = self.experts.gate_up_proj,
-            m_sizes = token_counts_by_expert.int(),
-            topk = self.top_k,
-            gather_indices = gather_indices,
-            permute_x = True,
-            permute_y = False,
-            autotune = True,
-            is_first_gemm = True,
-        )
+    # First grouped GEMM: gate_up_proj with permute_x
+    # Input: [num_tokens, hidden_dim] -> Output: [total_tokens, 2*intermediate_dim]
+    intermediate = grouped_gemm(
+        X = hidden_states,
+        W = self.experts.gate_up_proj,
+        m_sizes = token_counts_by_expert.int(),
+        topk = self.top_k,
+        gather_indices = gather_indices,
+        permute_x = True,
+        permute_y = False,
+        autotune = True,
+        is_first_gemm = True,
+    )
 
-        # Activation: SiLU(gate) * up
-        gate, up = intermediate.chunk(2, dim = -1)
-        intermediate = torch_nn_functional_silu(gate) * up
+    # Activation: SiLU(gate) * up
+    gate, up = intermediate.chunk(2, dim = -1)
+    intermediate = torch_nn_functional_silu(gate) * up
 
-        # Second grouped GEMM: down_proj with permute_y
-        # Input: [total_tokens, intermediate_dim] -> Output: [total_tokens, hidden_dim]
-        expert_output = grouped_gemm(
-            X = intermediate,
-            W = self.experts.down_proj,
-            m_sizes = token_counts_by_expert.int(),
-            topk = self.top_k,
-            gather_indices = gather_indices,
-            permute_x = False,
-            permute_y = True,
-            autotune = True,
-            is_first_gemm = False,
-        )
+    # Second grouped GEMM: down_proj with permute_y
+    # Input: [total_tokens, intermediate_dim] -> Output: [total_tokens, hidden_dim]
+    expert_output = grouped_gemm(
+        X = intermediate,
+        W = self.experts.down_proj,
+        m_sizes = token_counts_by_expert.int(),
+        topk = self.top_k,
+        gather_indices = gather_indices,
+        permute_x = False,
+        permute_y = True,
+        autotune = True,
+        is_first_gemm = False,
+    )
 
-        # Merge topk weights: [num_tokens, top_k, hidden_dim] -> [num_tokens, hidden_dim]
-        hidden_states = (
-            expert_output.view(num_tokens, self.top_k, hidden_dim)
-            * topk_weights.unsqueeze(-1)
-        ).sum(dim = 1)
-    else:
-        # Fallback to naive implementation
-        hidden_states = self.experts(hidden_states, topk_indices, topk_weights)
+    # Merge topk weights: [num_tokens, top_k, hidden_dim] -> [num_tokens, hidden_dim]
+    hidden_states = (
+        expert_output.view(num_tokens, self.top_k, hidden_dim)
+        * topk_weights.unsqueeze(-1)
+    ).sum(dim = 1)
 
     # Add shared expert output
     hidden_states = hidden_states + self.shared_experts(residuals.view(-1, hidden_dim))
@@ -241,38 +235,6 @@ def _glm4_moe_naive_fast_forward(
     top_k = top_k_index.shape[1]
     # Cast routing weights to match hidden_states dtype (Qwen3 pattern)
     top_k_weights = top_k_weights.to(hidden_states.dtype)
-
-    if not HAS_GROUPED_GEMM:
-        # Fallback to original naive implementation
-        final_hidden_states = torch.zeros_like(hidden_states)
-        with torch.no_grad():
-            expert_mask = torch.nn.functional.one_hot(
-                top_k_index, num_classes = self.num_experts
-            )
-            expert_mask = expert_mask.permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim = (-1, -2)), 0).nonzero()
-
-        for expert_idx in expert_hit:
-            expert_idx = expert_idx[0]
-            if expert_idx == self.num_experts:
-                continue
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-            current_state = hidden_states[token_idx]
-            gate, up = torch.nn.functional.linear(
-                current_state, self.gate_up_proj[expert_idx]
-            ).chunk(2, dim = -1)
-            current_hidden_states = self.act_fn(gate) * up
-            current_hidden_states = torch.nn.functional.linear(
-                current_hidden_states, self.down_proj[expert_idx]
-            )
-            current_hidden_states = (
-                current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-            )
-            final_hidden_states.index_add_(
-                0, token_idx, current_hidden_states.to(final_hidden_states.dtype)
-            )
-
-        return final_hidden_states
 
     # Get routing indices for grouped GEMM
     with torch.no_grad():
@@ -424,9 +386,8 @@ class FastGLM47Model(FastLlamaModel):
         # TMA compatibility is handled by grouped_gemm/__init__.py which patches
         # triton.language to support both old (_experimental_make_tensor_descriptor)
         # and new (make_tensor_descriptor) API names
-        if HAS_GROUPED_GEMM:
-            Glm4MoeLiteNaiveMoe.forward = Glm4MoeLiteNaiveMoe_fast_forward
-            Glm4MoeLiteMoE.forward = Glm4MoeLiteMoE_fast_forward
+        Glm4MoeLiteNaiveMoe.forward = Glm4MoeLiteNaiveMoe_fast_forward
+        Glm4MoeLiteMoE.forward = Glm4MoeLiteMoE_fast_forward
 
         # Note: We don't patch the following for GLM4 MoE because:
         # - GLM4 uses MLA (Multi-head Latent Attention) which has different projection names
@@ -478,9 +439,8 @@ class FastGLM4MoeModel(FastLlamaModel):
                 "Please upgrade with: pip install --upgrade transformers"
             )
 
-        if HAS_GROUPED_GEMM:
-            Glm4MoeNaiveMoe.forward = Glm4MoeNaiveMoe_fast_forward
-            Glm4MoeMoE.forward = Glm4MoeMoE_fast_forward
+        Glm4MoeNaiveMoe.forward = Glm4MoeNaiveMoe_fast_forward
+        Glm4MoeMoE.forward = Glm4MoeMoE_fast_forward
 
         # Note: matches FastGLM47Model -- we don't patch DecoderLayer / MLP /
         # RMSNorm because GLM4 uses MLA (Multi-head Latent Attention) with

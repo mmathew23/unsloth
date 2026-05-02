@@ -192,8 +192,8 @@ from unsloth_zoo.temporary_patches import (
 )
 from unsloth_zoo.temporary_patches.common import (
     torch_compile,
-    UNSLOTH_COMPILE_BACKEND,
 )
+from unsloth_zoo.compile_policy import UNSLOTH_COMPILE_BACKEND
 
 
 def apply_unsloth_gradient_checkpointing(

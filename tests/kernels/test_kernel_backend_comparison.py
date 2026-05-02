@@ -20,6 +20,7 @@ from unsloth.kernels._backend_registry import get_kernel_backend, kernel_backend
 cross_entropy_module = importlib.import_module("unsloth.kernels.cross_entropy_loss")
 geglu_module = importlib.import_module("unsloth.kernels.geglu")
 grouped_gemm_module = importlib.import_module("unsloth.kernels.grouped_gemm")
+grouped_gemm_interface = importlib.import_module("unsloth.kernels.moe.grouped_gemm.interface")
 layernorm_module = importlib.import_module("unsloth.kernels.layernorm")
 rms_layernorm_module = importlib.import_module("unsloth.kernels.rms_layernorm")
 rope_embedding_module = importlib.import_module("unsloth.kernels.rope_embedding")
@@ -890,29 +891,45 @@ def test_grouped_gemm_triton_small_glm4_dims():
     tri_x = _clone_for_backend(x_base, requires_grad = True)
     tri_w_up = _clone_for_backend(w_up_base, requires_grad = True)
     tri_w_down = _clone_for_backend(w_down_base, requires_grad = True)
-    tri_up = _grouped_gemm_for_backend(
-        "triton",
-        tri_x,
-        tri_w_up,
-        m_sizes,
-        topk = 4,
-        gather_indices = gather_indices,
-        permute_x = True,
-        autotune = True,
-    )
+    grouped_gemm_interface._WARNED_SHAPE_FALLBACKS.discard((64, 16, True, False))
+    with pytest.warns(
+        RuntimeWarning,
+        match = (
+            "grouped_gemm Triton autotune has no compatible default tile for "
+            "N=64, K=16; using a shape-compatible manual config instead"
+        ),
+    ):
+        tri_up = _grouped_gemm_for_backend(
+            "triton",
+            tri_x,
+            tri_w_up,
+            m_sizes,
+            topk = 4,
+            gather_indices = gather_indices,
+            permute_x = True,
+            autotune = True,
+        )
     tri_gate, tri_up_proj = tri_up.chunk(2, dim = -1)
     tri_mid = torch.nn.functional.silu(tri_gate) * tri_up_proj
-    tri_out = _grouped_gemm_for_backend(
-        "triton",
-        tri_mid,
-        tri_w_down,
-        m_sizes,
-        topk = 4,
-        gather_indices = gather_indices,
-        permute_y = True,
-        autotune = True,
-        is_first_gemm = False,
-    )
+    grouped_gemm_interface._WARNED_SHAPE_FALLBACKS.discard((16, 32, False, True))
+    with pytest.warns(
+        RuntimeWarning,
+        match = (
+            "grouped_gemm Triton autotune has no compatible default tile for "
+            "N=16, K=32; using a shape-compatible manual config instead"
+        ),
+    ):
+        tri_out = _grouped_gemm_for_backend(
+            "triton",
+            tri_mid,
+            tri_w_down,
+            m_sizes,
+            topk = 4,
+            gather_indices = gather_indices,
+            permute_y = True,
+            autotune = True,
+            is_first_gemm = False,
+        )
     tri_loss = tri_out.float().square().mean()
     tri_loss.backward()
 

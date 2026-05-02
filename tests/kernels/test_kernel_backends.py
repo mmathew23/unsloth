@@ -1,9 +1,12 @@
 import importlib
 import os
+import re
 import subprocess
 import sys
 import textwrap
 import unittest
+import warnings
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -41,16 +44,52 @@ import unsloth.kernels.fp8 as fp8_module
 import unsloth.kernels._backend_registry as backend_registry
 
 
+@contextmanager
+def _expect_backend_fallback_warnings(testcase, *backend_names):
+    backend_pattern = "|".join(re.escape(name) for name in backend_names)
+    fallback_pattern = re.compile(
+        rf"Kernel backend '(?:{backend_pattern})' is unavailable for "
+        r"'unsloth\.[^']+'. Falling back to '[^']+'."
+    )
+    with warnings.catch_warnings(record = True) as caught:
+        warnings.simplefilter("always")
+        yield
+
+    matches = [
+        warning
+        for warning in caught
+        if issubclass(warning.category, RuntimeWarning)
+        and fallback_pattern.fullmatch(str(warning.message))
+    ]
+    unexpected = [
+        warning
+        for warning in caught
+        if warning not in matches
+    ]
+    testcase.assertGreater(
+        len(matches),
+        0,
+        f"Expected backend fallback warning for {backend_names}; "
+        f"captured {[str(w.message) for w in caught]}",
+    )
+    testcase.assertEqual(
+        unexpected,
+        [],
+        f"Unexpected warnings captured: {[str(w.message) for w in unexpected]}",
+    )
+
+
 class KernelBackendTests(unittest.TestCase):
     def tearDown(self):
-        clear_kernel_backend_overrides()
         os.environ.pop("UNSLOTH_KERNEL_BACKEND", None)
         os.environ.pop("UNSLOTH_KERNEL_BACKEND_OVERRIDES", None)
         os.environ.pop("UNSLOTH_KERNEL_BACKEND_STRICT", None)
+        clear_kernel_backend_overrides()
 
     def test_unknown_backend_falls_back_to_triton_or_eager(self):
         os.environ["UNSLOTH_KERNEL_BACKEND"] = "missing_backend"
-        backend = get_kernel_backend("unsloth.cross_entropy_loss")
+        with _expect_backend_fallback_warnings(self, "missing_backend"):
+            backend = get_kernel_backend("unsloth.cross_entropy_loss")
         self.assertIn(backend, {"triton", "eager"})
 
         available, reason = is_kernel_backend_available("cutile")
@@ -59,8 +98,9 @@ class KernelBackendTests(unittest.TestCase):
             self.assertTrue(reason)
 
     def test_set_kernel_backends_preserves_global_when_only_overrides_are_set(self):
-        set_kernel_backend("dummy_global")
-        set_kernel_backends(overrides = {"unsloth.swiglu_fg": "dummy_op"})
+        with _expect_backend_fallback_warnings(self, "dummy_global", "dummy_op"):
+            set_kernel_backend("dummy_global")
+            set_kernel_backends(overrides = {"unsloth.swiglu_fg": "dummy_op"})
 
         state = backend_registry.get_kernel_backend_state()
         self.assertEqual(state["runtime_global_backend"], "dummy_global")
@@ -130,7 +170,8 @@ class KernelBackendTests(unittest.TestCase):
         register_kernel_backend(kernel_name, "eager", lambda x: x - 1)
         try:
             with patch.object(br, "DEFAULT_KERNEL_BACKEND", "synthetic_primary"):
-                backend = get_kernel_backend(kernel_name)
+                with _expect_backend_fallback_warnings(self, "synthetic_primary"):
+                    backend = get_kernel_backend(kernel_name)
             self.assertEqual(
                 backend, "synthetic_secondary",
                 "Implicit request must walk registered builtins before eager; "
@@ -156,7 +197,8 @@ class KernelBackendTests(unittest.TestCase):
         register_kernel_backend(kernel_name, "synthetic_decoy", lambda x: x + 100)
         register_kernel_backend(kernel_name, "eager", lambda x: x - 1)
         try:
-            backend = get_kernel_backend(kernel_name, backend = "missing_backend")
+            with _expect_backend_fallback_warnings(self, "missing_backend"):
+                backend = get_kernel_backend(kernel_name, backend = "missing_backend")
             self.assertEqual(
                 backend, "eager",
                 "Explicit unknown backend leaked into a non-eager fallback; "
@@ -288,42 +330,44 @@ class KernelBackendTests(unittest.TestCase):
         register_kernel_backend("unsloth.swiglu_fg", "dummy_inner", lambda e, g: e + g)
 
         # Outer setter establishes a global backend.
-        set_kernel_backend("dummy_outer")
+        with _expect_backend_fallback_warnings(self, "dummy_outer"):
+            set_kernel_backend("dummy_outer")
 
-        # Context with overrides ONLY (no global_backend kwarg) must not
-        # clobber the outer "dummy_outer" — kernels not in the override map
-        # must keep resolving to "dummy_outer".
-        with kernel_backend_context(overrides = {"some_other_kernel": "x"}):
+            # Context with overrides ONLY (no global_backend kwarg) must not
+            # clobber the outer "dummy_outer" — kernels not in the override map
+            # must keep resolving to "dummy_outer".
+            with kernel_backend_context(overrides = {"some_other_kernel": "x"}):
+                self.assertEqual(
+                    backend_registry._RUNTIME_GLOBAL_BACKEND.get(),
+                    "dummy_outer",
+                    "outer global backend was wiped by kernel_backend_context "
+                    "default; sentinel preserve-semantics is broken.",
+                )
+
+            # Explicit None must still clear the global backend within the scope.
+            with kernel_backend_context(global_backend = None):
+                self.assertIsNone(
+                    backend_registry._RUNTIME_GLOBAL_BACKEND.get(),
+                    "explicit global_backend=None must clear the outer state "
+                    "(matches set_kernel_backend(None)).",
+                )
+
+            # After exit either way, the outer state is restored.
             self.assertEqual(
                 backend_registry._RUNTIME_GLOBAL_BACKEND.get(),
                 "dummy_outer",
-                "outer global backend was wiped by kernel_backend_context "
-                "default; sentinel preserve-semantics is broken.",
+                "outer global backend not restored after kernel_backend_context exit.",
             )
-
-        # Explicit None must still clear the global backend within the scope.
-        with kernel_backend_context(global_backend = None):
-            self.assertIsNone(
-                backend_registry._RUNTIME_GLOBAL_BACKEND.get(),
-                "explicit global_backend=None must clear the outer state "
-                "(matches set_kernel_backend(None)).",
-            )
-
-        # After exit either way, the outer state is restored.
-        self.assertEqual(
-            backend_registry._RUNTIME_GLOBAL_BACKEND.get(),
-            "dummy_outer",
-            "outer global backend not restored after kernel_backend_context exit.",
-        )
 
     def test_per_op_override_beats_global_backend(self):
         register_kernel_backend("unsloth.swiglu_fg", "dummy", lambda e, g: e - g)
-        set_kernel_backend("cutile")
-        set_kernel_backend_for_op("swiglu_fg", "dummy")
+        with _expect_backend_fallback_warnings(self, "cutile"):
+            set_kernel_backend("cutile")
+            set_kernel_backend_for_op("swiglu_fg", "dummy")
 
-        e = torch.ones(1, 2)
-        g = torch.full((1, 2), 3.0)
-        out = swiglu_module.swiglu_fg_kernel(e, g)
+            e = torch.ones(1, 2)
+            g = torch.full((1, 2), 3.0)
+            out = swiglu_module.swiglu_fg_kernel(e, g)
 
         self.assertTrue(torch.equal(out, e - g))
 
@@ -333,11 +377,12 @@ class KernelBackendTests(unittest.TestCase):
         register_kernel_backend(kernel_name, "dummy_default", lambda x: x + 10)
         register_kernel_backend(kernel_name, "eager", lambda x: x + 1)
 
-        backend = get_kernel_backend(
-            kernel_name,
-            backend = "missing",
-            fallback_backend = "dummy_default",
-        )
+        with _expect_backend_fallback_warnings(self, "missing"):
+            backend = get_kernel_backend(
+                kernel_name,
+                backend = "missing",
+                fallback_backend = "dummy_default",
+            )
 
         self.assertEqual(backend, "eager")
         backend_registry._AVAILABILITY_CHECKS.pop("missing", None)
@@ -355,10 +400,11 @@ class KernelBackendTests(unittest.TestCase):
         # [triton, dummy_default, eager] -> triton step is skipped (no impl)
         # -> resolves to dummy_default.
 
-        backend = get_kernel_backend(
-            kernel_name,
-            fallback_backend = "dummy_default",
-        )
+        with _expect_backend_fallback_warnings(self, "triton"):
+            backend = get_kernel_backend(
+                kernel_name,
+                fallback_backend = "dummy_default",
+            )
 
         self.assertEqual(backend, "dummy_default")
 
@@ -371,12 +417,14 @@ class KernelBackendTests(unittest.TestCase):
         backend_registry._AVAILABILITY_CHECKS["missing"] = lambda: (False, "blocked")
         register_kernel_backend(kernel_name, "dummy_default", lambda x: x + 10)
         register_kernel_backend(kernel_name, "eager", lambda x: x + 1)
-        set_kernel_backend("missing")
+        with _expect_backend_fallback_warnings(self, "missing"):
+            set_kernel_backend("missing")
         try:
-            backend = get_kernel_backend(
-                kernel_name,
-                fallback_backend = "dummy_default",
-            )
+            with _expect_backend_fallback_warnings(self, "missing"):
+                backend = get_kernel_backend(
+                    kernel_name,
+                    fallback_backend = "dummy_default",
+                )
             self.assertEqual(backend, "eager")
         finally:
             set_kernel_backend(None)
@@ -451,7 +499,8 @@ class KernelBackendTests(unittest.TestCase):
         backend_registry._AVAILABILITY_CHECKS["cutile"] = lambda: (False, "blocked")
 
         try:
-            backend = get_kernel_backend("unsloth.grouped_gemm", backend = "cutile")
+            with _expect_backend_fallback_warnings(self, "cutile"):
+                backend = get_kernel_backend("unsloth.grouped_gemm", backend = "cutile")
 
             self.assertEqual(backend, "eager")
         finally:
@@ -537,19 +586,20 @@ class KernelBackendTests(unittest.TestCase):
         W = torch.randn(2, 6, 4)
         m_sizes = torch.tensor([3, 3], dtype = torch.int32)
         gather_indices = torch.arange(6, dtype = torch.int32)
-        with kernel_backend_context(global_backend = "dummy"):
-            out = grouped_gemm_module.grouped_gemm(
-                X,
-                W,
-                m_sizes,
-                topk = 2,
-                gather_indices = gather_indices,
-                permute_x = True,
-                kernel_config_fwd = "fwd_config",
-                kernel_config_bwd_dX = "dx_config",
-                kernel_config_bwd_dW = "dw_config",
-                autotune = True,
-            )
+        with _expect_backend_fallback_warnings(self, "dummy"):
+            with kernel_backend_context(global_backend = "dummy"):
+                out = grouped_gemm_module.grouped_gemm(
+                    X,
+                    W,
+                    m_sizes,
+                    topk = 2,
+                    gather_indices = gather_indices,
+                    permute_x = True,
+                    kernel_config_fwd = "fwd_config",
+                    kernel_config_bwd_dX = "dx_config",
+                    kernel_config_bwd_dW = "dw_config",
+                    autotune = True,
+                )
 
         # Static dispatch preserves the Python call shape: X, W, and m_sizes
         # are positional while topk and backend-specific options remain kwargs.

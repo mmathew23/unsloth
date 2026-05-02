@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib
+from types import FunctionType
 from types import ModuleType
 from typing import Any, Callable, Mapping
 
@@ -45,6 +46,102 @@ def _get_backend(name: str) -> str | None:
         return get_kernel_backend(name)
     except Exception:
         return None
+
+
+def _clone_function_with_globals(
+    fn: KernelCallable,
+    updates: Mapping[str, Any],
+) -> KernelCallable:
+    cloned = FunctionType(
+        fn.__code__,
+        {**fn.__globals__, **updates},
+        fn.__name__,
+        fn.__defaults__,
+        fn.__closure__,
+    )
+    cloned.__kwdefaults__ = getattr(fn, "__kwdefaults__", None)
+    cloned.__annotations__ = dict(getattr(fn, "__annotations__", {}))
+    cloned.__dict__.update(getattr(fn, "__dict__", {}))
+    cloned.__doc__ = getattr(fn, "__doc__", None)
+    cloned.__module__ = getattr(fn, "__module__", None)
+    cloned.__qualname__ = getattr(fn, "__qualname__", fn.__name__)
+    return cloned
+
+
+def _compiled_inner(fn: KernelCallable) -> KernelCallable:
+    return getattr(fn, "__wrapped__", fn)
+
+
+def _make_runtime_weight_dequant(
+    fp8_mod: ModuleType,
+    weight_dequant_block: KernelCallable,
+) -> KernelCallable:
+    return _clone_function_with_globals(
+        fp8_mod.weight_dequant,
+        {"weight_dequant_block": weight_dequant_block},
+    )
+
+
+def _make_runtime_fp8_linear(
+    fp8_mod: ModuleType,
+    *,
+    act_quant: KernelCallable,
+    fp8_block_matmul: KernelCallable,
+    weight_dequant: KernelCallable,
+    block_fp8_backend: str | None,
+) -> KernelCallable:
+    if block_fp8_backend == "eager":
+        return fp8_mod._fp8_linear_eager
+
+    torch = fp8_mod.torch
+    RuntimeFP8BlockQuantLinear = type(
+        "RuntimeFP8BlockQuantLinear",
+        (torch.autograd.Function,),
+        {
+            "__module__": fp8_mod.__name__,
+            "forward": staticmethod(
+                _clone_function_with_globals(
+                    fp8_mod.FP8BlockQuantLinear.forward,
+                    {
+                        "act_quant": act_quant,
+                        "fp8_block_matmul": fp8_block_matmul,
+                    },
+                )
+            ),
+            "backward": staticmethod(
+                _clone_function_with_globals(
+                    fp8_mod.FP8BlockQuantLinear.backward,
+                    {"weight_dequant": weight_dequant},
+                )
+            ),
+        },
+    )
+
+    if fp8_mod.fp8_block_quant_linear is fp8_mod.fp8_torch_block_quant_forward:
+        block_forward = _clone_function_with_globals(
+            _compiled_inner(fp8_mod.fp8_torch_block_quant_forward),
+            {"FP8BlockQuantLinear": RuntimeFP8BlockQuantLinear},
+        )
+        fp8_block_quant_linear = fp8_mod.torch_compile(block_forward)
+    else:
+        fp8_block_quant_linear = fp8_mod.fp8_block_quant_linear
+
+    fp8_linear_static = fp8_mod.torch_compile(
+        _clone_function_with_globals(
+            _compiled_inner(fp8_mod._fp8_linear_static),
+            {"fp8_block_quant_linear": fp8_block_quant_linear},
+        )
+    )
+
+    def fp8_linear_training_autograd(X, weight, weight_scale, bias = None):
+        return RuntimeFP8BlockQuantLinear.apply(X, weight, weight_scale, bias)
+
+    def fp8_linear_runtime(X, weight, weight_scale, bias = None):
+        if torch.is_grad_enabled() and X.requires_grad:
+            return fp8_linear_training_autograd(X, weight, weight_scale, bias)
+        return fp8_linear_static(X, weight, weight_scale, bias)
+
+    return fp8_linear_runtime
 
 
 def resolve_kernel_runtime_bindings() -> KernelRuntimeBindings:
@@ -121,12 +218,14 @@ def resolve_kernel_runtime_bindings() -> KernelRuntimeBindings:
         "unsloth.weight_dequant",
         fp8_mod._weight_dequant_block_eager,
     )
-    weight_dequant = fp8_mod.weight_dequant
+    weight_dequant = _make_runtime_weight_dequant(fp8_mod, weight_dequant_block)
     block_fp8_backend = _get_backend("unsloth.w8a8_block_fp8_matmul")
-    fp8_linear = (
-        fp8_mod._fp8_linear_eager
-        if block_fp8_backend == "eager"
-        else fp8_mod._fp8_linear_runtime
+    fp8_linear = _make_runtime_fp8_linear(
+        fp8_mod,
+        act_quant = act_quant,
+        fp8_block_matmul = fp8_block_matmul,
+        weight_dequant = weight_dequant,
+        block_fp8_backend = block_fp8_backend,
     )
 
     globals_map: dict[str, KernelCallable] = {

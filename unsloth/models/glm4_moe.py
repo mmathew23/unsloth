@@ -41,7 +41,7 @@ import torch
 import torch.nn.functional as F
 from typing import Optional, Tuple
 from ..kernels.rms_layernorm import fast_rms_layernorm_default as fast_rms_layernorm
-from ..kernels.grouped_gemm import grouped_gemm_default as grouped_gemm
+from ..kernels.grouped_gemm import grouped_gemm
 from ..kernels.moe.grouped_gemm.reference.moe_ops import get_routing_indices
 
 

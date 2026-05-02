@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -42,6 +43,15 @@ class CompileBackendSettingsTests(unittest.TestCase):
         self.assertEqual(compile_kwargs["dynamic"], True)
         self.assertEqual(compile_kwargs["fullgraph"], False)
         self.assertNotIn("options", compile_kwargs)
+
+    def test_kernel_flex_compile_backend_env_is_normalized(self):
+        import unsloth.kernels.flex_attention as flex_attention
+
+        with patch.dict("os.environ", {"UNSLOTH_TORCH_COMPILE_BACKEND": " INDUCTOR "}):
+            self.assertEqual(flex_attention._detect_kernel_compile_backend(), "inductor")
+
+        with patch.dict("os.environ", {"UNSLOTH_TORCH_COMPILE_BACKEND": "aot-eager"}):
+            self.assertEqual(flex_attention._detect_kernel_compile_backend(), "aot_eager")
 
 
 if __name__ == "__main__":

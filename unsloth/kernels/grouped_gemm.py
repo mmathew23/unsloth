@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
 import torch
 
 from ._backend_registry import register_kernel_backend
@@ -85,35 +84,34 @@ register_kernel_backend(
 )
 
 
-# Module-level alias rebound by hook on backend change. None when no
-# implementation is registered for the resolved global backend yet.
+# Static default alias rebound by hook on global backend changes. The exported
+# `grouped_gemm` wrapper below resolves per call so context-local backend
+# overrides do not leak through process-wide module alias mutation.
 _resolved_grouped_gemm = None
 grouped_gemm_default = None
-
-
-def _patch_grouped_gemm_hot_imports() -> None:
-    for name, module in tuple(sys.modules.items()):
-        if name.startswith("unsloth.models.") and hasattr(module, "grouped_gemm"):
-            module.grouped_gemm = grouped_gemm_default
 
 
 def _rebind_grouped_gemm_aliases(backend = None) -> None:
     """Hook fired by `_backend_registry` when the global backend changes
     or when a new backend impl is registered. Looks up the resolved impl
-    for the current global backend and pins it to the module-level alias.
-    Falls back to eager. Backend selection happens via registry
-    state/rebinding, not per-call kwargs."""
+    for the current global backend and pins it to the static default alias.
+    Falls back to eager."""
     global _resolved_grouped_gemm, grouped_gemm_default
     try:
         from ._backend_registry import get_kernel_impl
         _resolved_grouped_gemm = get_kernel_impl("unsloth.grouped_gemm")
     except Exception:
         _resolved_grouped_gemm = None
-    # NVIDIA_REVIEW: MoE model paths import this resolved implementation
-    # directly; explicit backend routing remains confined to `grouped_gemm`.
     grouped_gemm_default = _resolved_grouped_gemm or _grouped_gemm_eager
-    globals()["grouped_gemm"] = grouped_gemm_default
-    _patch_grouped_gemm_hot_imports()
+
+
+def grouped_gemm(*args, **kwargs):
+    from ._backend_registry import get_kernel_impl
+    try:
+        impl = get_kernel_impl("unsloth.grouped_gemm")
+    except Exception:
+        impl = _grouped_gemm_eager
+    return impl(*args, **kwargs)
 
 
 # Initial bind. Wrapped so module load never fails if no backend is loaded yet.
@@ -131,7 +129,4 @@ except Exception:
     pass
 
 
-# Export `grouped_gemm` as the currently resolved backend alias. This is
-# intentionally rebound instead of wrapping so hot imports keep the direct call
-# shape chosen by `_rebind_grouped_gemm_aliases`.
 _rebind_grouped_gemm_aliases()

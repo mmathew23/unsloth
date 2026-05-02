@@ -27,7 +27,12 @@ def _is_triton_importable() -> bool:
     return True
 
 def _detect_kernel_compile_backend() -> str:
-    explicit = os.environ.get("UNSLOTH_TORCH_COMPILE_BACKEND", "").strip()
+    explicit = (
+        os.environ.get("UNSLOTH_TORCH_COMPILE_BACKEND", "")
+        .strip()
+        .lower()
+        .replace("-", "_")
+    )
     if explicit:
         return explicit
     if _is_triton_importable():

@@ -827,7 +827,7 @@ class KernelBackendTests(unittest.TestCase):
             self.assertTrue(callable(default_symbol))
 
         self.assertIs(ce_mod.fast_cross_entropy_loss, ce_mod.fast_cross_entropy_loss_default)
-        self.assertIs(gg_mod.grouped_gemm, gg_mod.grouped_gemm_default)
+        self.assertTrue(callable(gg_mod.grouped_gemm))
         self.assertIs(rms_mod.fast_rms_layernorm, rms_mod.fast_rms_layernorm_default)
         self.assertIs(rope_mod.fast_rope_embedding, rope_mod.fast_rope_embedding_default)
         self.assertIs(rope_mod.rope_embedding, rope_mod.rope_embedding_default)
@@ -854,6 +854,34 @@ class KernelBackendTests(unittest.TestCase):
             fast_lora_mod.geglu_approx_backward_kernel,
             geglu_mod.geglu_approx_backward_kernel_default,
         )
+
+    def test_grouped_gemm_context_dispatch_does_not_rebind_exported_symbol(self):
+        import importlib
+
+        from unsloth.kernels._backend_registry import register_kernel_backend
+
+        gg_mod = importlib.import_module("unsloth.kernels.grouped_gemm")
+
+        def _dummy_a(*args, **kwargs):
+            return "a"
+
+        def _dummy_b(*args, **kwargs):
+            return "b"
+
+        register_kernel_backend("unsloth.grouped_gemm", "dummy_a", _dummy_a)
+        register_kernel_backend("unsloth.grouped_gemm", "dummy_b", _dummy_b)
+
+        exported = gg_mod.grouped_gemm
+        with kernel_backend_context(overrides = {"grouped_gemm": "dummy_a"}):
+            self.assertIs(gg_mod.grouped_gemm, exported)
+            self.assertEqual(gg_mod.grouped_gemm(), "a")
+            with kernel_backend_context(overrides = {"grouped_gemm": "dummy_b"}):
+                self.assertIs(gg_mod.grouped_gemm, exported)
+                self.assertEqual(gg_mod.grouped_gemm(), "b")
+            self.assertIs(gg_mod.grouped_gemm, exported)
+            self.assertEqual(gg_mod.grouped_gemm(), "a")
+
+        self.assertIs(gg_mod.grouped_gemm, exported)
 
     def test_static_default_hot_symbols_fall_back_to_direct_eager_not_dispatcher(self):
         import importlib

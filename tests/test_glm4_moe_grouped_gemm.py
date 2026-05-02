@@ -14,10 +14,8 @@ for repo in (ROOT / "unsloth", ROOT / "unsloth-zoo"):
         sys.path.insert(0, str(repo))
 
 os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
-os.environ.setdefault("UNSLOTH_SKIP_MODEL_IMPORTS", "1")
 
 from unsloth.kernels import clear_kernel_backend_overrides, kernel_backend_context
-from unsloth.kernels.grouped_gemm import grouped_gemm as grouped_gemm_kernel
 from unsloth.models import glm4_moe
 from unsloth.models import loader as model_loader
 
@@ -98,8 +96,8 @@ class Glm4MoeGroupedGemmTests(unittest.TestCase):
         top_k_weights = torch.tensor([[0.75, 0.25], [0.60, 0.40]], dtype = torch.float32)
         expected = self._manual_forward(moe, hidden_states, top_k_index, top_k_weights)
 
-        with patch.object(glm4_moe, "grouped_gemm", wraps = grouped_gemm_kernel) as grouped_gemm_spy:
-            with kernel_backend_context(global_backend = "eager"):
+        with kernel_backend_context(global_backend = "eager"):
+            with patch.object(glm4_moe, "grouped_gemm", wraps = glm4_moe.grouped_gemm) as grouped_gemm_spy:
                 actual = glm4_moe.Glm4MoeLiteNaiveMoe_fast_forward(
                     moe,
                     hidden_states,
@@ -131,8 +129,8 @@ class Glm4MoeGroupedGemmTests(unittest.TestCase):
         top_k_weights = torch.tensor([[0.55, 0.45], [0.35, 0.65]], dtype = torch.float32)
         expected = self._manual_forward(moe, hidden_states, top_k_index, top_k_weights)
 
-        with patch.object(glm4_moe, "grouped_gemm", wraps = grouped_gemm_kernel) as grouped_gemm_spy:
-            with kernel_backend_context(global_backend = "eager"):
+        with kernel_backend_context(global_backend = "eager"):
+            with patch.object(glm4_moe, "grouped_gemm", wraps = glm4_moe.grouped_gemm) as grouped_gemm_spy:
                 actual = glm4_moe.Glm4MoeNaiveMoe_fast_forward(
                     moe,
                     hidden_states,
@@ -194,8 +192,8 @@ class Glm4MoeGroupedGemmTests(unittest.TestCase):
             hidden_states.detach().clone()
         )
 
-        with patch.object(glm4_moe, "grouped_gemm", wraps = grouped_gemm_kernel) as grouped_gemm_spy:
-            with kernel_backend_context(global_backend = "eager"):
+        with kernel_backend_context(global_backend = "eager"):
+            with patch.object(glm4_moe, "grouped_gemm", wraps = glm4_moe.grouped_gemm) as grouped_gemm_spy:
                 actual = glm4_moe.Glm4MoeMoE_fast_forward(moe, hidden_states)
 
         torch.testing.assert_close(actual, expected)

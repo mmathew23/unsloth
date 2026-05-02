@@ -10,7 +10,6 @@ for package_root in (ROOT / "unsloth", ROOT / "unsloth-zoo"):
         sys.path.insert(0, package_root_str)
 
 os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
-os.environ.setdefault("UNSLOTH_SKIP_MODEL_IMPORTS", "1")
 
 from unsloth.kernels import describe_kernel_backends, ensure_backend_loaded, is_kernel_backend_available
 from unsloth.kernels.backends._manifests import CUTILE_EXPECTED_OPS, TRITON_EXPECTED_OPS

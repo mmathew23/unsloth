@@ -16,7 +16,6 @@ for repo in (ROOT / "unsloth", ROOT / "unsloth-zoo"):
         sys.path.insert(0, str(repo))
 
 os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
-os.environ.setdefault("UNSLOTH_SKIP_MODEL_IMPORTS", "1")
 
 from unsloth.kernels import is_kernel_backend_available
 from unsloth.kernels._backend_registry import get_kernel_backend, kernel_backend_context

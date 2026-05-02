@@ -606,9 +606,17 @@ def check_fbgemm_gpu_version():
     logger.info(f"Unsloth: fbgemm_gpu_genai=={fbgemm_gpu_version} detected.")
 
 
+def _is_triton_importable():
+    try:
+        importlib.import_module("triton")
+    except Exception:
+        return False
+    return True
+
+
 def patch_sdpa_without_triton():
     """Avoid cuDNN SDPA plans that fail in no-Triton CUDA installs."""
-    if importlib.util.find_spec("triton") is not None:
+    if _is_triton_importable():
         return
     if os.environ.get("UNSLOTH_NO_TRITON_ALLOW_CUDNN_SDPA", "0") in (
         "1",
@@ -630,7 +638,7 @@ def patch_sdpa_without_triton():
 
 def patch_finegrained_fp8_without_triton():
     """Let HF finegrained-FP8 model loading work in CuTile-only installs."""
-    if importlib.util.find_spec("triton") is not None:
+    if _is_triton_importable():
         return
     try:
         from transformers.quantizers.quantizer_finegrained_fp8 import (

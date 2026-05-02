@@ -15,7 +15,6 @@ for repo in (ROOT / "unsloth", ROOT / "unsloth-zoo"):
         sys.path.insert(0, str(repo))
 
 os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
-os.environ.setdefault("UNSLOTH_SKIP_MODEL_IMPORTS", "1")
 
 from unsloth.kernels import (
     clear_kernel_backend_overrides,
@@ -389,6 +388,42 @@ class KernelBackendTests(unittest.TestCase):
         )
         self.assertIn("registered_ops", triton)
 
+    def test_describe_kernel_backends_reports_loader_failure(self):
+        backend_name = "synthetic_describe_failure"
+        original_loader = backend_registry._BUILTIN_LOADERS.get(backend_name)
+        original_package = backend_registry._BACKEND_PACKAGES.get(backend_name)
+        original_check = backend_registry._AVAILABILITY_CHECKS.get(backend_name)
+
+        def failing_loader():
+            raise RuntimeError("synthetic loader exploded")
+
+        backend_registry._BUILTIN_LOADERS[backend_name] = failing_loader
+        backend_registry._BACKEND_PACKAGES[backend_name] = "synthetic.package"
+        backend_registry._AVAILABILITY_CHECKS[backend_name] = lambda: (True, None)
+        backend_registry.clear_backend_load_cache(backend_name)
+        try:
+            description = describe_kernel_backends()
+            data = description["backends"][backend_name]
+
+            self.assertFalse(data["available"])
+            self.assertIn("Backend load failed", data["reason"])
+            self.assertIn("synthetic loader exploded", data["reason"])
+            self.assertFalse(data["loaded"])
+        finally:
+            if original_loader is None:
+                backend_registry._BUILTIN_LOADERS.pop(backend_name, None)
+            else:
+                backend_registry._BUILTIN_LOADERS[backend_name] = original_loader
+            if original_package is None:
+                backend_registry._BACKEND_PACKAGES.pop(backend_name, None)
+            else:
+                backend_registry._BACKEND_PACKAGES[backend_name] = original_package
+            if original_check is None:
+                backend_registry._AVAILABILITY_CHECKS.pop(backend_name, None)
+            else:
+                backend_registry._AVAILABILITY_CHECKS[backend_name] = original_check
+            backend_registry.clear_backend_load_cache(backend_name)
+
     def test_backend_loader_registers_once(self):
         available, reason = is_kernel_backend_available("triton")
         if not available:
@@ -567,7 +602,6 @@ class KernelBackendTests(unittest.TestCase):
                 sys.path.insert(0, str(repo))
 
             os.environ["UNSLOTH_IS_PRESENT"] = "1"
-            os.environ["UNSLOTH_SKIP_MODEL_IMPORTS"] = "1"
             os.environ["UNSLOTH_KERNEL_BACKEND"] = "cutile"
 
             real_import = builtins.__import__

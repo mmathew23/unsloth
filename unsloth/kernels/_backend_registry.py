@@ -798,10 +798,14 @@ def get_kernel_backend_state() -> dict[str, Any]:
 
 
 def describe_kernel_backends() -> dict[str, Any]:
+    load_errors: dict[str, str] = {}
     for backend_name in sorted(_BUILTIN_LOADERS):
         available, _ = is_kernel_backend_available(backend_name)
         if available:
-            ensure_backend_loaded(backend_name)
+            try:
+                ensure_backend_loaded(backend_name)
+            except Exception as exc:
+                load_errors[backend_name] = str(exc)
 
     backend_names = {
         DEFAULT_KERNEL_BACKEND,
@@ -812,6 +816,9 @@ def describe_kernel_backends() -> dict[str, Any]:
     backends = {}
     for backend_name in sorted(backend_names):
         available, reason = is_kernel_backend_available(backend_name)
+        if backend_name in load_errors:
+            available = False
+            reason = f"Backend load failed: {load_errors[backend_name]}"
         registered_ops = [
             kernel_name
             for kernel_name, implementations in sorted(_REGISTRY.items())

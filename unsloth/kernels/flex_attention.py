@@ -16,13 +16,21 @@ import torch
 from functools import lru_cache
 from transformers.models.llama.modeling_llama import logger
 import os
-import importlib.util
+import importlib
+
+
+def _is_triton_importable() -> bool:
+    try:
+        importlib.import_module("triton")
+    except Exception:
+        return False
+    return True
 
 def _detect_kernel_compile_backend() -> str:
     explicit = os.environ.get("UNSLOTH_TORCH_COMPILE_BACKEND", "").strip()
     if explicit:
         return explicit
-    if importlib.util.find_spec("triton") is not None:
+    if _is_triton_importable():
         return "inductor"
     return "aot_eager"
 
@@ -46,10 +54,12 @@ try:
     if _KERNEL_COMPILE_BACKEND == "inductor":
         _flex_attention = torch.compile(
             _flex_attention, dynamic=True, options=torch_compile_options,
-            backend=_KERNEL_COMPILE_BACKEND,
         )
-    # else: leave _flex_attention uncompiled under non-inductor backends
-    HAS_FLEX_ATTENTION = False
+        HAS_FLEX_ATTENTION = True
+    else:
+        # Flex attention needs the inductor/Triton path. Keep the slow fallback
+        # for no-Triton/cutile-only installs that route compile through aot_eager.
+        HAS_FLEX_ATTENTION = False
 except:
     HAS_FLEX_ATTENTION = False
 

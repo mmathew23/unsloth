@@ -351,25 +351,23 @@ elif DEVICE_TYPE == "xpu":
     # TODO: check triton for intel installed properly.
     pass
 
-if os.environ.get("UNSLOTH_SKIP_MODEL_IMPORTS", "0") != "1":
-    from .models import *
-    from .models import __version__
-    from .save import *
-    from .chat_templates import *
-    from .tokenizer_utils import *
-    from .trainer import *
+from .models import *
+from .models import __version__
+from .save import *
+from .chat_templates import *
+from .tokenizer_utils import *
+from .trainer import *
 
-    # Export dataprep utilities for CLI and downstream users
-    from .dataprep.raw_text import RawTextDataLoader, TextPreprocessor
-    from unsloth_zoo.rl_environments import (
-        check_python_modules,
-        create_locked_down_function,
-        execute_with_time_limit,
-        Benchmarker,
-        is_port_open,
-        launch_openenv,
-    )
+# Export dataprep utilities for CLI and downstream users
+from .dataprep.raw_text import RawTextDataLoader, TextPreprocessor
+from unsloth_zoo.rl_environments import (
+    check_python_modules,
+    create_locked_down_function,
+    execute_with_time_limit,
+    Benchmarker,
+    is_port_open,
+    launch_openenv,
+)
 
-if os.environ.get("UNSLOTH_SKIP_MODEL_IMPORTS", "0") != "1":
-    # Patch TRL trainers for backwards compatibility
-    _patch_trl_trainer()
+# Patch TRL trainers for backwards compatibility
+_patch_trl_trainer()

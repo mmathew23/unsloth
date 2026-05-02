@@ -11,7 +11,6 @@ for package_root in (ROOT / "unsloth", ROOT / "unsloth-zoo"):
         sys.path.insert(0, package_root_str)
 
 os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
-os.environ.setdefault("UNSLOTH_SKIP_MODEL_IMPORTS", "1")
 
 
 class CompileBackendSettingsTests(unittest.TestCase):

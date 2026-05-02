@@ -437,11 +437,13 @@ def run_training_process(
             import triton  # noqa: F401
 
             logger.info("Triton available — torch.compile enabled")
-        except ImportError:
+        except Exception as exc:
             os.environ.setdefault("UNSLOTH_TORCH_COMPILE_BACKEND", "aot_eager")
             logger.warning(
                 "Triton not found on Windows — falling back to torch.compile aot_eager backend. "
-                'For best performance install Triton: pip install "triton-windows<3.7"'
+                'For best performance install Triton: pip install "triton-windows<3.7" '
+                "(import failed: %s)",
+                exc,
             )
 
     # ── 2. Now import ML libraries (fresh in this clean process) ──

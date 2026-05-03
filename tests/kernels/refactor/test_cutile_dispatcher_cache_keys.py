@@ -80,15 +80,41 @@ class CutileDispatcherCacheKeyTests(unittest.TestCase):
 
         self.assertEqual(checked, 2)
 
-    def test_element_count_constants_stay_in_elementwise_cache_keys(self):
+    def test_elementwise_cache_keys_exclude_launch_grid_element_counts(self):
         swiglu_path = CUTILE_BACKENDS / "swiglu.py"
         geglu_path = CUTILE_BACKENDS / "geglu.py"
 
         for path in (swiglu_path, geglu_path):
             for names in _assignment_name_sets(path, "cache_key"):
                 with self.subTest(path = path.name, names = sorted(names)):
-                    self.assertIn("n_elements", names)
+                    self.assertNotIn("n_elements", names)
                     self.assertIn("LONG_INDEXING", names)
+
+    def test_elementwise_counts_are_runtime_scalars_not_compile_constants(self):
+        expected_functions = {
+            "swiglu.py": {"_fg_kernel_ct", "_DWf_DW_dfg_kernel_ct"},
+            "geglu.py": {
+                "_exact_forward_ct",
+                "_exact_backward_ct",
+                "_approx_forward_ct",
+                "_approx_backward_ct",
+            },
+        }
+
+        for filename, function_names in expected_functions.items():
+            path = CUTILE_BACKENDS / filename
+            tree = ast.parse(path.read_text(), filename = str(path))
+            checked = 0
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.FunctionDef) or node.name not in function_names:
+                    continue
+                for arg in node.args.args:
+                    if arg.arg != "n_elements":
+                        continue
+                    checked += 1
+                    self.assertIsInstance(arg.annotation, ast.Name)
+                    self.assertEqual(arg.annotation.id, "int")
+            self.assertEqual(checked, len(function_names), filename)
 
     def test_rms_forward_casts_output_to_input_dtype_before_scatter(self):
         rms_path = CUTILE_BACKENDS / "rms_layernorm.py"

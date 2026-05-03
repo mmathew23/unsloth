@@ -39,7 +39,9 @@ ConstInt = ct.Constant[int]
 # forward launches. Local code routes through select_launch_config so the
 # production default avoids per-shape tuning overhead while keeping opt-in
 # exhaustive tuning available through UNSLOTH_CUTILE_EXHAUSTIVE_TUNE=1.
-# Module-level tune caches: (n_elements, LONG_INDEXING, dtype, device) -> tuned_kernel
+# Module-level tune caches: compile-specializing key -> tuned_kernel.
+# n_elements is launch-grid only for these 1D elementwise kernels; bounds come
+# from the array arguments, so keep it runtime to avoid per-sequence compiles.
 _geglu_exact_fwd_tune_cache: dict = {}
 _geglu_approx_fwd_tune_cache: dict = {}
 
@@ -57,7 +59,7 @@ INT32_SAFETY_BUFFER = NUM_INT32_ELEMENTS - max(BLOCK_SIZE_FWD, BLOCK_SIZE_BWD) *
 
 
 @ct.kernel
-def _exact_forward_ct(e, g, h, n_elements: ConstInt, BLOCK_SIZE: ConstInt, LONG_INDEXING: ConstInt):
+def _exact_forward_ct(e, g, h, n_elements: int, BLOCK_SIZE: ConstInt, LONG_INDEXING: ConstInt):
     """Exact GEGLU forward: h = 0.5 * e * (1 + erf(e/sqrt(2))) * g"""
     bid = ct.bid(0)
     if LONG_INDEXING:
@@ -81,7 +83,7 @@ def _exact_forward_ct(e, g, h, n_elements: ConstInt, BLOCK_SIZE: ConstInt, LONG_
 
 
 @ct.kernel
-def _exact_backward_ct(DW, e, g, n_elements: ConstInt, BLOCK_SIZE: ConstInt, LONG_INDEXING: ConstInt):
+def _exact_backward_ct(DW, e, g, n_elements: int, BLOCK_SIZE: ConstInt, LONG_INDEXING: ConstInt):
     """Exact GEGLU backward (in-place): DW→h, e→df, g→de"""
     bid = ct.bid(0)
     if LONG_INDEXING:
@@ -125,7 +127,7 @@ def _exact_backward_ct(DW, e, g, n_elements: ConstInt, BLOCK_SIZE: ConstInt, LON
 
 
 @ct.kernel
-def _approx_forward_ct(e, g, h, n_elements: ConstInt, BLOCK_SIZE: ConstInt, LONG_INDEXING: ConstInt):
+def _approx_forward_ct(e, g, h, n_elements: int, BLOCK_SIZE: ConstInt, LONG_INDEXING: ConstInt):
     """Approximate GEGLU forward using tanh approximation."""
     bid = ct.bid(0)
     if LONG_INDEXING:
@@ -147,7 +149,7 @@ def _approx_forward_ct(e, g, h, n_elements: ConstInt, BLOCK_SIZE: ConstInt, LONG
 
 
 @ct.kernel
-def _approx_backward_ct(DW, e, g, n_elements: ConstInt, BLOCK_SIZE: ConstInt, LONG_INDEXING: ConstInt):
+def _approx_backward_ct(DW, e, g, n_elements: int, BLOCK_SIZE: ConstInt, LONG_INDEXING: ConstInt):
     """Approximate GEGLU backward (in-place): DW→h, e→df, g→de"""
     bid = ct.bid(0)
     if LONG_INDEXING:
@@ -194,7 +196,7 @@ def geglu_exact_forward(gate, up):
     out = torch.empty((batch, seq_len, hd), dtype=gate.dtype, device=gate.device)
     stream = current_cuda_stream()
     LONG_INDEXING = 0 if n_elements <= INT32_SAFETY_BUFFER else 1
-    cache_key = (n_elements, LONG_INDEXING, gate.dtype, str(gate.device))
+    cache_key = (LONG_INDEXING, gate.dtype, str(gate.device))
     if cache_key not in _geglu_exact_fwd_tune_cache:
         result = select_launch_config(
             list(autotune_configs()),
@@ -255,7 +257,7 @@ def geglu_approx_forward(gate, up):
     out = torch.empty((batch, seq_len, hd), dtype=gate.dtype, device=gate.device)
     stream = current_cuda_stream()
     LONG_INDEXING = 0 if n_elements <= INT32_SAFETY_BUFFER else 1
-    cache_key = (n_elements, LONG_INDEXING, gate.dtype, str(gate.device))
+    cache_key = (LONG_INDEXING, gate.dtype, str(gate.device))
     if cache_key not in _geglu_approx_fwd_tune_cache:
         result = select_launch_config(
             list(autotune_configs()),

@@ -30,7 +30,9 @@ ConstInt = ct.Constant[int]
 # SwiGLU forward launch. Local code routes through select_launch_config so
 # production avoids repeated per-shape tuning; opt into exhaustive tuning with
 # UNSLOTH_CUTILE_EXHAUSTIVE_TUNE=1.
-# Module-level tune cache: (n_elements, LONG_INDEXING, dtype, device) -> tuned_kernel
+# Module-level tune cache: compile-specializing key -> tuned_kernel.
+# n_elements is launch-grid only for these 1D elementwise kernels; bounds come
+# from the array arguments, so keep it runtime to avoid per-sequence compiles.
 _swiglu_fg_tune_cache: dict = {}
 
 # signed int32 max is 2**31-1 so num_elements cannot exceed 2**31
@@ -48,7 +50,7 @@ def _sigmoid_tanh(x):
 
 
 @ct.kernel
-def _fg_kernel_ct(e, g, h, n_elements: ConstInt, BLOCK_SIZE: ConstInt, LONG_INDEXING: ConstInt):
+def _fg_kernel_ct(e, g, h, n_elements: int, BLOCK_SIZE: ConstInt, LONG_INDEXING: ConstInt):
     """SwiGLU forward: h = silu(e) * g = (e * sigmoid(e)) * g"""
     bid = ct.bid(0)
     if LONG_INDEXING:
@@ -69,7 +71,7 @@ def _fg_kernel_ct(e, g, h, n_elements: ConstInt, BLOCK_SIZE: ConstInt, LONG_INDE
 
 
 @ct.kernel
-def _DWf_DW_dfg_kernel_ct(DW, e, g, n_elements: ConstInt, BLOCK_SIZE: ConstInt, LONG_INDEXING: ConstInt):
+def _DWf_DW_dfg_kernel_ct(DW, e, g, n_elements: int, BLOCK_SIZE: ConstInt, LONG_INDEXING: ConstInt):
     """SwiGLU backward (in-place): DW→h, e→df, g→de"""
     bid = ct.bid(0)
     if LONG_INDEXING:
@@ -105,7 +107,7 @@ def swiglu_fg(e, g):
     h = torch.empty((batch, seq_len, hd), dtype=e.dtype, device=e.device)
     stream = current_cuda_stream()
     LONG_INDEXING = 0 if n_elements <= INT32_SAFETY_BUFFER else 1
-    cache_key = (n_elements, LONG_INDEXING, e.dtype, str(e.device))
+    cache_key = (LONG_INDEXING, e.dtype, str(e.device))
     if cache_key not in _swiglu_fg_tune_cache:
         result = select_launch_config(
             list(autotune_configs()),

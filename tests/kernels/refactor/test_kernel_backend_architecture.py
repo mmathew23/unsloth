@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[4]
 
 from unsloth.kernels import describe_kernel_backends, ensure_backend_loaded, is_kernel_backend_available
 from unsloth.kernels.backends._manifests import CUTILE_EXPECTED_OPS, TRITON_EXPECTED_OPS

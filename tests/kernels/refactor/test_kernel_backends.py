@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import torch
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[4]
 
 from unsloth.kernels import (
     clear_kernel_backend_overrides,

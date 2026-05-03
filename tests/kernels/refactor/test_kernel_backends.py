@@ -1068,11 +1068,12 @@ class KernelBackendTests(unittest.TestCase):
         utils_mod = importlib.import_module("unsloth.kernels.utils")
 
         bound_weight_dequant, bound_fp8_linear = utils_mod._bind_fp8_symbols()
+        expected_fp8_linear = fp8_real._get_fp8_linear_for_utils()
 
         self.assertIs(bound_weight_dequant, fp8_real.weight_dequant)
-        self.assertIs(bound_fp8_linear, fp8_real.fp8_linear)
+        self.assertIs(bound_fp8_linear, expected_fp8_linear)
         self.assertIs(utils_mod.weight_dequant, fp8_real.weight_dequant)
-        self.assertIs(utils_mod.fp8_linear, fp8_real.fp8_linear)
+        self.assertIs(utils_mod.fp8_linear, expected_fp8_linear)
 
     def test_fp8_block_path_forwards_bias(self):
         # The dispatcher must forward a non-None bias kwarg into

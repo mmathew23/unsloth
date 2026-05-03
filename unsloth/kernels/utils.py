@@ -59,8 +59,9 @@ def _bind_fp8_symbols():
     # cycle, but rebind after the first lookup so FP8 hot paths do not pay an
     # extra Python wrapper + import check on every generate token.
     from .fp8 import weight_dequant as _weight_dequant
-    from .fp8 import fp8_linear as _fp8_linear
+    from .fp8 import _get_fp8_linear_for_utils
 
+    _fp8_linear = _get_fp8_linear_for_utils()
     globals()["weight_dequant"] = _weight_dequant
     globals()["fp8_linear"] = _fp8_linear
     return _weight_dequant, _fp8_linear

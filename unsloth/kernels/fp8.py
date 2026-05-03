@@ -13,6 +13,7 @@
 # limitations under the License.
 import os
 from contextvars import ContextVar
+from types import FunctionType
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -29,6 +30,23 @@ from unsloth_zoo.log import logger
 from unsloth_zoo.temporary_patches.common import torch_compile
 
 torch_matmul = torch.matmul
+
+
+def _clone_function_with_globals(fn, updates):
+    cloned = FunctionType(
+        fn.__code__,
+        {**fn.__globals__, **updates},
+        fn.__name__,
+        fn.__defaults__,
+        fn.__closure__,
+    )
+    cloned.__kwdefaults__ = getattr(fn, "__kwdefaults__", None)
+    cloned.__annotations__ = dict(getattr(fn, "__annotations__", {}))
+    cloned.__dict__.update(getattr(fn, "__dict__", {}))
+    cloned.__doc__ = getattr(fn, "__doc__", None)
+    cloned.__module__ = getattr(fn, "__module__", None)
+    cloned.__qualname__ = getattr(fn, "__qualname__", fn.__name__)
+    return cloned
 
 try:
     from transformers.integrations.finegrained_fp8 import FP8Linear
@@ -635,6 +653,58 @@ def _fp8_torch_block_quant_forward_lean(X, weight, weight_scale):
     return FP8BlockQuantLinearLean.apply(X, weight, weight_scale)
 
 
+_triton_fp8_block_matmul_hot = (
+    torchao_block_matmul
+    if torchao_blockwise_gemm is not None
+    else w8a8_block_fp8_matmul_triton
+)
+
+
+class FP8BlockQuantLinearLeanTriton(torch.autograd.Function):
+    forward = staticmethod(
+        _clone_function_with_globals(
+            FP8BlockQuantLinearLean.forward,
+            {
+                "act_quant": _triton_act_quant,
+                "fp8_block_matmul": _triton_fp8_block_matmul_hot,
+            },
+        )
+    )
+    backward = staticmethod(
+        _clone_function_with_globals(
+            FP8BlockQuantLinearLean.backward,
+            {"weight_dequant": _triton_weight_dequant_block},
+        )
+    )
+
+
+@torch_compile
+def _fp8_torch_block_quant_forward_lean_triton(X, weight, weight_scale):
+    return FP8BlockQuantLinearLeanTriton.apply(X, weight, weight_scale)
+
+
+@torch_compile
+def _fp8_linear_triton_hot(X, weight, weight_scale, bias = None):
+    # Keep `matmul_lora` on the same simple compiled shape as GitHub main for
+    # the common no-bias block-FP8 path. Bias remains supported, but the
+    # bias-free Qwen/DeepSeek FP8 path must not pay the generic registry
+    # dispatcher cost.
+    if weight_scale.numel() == 1 or (
+        weight_scale.ndim == 2 and weight_scale.shape[1] > 1
+    ):
+        if bias is None:
+            return _fp8_torch_block_quant_forward_lean_triton(
+                X,
+                weight,
+                weight_scale,
+            )
+        return fp8_torch_block_quant_forward(X, weight, weight_scale, bias = bias)
+    if not _HAS_FBGEMM_ROWWISE:
+        _warn_fp8_rowwise_eager_fallback_once()
+        return _fp8_linear_eager(X, weight, weight_scale, bias)
+    return fbgemm_fp8_linear(X, weight, weight_scale, bias)
+
+
 class FbgemmFp8Linear_matmul(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, weight_scale, bias = None):
@@ -989,7 +1059,13 @@ def _patch_fp8_hot_imports() -> None:
     if utils_mod is not None:
         utils_mod.weight_dequant = weight_dequant
         if "fp8_linear" in globals():
-            utils_mod.fp8_linear = fp8_linear
+            utils_mod.fp8_linear = _get_fp8_linear_for_utils()
+
+
+def _get_fp8_linear_for_utils():
+    if _BAKED_BLOCK_FP8_BACKEND == "triton":
+        return _fp8_linear_triton_hot
+    return fp8_linear
 
 
 def _rebind_fp8_aliases(backend = None) -> None:
@@ -1185,14 +1261,17 @@ if FP8Linear is not None:
     # profiler-confirmed parity with pypi requires this exact call shape so
     # dynamo inlines the inner compile into HF generate's outer compile.
     if fp8_block_quant_linear is fp8_torch_block_quant_forward:
-        _hot_block_fp8 = _fp8_torch_block_quant_forward_lean
         def _patched_block_fp8(self, X):
-            if torch.is_grad_enabled() and X.requires_grad:
-                # NVIDIA_REVIEW: training needs the explicit autograd boundary
-                # above. The compiled lean wrapper is kept for no-grad
-                # inference/generation where PyPI call-shape parity matters.
-                return _fp8_linear_training_autograd(X, self.weight, self.weight_scale_inv)
-            return _hot_block_fp8(X, self.weight, self.weight_scale_inv)
+            bias = getattr(self, "bias", None)
+            if bias is None:
+                if _BAKED_BLOCK_FP8_BACKEND == "triton":
+                    return _fp8_torch_block_quant_forward_lean_triton(
+                        X, self.weight, self.weight_scale_inv
+                    )
+                return _fp8_torch_block_quant_forward_lean(
+                    X, self.weight, self.weight_scale_inv
+                )
+            return _fp8_linear_training_autograd(X, self.weight, self.weight_scale_inv, bias)
         FP8Linear.forward = _patched_block_fp8
     else:
         FP8Linear.forward = module_forward_patch("weight_scale_inv")

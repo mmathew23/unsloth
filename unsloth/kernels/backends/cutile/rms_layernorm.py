@@ -41,7 +41,9 @@ from .ct_ops import calculate_settings
 # layernorm launches. Local code routes through select_launch_config to avoid
 # repeated per-shape benchmarking in production; exhaustive tuning is opt-in via
 # UNSLOTH_CUTILE_EXHAUSTIVE_TUNE=1.
-# Module-level tune cache: (direction, n_rows, n_cols, dtype, TILE_N, OFFSET, device) -> tuned_kernel
+# Module-level tune cache: compile-specializing key -> tuned_kernel.
+# Do not include n_rows: it is launch-grid only and CuTile can reuse the same
+# dispatcher/JIT cache across row counts for the same compiled signature.
 _rms_layernorm_tune_cache: dict = {}
 
 ConstInt = ct.Constant[int]
@@ -94,6 +96,7 @@ def _rms_layernorm_forward_ct_1d_body(Y, X, W, r, n_cols, eps, OFFSET, TILE_N):
         normed = ct.astype(normed, W.dtype)
         output = normed * w
 
+    output = ct.astype(output, X.dtype)
     ct.scatter(Y, (row, offsets), output, check_bounds=not no_padding)
 
 
@@ -199,7 +202,7 @@ class _Fast_RMS_Layernorm_CT(torch.autograd.Function):
         r = torch.empty(n_rows, dtype=torch.float32, device=X.device)
 
         stream = current_cuda_stream()
-        fwd_cache_key = ("fwd", n_rows, n_cols, X.dtype, TILE_N, OFFSET, str(X.device))
+        fwd_cache_key = ("fwd", n_cols, X.dtype, TILE_N, OFFSET, str(X.device))
         if fwd_cache_key not in _rms_layernorm_tune_cache:
             result = select_launch_config(
                 list(autotune_configs()),
@@ -243,7 +246,7 @@ class _Fast_RMS_Layernorm_CT(torch.autograd.Function):
         dX = torch.empty_like(dY)
 
         stream = current_cuda_stream()
-        bwd_cache_key = ("bwd", n_rows, n_cols, dY.dtype, ctx.TILE_N, ctx.OFFSET, str(dY.device))
+        bwd_cache_key = ("bwd", n_cols, dY.dtype, ctx.TILE_N, ctx.OFFSET, str(dY.device))
         if bwd_cache_key not in _rms_layernorm_tune_cache:
             result = select_launch_config(
                 list(autotune_configs()),

@@ -38,7 +38,9 @@ ConstFloat = ct.Constant[float]
 # layernorm launches. Local code routes through select_launch_config so the
 # default avoids per-shape tuning overhead; set
 # UNSLOTH_CUTILE_EXHAUSTIVE_TUNE=1 to review/profile TileGym's exhaustive path.
-# Module-level tune caches: (direction, n_rows, n_cols, dtype, TILE_N, device) -> tuned_kernel
+# Module-level tune caches: compile-specializing key -> tuned_kernel.
+# Do not include n_rows: it is launch-grid only and CuTile can reuse the same
+# dispatcher/JIT cache across row counts for the same compiled signature.
 _layernorm_fwd_tune_cache: dict = {}
 _layernorm_bwd_tune_cache: dict = {}
 
@@ -214,7 +216,7 @@ class _Fast_Layernorm_CT(torch.autograd.Function):
         mu = torch.empty(n_rows, dtype=torch.float32, device=X.device)
 
         stream = current_cuda_stream()
-        fwd_cache_key = (n_rows, n_cols, X.dtype, TILE_N, str(X.device))
+        fwd_cache_key = (n_cols, X.dtype, TILE_N, str(X.device))
         if fwd_cache_key not in _layernorm_fwd_tune_cache:
             result = select_launch_config(
                 list(autotune_configs()),
@@ -258,7 +260,7 @@ class _Fast_Layernorm_CT(torch.autograd.Function):
         dX = torch.empty_like(dY)
 
         stream = current_cuda_stream()
-        bwd_cache_key = (n_rows, n_cols, dY.dtype, ctx.TILE_N, str(dY.device))
+        bwd_cache_key = (n_cols, dY.dtype, ctx.TILE_N, str(dY.device))
         if bwd_cache_key not in _layernorm_bwd_tune_cache:
             result = select_launch_config(
                 list(autotune_configs()),

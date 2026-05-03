@@ -53,7 +53,10 @@ PAD_ZERO = ct.PaddingMode.ZERO
 # padding-free training hits many sequence shapes; repeated exhaustive searches
 # dominate runtime. Set UNSLOTH_CUTILE_EXHAUSTIVE_TUNE=1 to review/profile the
 # exact TileGym tuning behavior.
-# Module-level tune caches: (n_rows, n_heads, seq_len, head_dim, TILE_HD, dtype, device) -> tuned_kernel
+# Module-level tune caches: compile-specializing key -> tuned_kernel.
+# Do not include batch-derived n_rows or seqlen: n_rows is launch-grid only,
+# and seqlen is passed as a runtime scalar so padding-free training can reuse
+# the same dispatcher/JIT cache across dynamic sequence lengths.
 _rope_embedding_single_tune_cache: dict = {}
 _rope_embedding_qk_tune_cache: dict = {}
 
@@ -70,7 +73,7 @@ def _rope_embedding_QK_ct(
     cos,  # flattened: (seq_len * cos_row_stride,) — 1D gather access
     sin,  # same shape as cos, flattened
     rope_embedding_indices,  # (batch * seq_len,) int32, or dummy (1,)
-    seqlen: ConstInt,
+    seqlen: int,
     head_dim: ConstInt,
     n_heads_Q: ConstInt,
     n_heads_K: ConstInt,
@@ -168,7 +171,7 @@ def _rope_embedding_ct(
     Q_out,  # flattened: same shape — write output
     cos,  # flattened: (seq_len * cos_row_stride,) — gather-based access
     sin,  # same shape as cos, flattened
-    seqlen: ConstInt,
+    seqlen: int,
     n_heads: ConstInt,
     head_dim: ConstInt,
     cos_row_stride: ConstInt,
@@ -270,7 +273,7 @@ class _Fast_RoPE_Embedding_CT(torch.autograd.Function):
         # Autotune over occupancy=[1,2,4,8] (matching layernorm.py pattern).
         # Split-buffer: Q_flat_1d is read-only, Q_result is write-only.
         stream = current_cuda_stream()
-        single_cache_key = (n_rows, n_heads, seq_len, head_dim, TILE_HD, cos_row_stride, Q.dtype, str(Q.device))
+        single_cache_key = (n_heads, head_dim, TILE_HD, cos_row_stride, no_padding, Q.dtype, str(Q.device))
         if single_cache_key not in _rope_embedding_single_tune_cache:
             result = select_launch_config(
                 list(autotune_configs()),
@@ -408,12 +411,12 @@ class _Fast_RoPE_Embedding_QK_CT(torch.autograd.Function):
 
         stream = current_cuda_stream()
         qk_cache_key = (
-            n_rows,
             n_heads_Q,
             n_heads_K,
-            seq_len,
             head_dim,
             TILE_HD,
+            cos_row_stride,
+            no_padding,
             has_indices_int,
             Q.dtype,
             str(Q.device),

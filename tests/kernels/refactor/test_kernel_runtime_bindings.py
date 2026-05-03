@@ -53,6 +53,47 @@ class KernelRuntimeBindingTests(unittest.TestCase):
             "runtime_dummy",
         )
 
+    def test_distinct_runtime_modules_keep_distinct_backend_bindings(self):
+        kernel_name = "unsloth.layernorm"
+        backend_a = "runtime_module_a"
+        backend_b = "runtime_module_b"
+
+        def _layernorm_a(X, W, b, eps):
+            return X + W + b + 10
+
+        def _layernorm_b(X, W, b, eps):
+            return X + W + b + 20
+
+        register_kernel_backend(kernel_name, backend_a, _layernorm_a)
+        register_kernel_backend(kernel_name, backend_b, _layernorm_b)
+
+        runtime_a = types.ModuleType("runtime_module_a")
+        runtime_b = types.ModuleType("runtime_module_b")
+
+        with kernel_backend_context(global_backend = backend_a):
+            bind_kernel_runtime_globals(runtime_a)
+        with kernel_backend_context(global_backend = backend_b):
+            bind_kernel_runtime_globals(runtime_b)
+
+        layernorm = torch.nn.LayerNorm(4)
+        X = torch.zeros(2, 4)
+
+        with kernel_backend_context(global_backend = backend_b):
+            out_a = runtime_a.fast_layernorm(layernorm, X)
+        with kernel_backend_context(global_backend = backend_a):
+            out_b = runtime_b.fast_layernorm(layernorm, X)
+
+        self.assertTrue(torch.equal(out_a, X + layernorm.weight + layernorm.bias + 10))
+        self.assertTrue(torch.equal(out_b, X + layernorm.weight + layernorm.bias + 20))
+        self.assertEqual(
+            runtime_a._unsloth_kernel_binding_state["runtime_global_backend"],
+            backend_a,
+        )
+        self.assertEqual(
+            runtime_b._unsloth_kernel_binding_state["runtime_global_backend"],
+            backend_b,
+        )
+
     def test_fp8_runtime_bindings_do_not_follow_later_backend_rebinds(self):
         suffix = "runtime_fp8_a"
         backend_a = f"{suffix}_a"

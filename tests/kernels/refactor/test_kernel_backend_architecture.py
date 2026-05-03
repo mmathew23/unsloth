@@ -1,12 +1,19 @@
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[4]
+def _find_repo_root(path):
+    for parent in path.resolve().parents:
+        if (parent / "unsloth" / "kernels").is_dir():
+            return parent
+    raise RuntimeError(f"Could not find unsloth repo root from {path}")
+
+
+ROOT = _find_repo_root(Path(__file__))
 
 from unsloth.kernels import describe_kernel_backends, ensure_backend_loaded, is_kernel_backend_available
 from unsloth.kernels.backends._manifests import CUTILE_EXPECTED_OPS, TRITON_EXPECTED_OPS
 
-CUTILE_DIR = ROOT / "unsloth" / "unsloth" / "kernels" / "backends" / "cutile"
+CUTILE_DIR = ROOT / "unsloth" / "kernels" / "backends" / "cutile"
 
 
 class KernelBackendArchitectureTests(unittest.TestCase):
@@ -33,7 +40,7 @@ class KernelBackendArchitectureTests(unittest.TestCase):
 
     def test_glm4_moe_uses_pluggable_grouped_gemm(self):
         source = (
-            ROOT / "unsloth" / "unsloth" / "models" / "glm4_moe.py"
+            ROOT / "unsloth" / "models" / "glm4_moe.py"
         ).read_text()
         self.assertIn(
             "from ..kernels.grouped_gemm import grouped_gemm",

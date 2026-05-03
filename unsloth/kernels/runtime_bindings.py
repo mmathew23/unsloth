@@ -116,6 +116,39 @@ def _make_runtime_fp8_linear(
             ),
         },
     )
+    RuntimeFbgemmFp8LinearMatmul = type(
+        "RuntimeFbgemmFp8Linear_matmul",
+        (torch.autograd.Function,),
+        {
+            "__module__": fp8_mod.__name__,
+            "forward": staticmethod(
+                _clone_function_with_globals(
+                    fp8_mod.FbgemmFp8Linear_matmul.forward,
+                    {"weight_dequant": weight_dequant},
+                )
+            ),
+            "backward": staticmethod(
+                _clone_function_with_globals(
+                    fp8_mod.FbgemmFp8Linear_matmul.backward,
+                    {"weight_dequant": weight_dequant},
+                )
+            ),
+        },
+    )
+    RuntimeFP8FbgemmBlockLinear = type(
+        "RuntimeFP8_fbgemm_block_linear",
+        (torch.autograd.Function,),
+        {
+            "__module__": fp8_mod.__name__,
+            "forward": staticmethod(fp8_mod.FP8_fbgemm_block_linear.forward),
+            "backward": staticmethod(
+                _clone_function_with_globals(
+                    fp8_mod.FP8_fbgemm_block_linear.backward,
+                    {"weight_dequant": weight_dequant},
+                )
+            ),
+        },
+    )
 
     if fp8_mod.fp8_block_quant_linear is fp8_mod.fp8_torch_block_quant_forward:
         block_forward = _clone_function_with_globals(
@@ -123,13 +156,28 @@ def _make_runtime_fp8_linear(
             {"FP8BlockQuantLinear": RuntimeFP8BlockQuantLinear},
         )
         fp8_block_quant_linear = fp8_mod.torch_compile(block_forward)
+    elif fp8_mod.fp8_block_quant_linear is fp8_mod.fp8_fbgemm_block_linear:
+        block_forward = _clone_function_with_globals(
+            _compiled_inner(fp8_mod.fp8_fbgemm_block_linear),
+            {"FP8_fbgemm_block_linear": RuntimeFP8FbgemmBlockLinear},
+        )
+        fp8_block_quant_linear = fp8_mod.torch_compile(block_forward)
     else:
         fp8_block_quant_linear = fp8_mod.fp8_block_quant_linear
+    fbgemm_fp8_linear = fp8_mod.torch_compile(
+        _clone_function_with_globals(
+            _compiled_inner(fp8_mod.fbgemm_fp8_linear),
+            {"FbgemmFp8Linear_matmul": RuntimeFbgemmFp8LinearMatmul},
+        )
+    )
 
     fp8_linear_static = fp8_mod.torch_compile(
         _clone_function_with_globals(
             _compiled_inner(fp8_mod._fp8_linear_static),
-            {"fp8_block_quant_linear": fp8_block_quant_linear},
+            {
+                "fp8_block_quant_linear": fp8_block_quant_linear,
+                "fbgemm_fp8_linear": fbgemm_fp8_linear,
+            },
         )
     )
 

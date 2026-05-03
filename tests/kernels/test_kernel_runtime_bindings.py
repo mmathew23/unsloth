@@ -11,6 +11,7 @@ from unsloth.kernels import (
 )
 from unsloth.kernels.runtime_bindings import (
     bind_kernel_runtime_globals,
+    _make_runtime_fp8_linear,
     resolve_kernel_runtime_bindings,
 )
 import unsloth.kernels.layernorm as layernorm_module
@@ -118,6 +119,83 @@ class KernelRuntimeBindingTests(unittest.TestCase):
 
         self.assertTrue(torch.equal(dequant, torch.full_like(dequant, 33)))
         self.assertTrue(torch.equal(linear, torch.full_like(linear, 11)))
+
+    def test_runtime_fp8_rowwise_binding_isolates_fbgemm_dequant_global(self):
+        def _global_weight_dequant(weight, scale):
+            return torch.full((weight.shape[1], weight.shape[0]), 99.0)
+
+        def _runtime_weight_dequant(weight, scale):
+            return torch.full((weight.shape[1], weight.shape[0]), 7.0)
+
+        namespace = {
+            "torch": torch,
+            "weight_dequant": _global_weight_dequant,
+        }
+        exec(
+            """
+class FbgemmFp8Linear_matmul(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, weight_scale, bias = None):
+        return torch.matmul(x, weight_dequant(weight, weight_scale))
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        raise AssertionError("backward is not used by this structural test")
+
+class FP8_fbgemm_block_linear(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, X, weight, weight_scale, bias = None):
+        return X
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        raise AssertionError("backward is not used by this structural test")
+
+def fbgemm_fp8_linear(X, weight, weight_scale, bias = None):
+    return FbgemmFp8Linear_matmul.apply(X, weight, weight_scale, bias)
+
+def fp8_fbgemm_block_linear(X, weight, weight_scale, bias = None):
+    return FP8_fbgemm_block_linear.apply(X, weight, weight_scale, bias)
+
+def fp8_torch_block_quant_forward(X, weight, weight_scale, bias = None):
+    return X
+
+def _fp8_linear_static(X, weight, weight_scale, bias = None):
+    return fbgemm_fp8_linear(X, weight, weight_scale, bias)
+""",
+            namespace,
+        )
+
+        fake_fp8_mod = types.SimpleNamespace(
+            __name__ = "fake_fp8_mod",
+            torch = torch,
+            torch_compile = lambda fn: fn,
+            FP8BlockQuantLinear = namespace["FP8_fbgemm_block_linear"],
+            FbgemmFp8Linear_matmul = namespace["FbgemmFp8Linear_matmul"],
+            FP8_fbgemm_block_linear = namespace["FP8_fbgemm_block_linear"],
+            fp8_block_quant_linear = namespace["fp8_torch_block_quant_forward"],
+            fp8_torch_block_quant_forward = namespace["fp8_torch_block_quant_forward"],
+            fp8_fbgemm_block_linear = namespace["fp8_fbgemm_block_linear"],
+            fbgemm_fp8_linear = namespace["fbgemm_fp8_linear"],
+            _fp8_linear_static = namespace["_fp8_linear_static"],
+            _fp8_linear_eager = lambda X, weight, weight_scale, bias = None: X,
+        )
+
+        runtime_fp8_linear = _make_runtime_fp8_linear(
+            fake_fp8_mod,
+            act_quant = lambda X, block_size: (X, torch.ones(1)),
+            fp8_block_matmul = lambda *args, **kwargs: args[0],
+            weight_dequant = _runtime_weight_dequant,
+            block_fp8_backend = "runtime",
+        )
+
+        X = torch.ones(1, 2)
+        weight = torch.ones(3, 2)
+        weight_scale = torch.ones(3, 1)
+        with torch.no_grad():
+            out = runtime_fp8_linear(X, weight, weight_scale)
+
+        self.assertTrue(torch.equal(out, torch.full((1, 3), 14.0)))
 
 
 if __name__ == "__main__":

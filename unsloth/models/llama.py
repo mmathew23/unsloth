@@ -123,7 +123,7 @@ except:
     from huggingface_hub.utils._token import get_token
 try:
     from triton import __version__ as triton_version
-except ModuleNotFoundError:
+except Exception:
     triton_version = "not-installed"
 
 HAS_XFORMERS = xformers is not None

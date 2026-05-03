@@ -692,8 +692,16 @@ def patch_finegrained_fp8_without_triton():
                 )
             from unsloth.kernels.fp8 import fp8_linear
 
-            weight = self.weight.contiguous()
-            scale_inv = self.weight_scale_inv.contiguous()
+            try:
+                from torch.distributed.tensor import DTensor
+            except Exception:
+                DTensor = None
+            if DTensor is not None and isinstance(self.weight, DTensor):
+                weight = self.weight._local_tensor.contiguous()
+                scale_inv = self.weight_scale_inv._local_tensor.contiguous()
+            else:
+                weight = self.weight.contiguous()
+                scale_inv = self.weight_scale_inv.contiguous()
             return fp8_linear(input, weight, scale_inv, self.bias).to(dtype=input.dtype)
 
     def replace_with_unsloth_fp8_linear(
@@ -704,6 +712,11 @@ def patch_finegrained_fp8_without_triton():
     ):
         if quantization_config.dequantize:
             return model
+        if quantization_config.activation_scheme != "dynamic":
+            raise NotImplementedError(
+                "CuTile/no-Triton finegrained FP8 currently supports only "
+                "activation_scheme='dynamic'."
+            )
         has_been_replaced = False
         for module_name, module in model.named_modules():
             if not should_convert_module(module_name, modules_to_not_convert):

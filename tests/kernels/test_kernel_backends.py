@@ -40,6 +40,7 @@ layernorm_module = importlib.import_module("unsloth.kernels.layernorm")
 swiglu_module = importlib.import_module("unsloth.kernels.swiglu")
 import unsloth.kernels.fp8 as fp8_module
 import unsloth.kernels._backend_registry as backend_registry
+import unsloth.kernels.cross_entropy_loss as cross_entropy_module
 
 
 @contextmanager
@@ -229,6 +230,15 @@ class KernelBackendTests(unittest.TestCase):
         self.assertIsNotNone(reason)
         self.assertIn("Triton import failed", reason)
         self.assertIn("simulated ABI mismatch", reason)
+
+    def test_cross_entropy_patch_always_installs_transformers_loss_hook(self):
+        with patch.object(cross_entropy_module, "_patch_loss_functions") as patched:
+            cross_entropy_module.patch_loss_functions(torch_compile = False)
+
+        patched.assert_called_once_with(
+            cross_entropy_module.fast_cross_entropy_loss,
+            torch_compile = False,
+        )
 
     def test_failed_backend_loader_is_cached_not_retried(self):
         """A loader that raises should be cached so subsequent dispatches

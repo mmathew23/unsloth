@@ -108,7 +108,12 @@ if not HAS_FLEX_ATTENTION:
             fullgraph=True, dynamic=True, options=torch_compile_options,
         )
     else:
-        slow_attention_softcapping = _slow_attention_softcapping_impl
+        from unsloth_zoo.temporary_patches.common import torch_compile
+
+        slow_attention_softcapping = torch_compile(
+            _slow_attention_softcapping_impl,
+            fullgraph=True, dynamic=True, options=torch_compile_options,
+        )
 
     create_flex_attention_causal_mask = None
     create_flex_attention_sliding_window_mask = None

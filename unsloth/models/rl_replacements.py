@@ -1190,11 +1190,24 @@ def grpo_trainer__get_per_token_logps_and_entropies(function_name, function):
                                 :, -(logits_to_keep + max_left_pad + 1) :, :
                             ]
                             logits_chunk = logits_chunk[:, :-1, :]
-                            # Some eager/generic model paths return logits even
-                            # when UNSLOTH_RETURN_HIDDEN_STATES=1. Avoid
-                            # projecting vocab logits through lm_head a second
-                            # time.
-                            if logits_chunk.shape[-1] == lm_head.shape[1]:
+                            # Some eager/generic paths ignore
+                            # UNSLOTH_RETURN_HIDDEN_STATES and return vocab
+                            # logits. Do not silently guess when hidden and
+                            # vocab widths are identical.
+                            _logits_width = logits_chunk.shape[-1]
+                            _hidden_width = lm_head.shape[1]
+                            _vocab_width = lm_head.shape[0]
+                            if (
+                                _logits_width == _hidden_width
+                                and _logits_width == _vocab_width
+                            ):
+                                raise RuntimeError(
+                                    "Unsloth: cannot determine whether GRPO model "
+                                    "output contains hidden states or logits because "
+                                    "hidden_size == vocab_size. The model forward path "
+                                    "must provide an explicit hidden-state/logits contract."
+                                )
+                            if _logits_width == _hidden_width:
                                 logprobs_chunk = (
                                     chunked_hidden_states_selective_log_softmax(
                                         logits_chunk,
@@ -1207,11 +1220,16 @@ def grpo_trainer__get_per_token_logps_and_entropies(function_name, function):
                                         temperature = temperature,
                                     )
                                 )
-                            else:
+                            elif _logits_width == _vocab_width:
                                 logprobs_chunk = chunked_selective_log_softmax(
                                     logits_chunk,
                                     completion_input_ids_chunk,
                                     temperature = temperature,
+                                )
+                            else:
+                                raise RuntimeError(
+                                    "Unsloth: model output width does not match either "
+                                    "hidden_size or vocab_size in GRPO logprob path."
                                 )
                         else:
                             # Essentially, for VLMs we do not go via the optimized path in models/,
@@ -1231,8 +1249,22 @@ def grpo_trainer__get_per_token_logps_and_entropies(function_name, function):
                             completion_input_ids_chunk = input_ids_chunk[
                                 :, -logits_to_keep:
                             ]
-                            # Guard: check if model returned hidden states or logits
-                            if logits_chunk.shape[-1] == lm_head.shape[1]:
+                            # Guard: check if model returned hidden states or logits.
+                            # Do not silently guess when both widths are identical.
+                            _logits_width = logits_chunk.shape[-1]
+                            _hidden_width = lm_head.shape[1]
+                            _vocab_width = lm_head.shape[0]
+                            if (
+                                _logits_width == _hidden_width
+                                and _logits_width == _vocab_width
+                            ):
+                                raise RuntimeError(
+                                    "Unsloth: cannot determine whether GRPO model "
+                                    "output contains hidden states or logits because "
+                                    "hidden_size == vocab_size. The model forward path "
+                                    "must provide an explicit hidden-state/logits contract."
+                                )
+                            if _logits_width == _hidden_width:
                                 logprobs_chunk = (
                                     chunked_hidden_states_selective_log_softmax(
                                         logits_chunk,
@@ -1245,12 +1277,17 @@ def grpo_trainer__get_per_token_logps_and_entropies(function_name, function):
                                         temperature = temperature,
                                     )
                                 )
-                            else:
+                            elif _logits_width == _vocab_width:
                                 # Model returned logits directly - scaling/softcapping already applied by model forward
                                 logprobs_chunk = chunked_selective_log_softmax(
                                     logits_chunk,
                                     completion_input_ids_chunk,
                                     temperature,
+                                )
+                            else:
+                                raise RuntimeError(
+                                    "Unsloth: model output width does not match either "
+                                    "hidden_size or vocab_size in GRPO logprob path."
                                 )
                     # This is needed to avoid race conditions with GPT OSS offload_embbed=True
                     # However, it seems that this line does not slow down or disrupt models.

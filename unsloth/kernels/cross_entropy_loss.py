@@ -566,11 +566,4 @@ if (Version(torch.__version__) < Version("2.4.0")) and not hasattr(
 
 # Patch CE Losses in transformers
 def patch_loss_functions(torch_compile = True):
-    try:
-        from ._backend_registry import get_kernel_backend
-
-        if get_kernel_backend("unsloth.cross_entropy_loss") == "eager":
-            return
-    except Exception:
-        pass
     _patch_loss_functions(fast_cross_entropy_loss, torch_compile = torch_compile)

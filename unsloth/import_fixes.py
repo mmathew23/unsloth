@@ -686,11 +686,7 @@ def patch_finegrained_fp8_without_triton():
         def forward(self, input: torch.Tensor) -> torch.Tensor:
             if self.weight.element_size() > 1:
                 return nn.functional.linear(input, self.weight, self.bias)
-            if self.activation_scheme != "dynamic":
-                raise NotImplementedError(
-                    f"Unsupported FP8 activation scheme without Triton: {self.activation_scheme}"
-                )
-            from unsloth.kernels.fp8 import fp8_linear
+            from unsloth.kernels.fp8 import fp8_linear, weight_dequant
 
             try:
                 from torch.distributed.tensor import DTensor
@@ -702,7 +698,18 @@ def patch_finegrained_fp8_without_triton():
             else:
                 weight = self.weight.contiguous()
                 scale_inv = self.weight_scale_inv.contiguous()
-            return fp8_linear(input, weight, scale_inv, self.bias).to(dtype=input.dtype)
+            if self.activation_scheme == "dynamic":
+                return fp8_linear(input, weight, scale_inv, self.bias).to(dtype=input.dtype)
+            if self.activation_scheme == "static":
+                # No-Triton fallback: keep checkpoint loading functional for
+                # static-activation finegrained FP8 by dequantizing weights and
+                # using a standard matmul. This is a compatibility path, not a
+                # hot performance path.
+                dequant_weight = weight_dequant(weight, scale_inv, dtype=input.dtype)
+                return nn.functional.linear(input, dequant_weight, self.bias).to(dtype=input.dtype)
+            raise NotImplementedError(
+                f"Unsupported FP8 activation scheme without Triton: {self.activation_scheme}"
+            )
 
     def replace_with_unsloth_fp8_linear(
         model,
@@ -712,11 +719,6 @@ def patch_finegrained_fp8_without_triton():
     ):
         if quantization_config.dequantize:
             return model
-        if quantization_config.activation_scheme != "dynamic":
-            raise NotImplementedError(
-                "CuTile/no-Triton finegrained FP8 currently supports only "
-                "activation_scheme='dynamic'."
-            )
         has_been_replaced = False
         for module_name, module in model.named_modules():
             if not should_convert_module(module_name, modules_to_not_convert):

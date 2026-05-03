@@ -60,6 +60,13 @@ _RESOLVE_CACHE: dict[tuple[str, str | None, str, str | None, str | None], str] =
 # `kernel_backend_context` enters/exits, or when a new backend implementation is
 # registered (so dispatcher kernels can rebind their `_resolved_<name>` module
 # aliases).
+#
+# Important contract: these hooks intentionally update process-global hot-path
+# aliases so generated/training code can keep a direct call shape with no
+# per-call backend dispatch. They are suitable for process/session backend
+# policy and sequential tests, but they do not make direct exported kernel
+# aliases safe for concurrent per-thread/per-request backend switching. Use
+# explicit registry dispatch or isolated runtime-module bindings for that.
 GlobalBackendChangeHook = Callable[[str | None], None]
 _GLOBAL_BACKEND_CHANGE_HOOKS: list[GlobalBackendChangeHook] = []
 _GLOBAL_BACKEND_CHANGE_HOOK_KEYS: dict[tuple[str, str], GlobalBackendChangeHook] = {}
@@ -72,14 +79,18 @@ def register_global_backend_change_hook(fn: GlobalBackendChangeHook) -> None:
     or ``None`` if the global has been cleared. Fired by:
       * ``set_kernel_backend`` / ``set_kernel_backend_for_op`` /
         ``set_kernel_backends`` / ``clear_kernel_backend_overrides``
-      * ``kernel_backend_context`` enter and exit (so nested-context restoration is honored)
+      * ``kernel_backend_context`` enter and exit (so nested-context restoration is honored
+        for sequential use)
       * ``register_kernel_backend`` (so a backend that registers AFTER a kernel
         module's `_resolved_<name>` alias was bound triggers a re-bind)
       * ``ensure_backend_loaded`` on first successful load (same reason)
 
     Hooks must be idempotent and side-effect-free beyond updating their own
-    module-level aliases. Exceptions raised inside a hook are swallowed and
-    logged (a faulty backend should not break global state mutation).
+    module-level aliases. They may update process-global hot aliases by design;
+    that preserves throughput but is not a concurrency primitive for serving
+    different backends from different threads in one process. Exceptions raised
+    inside a hook are swallowed and logged (a faulty backend should not break
+    global state mutation).
     """
     if not callable(fn):
         raise TypeError("Backend change hook must be callable.")
@@ -630,10 +641,13 @@ def set_kernel_backend(backend: str | None) -> None:
         with kernel_backend_context(global_backend="cutile"):
             ...
 
-    Scope: applies to the current contextvar context only. New threads,
-    forked subprocesses (e.g. ``torch.utils.data.DataLoader`` workers,
-    Ray actors), and ``multiprocessing`` children do NOT inherit it. For
-    process-wide / cross-process configuration, set the
+    Scope: the registry state applies to the current contextvar context only,
+    but direct hot kernel aliases are rebound process-wide for speed. Do not
+    use this API for concurrent per-thread/per-request backend switching in one
+    process. New threads, forked subprocesses (e.g.
+    ``torch.utils.data.DataLoader`` workers, Ray actors), and
+    ``multiprocessing`` children do NOT inherit it. For process-wide /
+    cross-process configuration, set the
     ``UNSLOTH_KERNEL_BACKEND`` environment variable before spawning — the
     env var is read by every dispatch and inherited by subprocesses.
     """
@@ -650,9 +664,10 @@ def set_kernel_backend_for_op(name: str, backend: str | None) -> None:
         with kernel_backend_context(overrides={"rope_embedding": "cutile"}):
             ...
 
-    Scope: current contextvar context only (see :func:`set_kernel_backend`
-    for thread / subprocess caveats). For process-wide per-op overrides
-    use the ``UNSLOTH_KERNEL_BACKEND_OVERRIDES`` env var (format:
+    Scope: current contextvar context for registry lookups only (see
+    :func:`set_kernel_backend` for hot-alias, thread, and subprocess caveats).
+    For process-wide per-op overrides use the
+    ``UNSLOTH_KERNEL_BACKEND_OVERRIDES`` env var (format:
     ``rope_embedding=cutile,layernorm=triton``).
     """
     kernel_name = _normalize_kernel_name(name)
@@ -684,10 +699,10 @@ def set_kernel_backends(
                                     overrides={"rope_embedding": "triton"}):
             ...
 
-    Scope: current contextvar context only (see :func:`set_kernel_backend`
-    for thread / subprocess caveats). For process-wide configuration use
-    the ``UNSLOTH_KERNEL_BACKEND`` and ``UNSLOTH_KERNEL_BACKEND_OVERRIDES``
-    environment variables.
+    Scope: current contextvar context for registry lookups only (see
+    :func:`set_kernel_backend` for hot-alias, thread, and subprocess caveats).
+    For process-wide configuration use the ``UNSLOTH_KERNEL_BACKEND`` and
+    ``UNSLOTH_KERNEL_BACKEND_OVERRIDES`` environment variables.
     """
     if global_backend is not _UNSET:
         set_kernel_backend(global_backend)
@@ -720,7 +735,10 @@ def kernel_backend_context(
 
     Use this instead of :func:`set_kernel_backend` /
     :func:`set_kernel_backend_for_op` / :func:`set_kernel_backends` when you
-    want the override to last only for a block of code. Example::
+    want the override to last only for a sequential block of code. Direct hot
+    kernel aliases are rebound process-wide for throughput, so this context
+    manager is not intended for concurrent per-thread/per-request backend
+    switching in one process. Example::
 
         with kernel_backend_context(global_backend="cutile",
                                     overrides={"rope_embedding": "triton"}):

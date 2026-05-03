@@ -3,9 +3,9 @@ import unittest
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[3]
-UNSLOTH_PYPROJECT = ROOT / "unsloth" / "pyproject.toml"
-UNSLOTH_ZOO_PYPROJECT = ROOT / "unsloth-zoo" / "pyproject.toml"
+ROOT = Path(__file__).resolve().parents[2]
+UNSLOTH_PYPROJECT = ROOT / "pyproject.toml"
+UNSLOTH_ZOO_PYPROJECT = ROOT.parent / "unsloth-zoo" / "pyproject.toml"
 
 
 def _load_optional_dependencies(pyproject_path: Path) -> dict[str, list[str]]:
@@ -21,6 +21,10 @@ def _load_dependencies(pyproject_path: Path) -> list[str]:
 
 
 class CutilePackagingTests(unittest.TestCase):
+    def _require_unsloth_zoo_checkout(self):
+        if not UNSLOTH_ZOO_PYPROJECT.exists():
+            self.skipTest("requires a sibling unsloth-zoo checkout")
+
     def test_unsloth_cutile_extra_is_available_without_triton(self):
         optional = _load_optional_dependencies(UNSLOTH_PYPROJECT)
         self.assertIn("cutile", optional)
@@ -34,10 +38,12 @@ class CutilePackagingTests(unittest.TestCase):
         self.assertFalse(any(dep.startswith("triton") for dep in cutile_deps))
 
     def test_unsloth_zoo_base_dependencies_do_not_require_triton(self):
+        self._require_unsloth_zoo_checkout()
         dependencies = _load_dependencies(UNSLOTH_ZOO_PYPROJECT)
         self.assertFalse(any(dep.startswith("triton") for dep in dependencies))
 
     def test_unsloth_zoo_cutile_extra_carries_cutile_stack(self):
+        self._require_unsloth_zoo_checkout()
         optional = _load_optional_dependencies(UNSLOTH_ZOO_PYPROJECT)
         self.assertIn("cutile", optional)
         cutile_deps = optional["cutile"]
@@ -59,6 +65,7 @@ class CutilePackagingTests(unittest.TestCase):
         )
 
     def test_unsloth_zoo_huggingface_extra_keeps_triton_path(self):
+        self._require_unsloth_zoo_checkout()
         optional = _load_optional_dependencies(UNSLOTH_ZOO_PYPROJECT)
         self.assertIn("huggingface", optional)
         self.assertTrue(

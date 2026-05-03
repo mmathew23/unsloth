@@ -385,6 +385,106 @@ class KernelBackendTests(unittest.TestCase):
 
         self.assertTrue(torch.equal(out, e - g))
 
+    def test_env_hybrid_override_keeps_global_triton_for_non_overridden_ops(self):
+        """Studio hybrid mode can keep Triton globally while routing selected
+        kernels to CuTile through ``UNSLOTH_KERNEL_BACKEND_OVERRIDES``.
+
+        Use synthetic ops and patched availability so this locks policy
+        semantics without requiring a real CuTile install in the default test
+        environment.
+        """
+        from unsloth.kernels import _backend_registry as br
+
+        overridden_kernel = "unsloth.synthetic_hybrid_override"
+        default_kernel = "unsloth.synthetic_hybrid_default"
+        saved_loaders = dict(br._BUILTIN_LOADERS)
+        saved_checks = dict(br._AVAILABILITY_CHECKS)
+        try:
+            br._BUILTIN_LOADERS["triton"] = lambda: None
+            br._BUILTIN_LOADERS["cutile"] = lambda: None
+            br._AVAILABILITY_CHECKS["triton"] = lambda: (True, None)
+            br._AVAILABILITY_CHECKS["cutile"] = lambda: (True, None)
+            backend_registry.clear_backend_load_cache("triton")
+            backend_registry.clear_backend_load_cache("cutile")
+
+            register_kernel_backend(overridden_kernel, "triton", lambda x: x + 10)
+            register_kernel_backend(overridden_kernel, "cutile", lambda x: x + 20)
+            register_kernel_backend(default_kernel, "triton", lambda x: x + 30)
+            register_kernel_backend(default_kernel, "cutile", lambda x: x + 40)
+
+            os.environ["UNSLOTH_KERNEL_BACKEND"] = "triton"
+            os.environ["UNSLOTH_KERNEL_BACKEND_OVERRIDES"] = (
+                f"{overridden_kernel}=cutile"
+            )
+
+            self.assertEqual(get_kernel_backend(overridden_kernel), "cutile")
+            self.assertEqual(get_kernel_backend(default_kernel), "triton")
+            self.assertEqual(
+                backend_registry.dispatch_kernel(overridden_kernel, 1),
+                21,
+            )
+            self.assertEqual(
+                backend_registry.dispatch_kernel(default_kernel, 1),
+                31,
+            )
+        finally:
+            br._REGISTRY.pop(overridden_kernel, None)
+            br._REGISTRY.pop(default_kernel, None)
+            br._BUILTIN_LOADERS.clear()
+            br._BUILTIN_LOADERS.update(saved_loaders)
+            br._AVAILABILITY_CHECKS.clear()
+            br._AVAILABILITY_CHECKS.update(saved_checks)
+            backend_registry.clear_backend_load_cache("triton")
+            backend_registry.clear_backend_load_cache("cutile")
+
+    def test_runtime_hybrid_override_keeps_global_triton_for_non_overridden_ops(self):
+        """The runtime API should support the same granular hybrid policy as
+        the env-string Studio launcher path: global Triton, selected CuTile op.
+        """
+        from unsloth.kernels import _backend_registry as br
+
+        overridden_kernel = "unsloth.synthetic_runtime_hybrid_override"
+        default_kernel = "unsloth.synthetic_runtime_hybrid_default"
+        saved_loaders = dict(br._BUILTIN_LOADERS)
+        saved_checks = dict(br._AVAILABILITY_CHECKS)
+        try:
+            br._BUILTIN_LOADERS["triton"] = lambda: None
+            br._BUILTIN_LOADERS["cutile"] = lambda: None
+            br._AVAILABILITY_CHECKS["triton"] = lambda: (True, None)
+            br._AVAILABILITY_CHECKS["cutile"] = lambda: (True, None)
+            backend_registry.clear_backend_load_cache("triton")
+            backend_registry.clear_backend_load_cache("cutile")
+
+            register_kernel_backend(overridden_kernel, "triton", lambda x: x + 10)
+            register_kernel_backend(overridden_kernel, "cutile", lambda x: x + 20)
+            register_kernel_backend(default_kernel, "triton", lambda x: x + 30)
+            register_kernel_backend(default_kernel, "cutile", lambda x: x + 40)
+
+            set_kernel_backends(
+                global_backend = "triton",
+                overrides = {overridden_kernel: "cutile"},
+            )
+
+            self.assertEqual(get_kernel_backend(overridden_kernel), "cutile")
+            self.assertEqual(get_kernel_backend(default_kernel), "triton")
+            self.assertEqual(
+                backend_registry.dispatch_kernel(overridden_kernel, 1),
+                21,
+            )
+            self.assertEqual(
+                backend_registry.dispatch_kernel(default_kernel, 1),
+                31,
+            )
+        finally:
+            br._REGISTRY.pop(overridden_kernel, None)
+            br._REGISTRY.pop(default_kernel, None)
+            br._BUILTIN_LOADERS.clear()
+            br._BUILTIN_LOADERS.update(saved_loaders)
+            br._AVAILABILITY_CHECKS.clear()
+            br._AVAILABILITY_CHECKS.update(saved_checks)
+            backend_registry.clear_backend_load_cache("triton")
+            backend_registry.clear_backend_load_cache("cutile")
+
     def test_explicit_backend_request_skips_intermediate_fallback_backend(self):
         kernel_name = "unsloth.synthetic_explicit_request"
         backend_registry._AVAILABILITY_CHECKS["missing"] = lambda: (False, "blocked")

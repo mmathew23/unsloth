@@ -12,6 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from ._backend_registry import (
+    EAGER_KERNEL_BACKEND,
+    clear_backend_load_cache,
+    clear_kernel_backend_overrides,
+    describe_kernel_backends,
+    ensure_backend_loaded,
+    get_kernel_backend,
+    get_kernel_backend_state,
+    get_kernel_impl,
+    get_registered_kernel_backends,
+    is_kernel_backend_available,
+    kernel_backend_context,
+    register_kernel_backend,
+    set_kernel_backend,
+    set_kernel_backend_for_op,
+    set_kernel_backends,
+)
+# NOTE: the generic ``register_impl`` decorator is intentionally NOT
+# re-exported. Backend packages should register through their own
+# ``backends/<name>/_adapter.py`` so the backend identity is enforced.
+# External code that needs to register implementations should call
+# ``register_kernel_backend(op, backend, fn)`` directly.
 from .cross_entropy_loss import (
     fast_cross_entropy_loss,
     post_patch_loss_function,
@@ -26,13 +48,19 @@ from .layernorm import (
     fast_layernorm,
     patch_layernorm,
 )
-from .rope_embedding import fast_rope_embedding, inplace_rope_embedding
+from .rope_embedding import fast_rope_embedding, inplace_rope_embedding, rope_embedding
 from .swiglu import swiglu_fg_kernel, swiglu_DWf_DW_dfg_kernel
 from .geglu import (
     geglu_exact_forward_kernel,
     geglu_exact_backward_kernel,
     geglu_approx_forward_kernel,
     geglu_approx_backward_kernel,
+)
+from .grouped_gemm import grouped_gemm
+from .runtime_bindings import (
+    KernelRuntimeBindings,
+    bind_kernel_runtime_globals,
+    resolve_kernel_runtime_bindings,
 )
 from .fast_lora import (
     get_lora_parameters,

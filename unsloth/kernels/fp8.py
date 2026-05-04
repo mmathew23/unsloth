@@ -12,17 +12,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+from contextvars import ContextVar
+from types import FunctionType
 import torch
 import torch.nn as nn
-import triton
-import triton.language as tl
 from torch.nn import functional as F
 import math
+from ._backend_registry import (
+    get_kernel_backend,
+    get_kernel_impl,
+    register_global_backend_change_hook,
+    register_kernel_backend,
+)
+from ._optional_triton import HAS_TRITON, tl, triton
 from unsloth_zoo.utils import Version
 from unsloth_zoo.log import logger
 from unsloth_zoo.temporary_patches.common import torch_compile
 
 torch_matmul = torch.matmul
+
+
+def _clone_function_with_globals(fn, updates):
+    cloned = FunctionType(
+        fn.__code__,
+        {**fn.__globals__, **updates},
+        fn.__name__,
+        fn.__defaults__,
+        fn.__closure__,
+    )
+    cloned.__kwdefaults__ = getattr(fn, "__kwdefaults__", None)
+    cloned.__annotations__ = dict(getattr(fn, "__annotations__", {}))
+    cloned.__dict__.update(getattr(fn, "__dict__", {}))
+    cloned.__doc__ = getattr(fn, "__doc__", None)
+    cloned.__module__ = getattr(fn, "__module__", None)
+    cloned.__qualname__ = getattr(fn, "__qualname__", fn.__name__)
+    return cloned
 
 try:
     from transformers.integrations.finegrained_fp8 import FP8Linear
@@ -94,7 +118,58 @@ def weight_dequant_block(
     return y
 
 
-def weight_dequant(x: torch.Tensor, s: torch.Tensor, dtype = torch.bfloat16):
+_triton_weight_dequant_block = weight_dequant_block
+
+
+def _weight_dequant_block_eager(
+    x: torch.Tensor,
+    s: torch.Tensor,
+    block_size: int = 128,
+    dtype = torch.bfloat16,
+) -> torch.Tensor:
+    if not x.is_contiguous():
+        x = x.contiguous()
+    if not s.is_contiguous():
+        s = s.contiguous()
+    M, N = x.shape
+    expected_shape = (math.ceil(M / block_size), math.ceil(N / block_size))
+    if s.shape == expected_shape:
+        pass
+    elif s.shape == expected_shape[::-1]:
+        s = s.t().contiguous()
+    else:
+        raise ValueError(
+            f"Scale shape {s.shape} is incompatible with weight shape {x.shape} and block size {block_size}"
+        )
+    row_scales = torch.repeat_interleave(s, block_size, dim = 0)[:M]
+    full_scales = torch.repeat_interleave(row_scales, block_size, dim = 1)[:, :N]
+    return (x.to(dtype = torch.float32) * full_scales.to(dtype = torch.float32)).to(
+        dtype = dtype
+    )
+
+
+register_kernel_backend(
+    "unsloth.weight_dequant",
+    "eager",
+    _weight_dequant_block_eager,
+)
+
+
+def weight_dequant_block(
+    x: torch.Tensor,
+    s: torch.Tensor,
+    block_size: int = 128,
+    dtype = torch.bfloat16,
+) -> torch.Tensor:
+    impl = _get_fp8_alias_bindings()["weight_dequant_block"]
+    return impl(x, s, block_size, dtype)
+
+
+def weight_dequant(
+    x: torch.Tensor,
+    s: torch.Tensor,
+    dtype = torch.bfloat16,
+):
     # Per-tensor scale: single value for entire weight matrix
     if s.numel() == 1:
         return x.to(dtype) * s.view(1, 1).to(dtype)
@@ -145,6 +220,39 @@ def act_quant(
 
     act_quant_kernel[grid](x, y, s, BLOCK_SIZE = block_size)
     return y, s
+
+
+_triton_act_quant = act_quant
+
+
+def _act_quant_eager(
+    x: torch.Tensor, block_size: int = 128
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not x.is_contiguous():
+        x = x.contiguous()
+    assert x.shape[-1] % block_size == 0
+    num_blocks = x.shape[-1] // block_size
+    x_blocks = x.to(torch.float32).reshape(*x.shape[:-1], num_blocks, block_size)
+    abs_max = x_blocks.abs().amax(dim = -1)
+    scale = abs_max / 448.0
+    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    y = (x_blocks / scale.unsqueeze(-1)).reshape_as(x).to(torch.float8_e4m3fn)
+    return y, scale.contiguous()
+
+
+register_kernel_backend(
+    "unsloth.act_quant",
+    "eager",
+    _act_quant_eager,
+)
+
+
+def act_quant(
+    x: torch.Tensor,
+    block_size: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    impl = _get_fp8_alias_bindings()["act_quant"]
+    return impl(x, block_size)
 
 
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/quantization/fp8_kernel.py
@@ -317,17 +425,165 @@ def torchao_block_matmul(
     return out.to(output_dtype)
 
 
-# Note that older versions of fbgemm (<=1.3.0) cause numerical imprecisions resulting in NaNs especially when X has high values in it.
-# So our preference order is fbgemm (>=1.4.0) > torchao > triton. All of these have similar outputs/losses. Never use fbgemm (<=1.3.0) for block quantized FP8 matmul.
-# This torchao FP8 matmul seems to be ~3x faster than the w8a8_block_fp8_matmul_triton. Though torchao is 15-30% slower than fbgemm implementation (on H100 GPUs).
-fp8_block_matmul = (
-    torchao_block_matmul
-    if torchao_blockwise_gemm is not None
-    else w8a8_block_fp8_matmul_triton
+def _w8a8_block_fp8_matmul_eager(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    block_size,
+    output_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    if block_size is None:
+        block_n, block_k = 128, 128
+    else:
+        block_n, block_k = block_size[0], block_size[1]
+
+    N, K = B.shape
+    M = A.numel() // A.shape[-1]
+
+    A_f = A.reshape(M, K).to(torch.float32)
+    B_f = B.to(torch.float32)
+
+    # As: (..., ceil(K/block_k)) -> (M, ceil(K/block_k))
+    As_f = As.reshape(M, -1).to(torch.float32)
+    A_scale = As_f.repeat_interleave(block_k, dim = -1)[..., :K]
+    A_scaled = A_f * A_scale
+
+    # Bs: (ceil(N/block_n), ceil(K/block_k))
+    Bs_f = Bs.to(torch.float32)
+    B_scale = Bs_f.repeat_interleave(block_n, dim = 0)[:N, :]
+    B_scale = B_scale.repeat_interleave(block_k, dim = 1)[:, :K]
+    B_scaled = B_f * B_scale
+
+    out = A_scaled @ B_scaled.t()
+    return out.reshape(A.shape[:-1] + (N,)).to(output_dtype)
+
+
+register_kernel_backend(
+    "unsloth.w8a8_block_fp8_matmul",
+    "eager",
+    _w8a8_block_fp8_matmul_eager,
 )
 
 
+# Note that older versions of fbgemm (<=1.3.0) cause numerical imprecisions resulting in NaNs especially when X has high values in it.
+# So our preference order is fbgemm (>=1.4.0) > torchao > triton. All of these have similar outputs/losses. Never use fbgemm (<=1.3.0) for block quantized FP8 matmul.
+# This torchao FP8 matmul seems to be ~3x faster than the w8a8_block_fp8_matmul_triton. Though torchao is 15-30% slower than fbgemm implementation (on H100 GPUs).
+def fp8_block_matmul(
+    act_q: torch.Tensor,
+    weight_q: torch.Tensor,
+    act_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    block_size: tuple[int, int],
+    output_dtype: torch.dtype = torch.bfloat16,
+):
+    impl = _get_fp8_alias_bindings()["fp8_block_matmul"]
+    return impl(
+        act_q,
+        weight_q,
+        act_scale,
+        weight_scale,
+        block_size,
+        output_dtype = output_dtype,
+    )
+
+
 class FP8BlockQuantLinear(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, X, weight, weight_scale, bias = None):
+        m, n = weight.shape
+
+        # Save original scale for backward (before any transformation)
+        original_weight_scale = weight_scale
+
+        # Handle per-tensor quantization: expand scalar to block scale shape
+        if weight_scale.numel() == 1:
+            block_size = [128, 128]
+            # Expand scalar to (ceil(m/128), ceil(n/128)) - same value for all blocks
+            num_blocks_m = triton.cdiv(m, block_size[0])
+            num_blocks_n = triton.cdiv(n, block_size[1])
+            weight_scale = weight_scale.expand(num_blocks_m, num_blocks_n).contiguous()
+        else:
+            # Block quantization path
+            p, q = weight_scale.shape
+            block_size = getattr(weight, "block_size", None) or getattr(
+                weight_scale, "block_size", [128, 128]
+            )
+            assert block_size is not None, "block_size is not set"
+            if triton.cdiv(m, block_size[0]) != p or triton.cdiv(n, block_size[1]) != q:
+                if (
+                    triton.cdiv(m, block_size[0]) == q
+                    and triton.cdiv(n, block_size[1]) == p
+                ):
+                    weight_scale = weight_scale.T
+                    original_weight_scale = weight_scale  # Update for transposed case
+                else:
+                    raise ValueError(
+                        f"Weight shape {weight.shape} and scales shape {weight_scale.shape} is not compatible with block size {block_size}"
+                    )
+
+        if not weight.is_contiguous():
+            weight = weight.contiguous()
+
+        # Quantize input and run FP8 matmul through static backend symbols.
+        qinput, scale = act_quant(X, block_size[1])
+        output = fp8_block_matmul(
+            qinput,
+            weight,
+            scale,
+            weight_scale,
+            block_size,
+            output_dtype = X.dtype,
+        )
+        output = output.to(X.dtype)
+        if bias is not None:
+            output = output + bias.to(output.dtype)
+        ctx.weight = weight
+        ctx.weight_scale = original_weight_scale  # Save original for backward
+        # ctx.bias is only needed as a {None, not-None} flag for d_bias gating;
+        # the bias tensor itself is not used in backward. Storing the boolean
+        # avoids holding a tensor reference on the autograd graph.
+        ctx.bias_used = bias is not None
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # Backend is intentionally not threaded through ctx — weight_dequant
+        # resolves it via the cached registry path on every call (~50 ns
+        # post-fix), so an explicit ctx.backend slot only added a Python
+        # attr write per forward without changing the resolution result.
+        W_deq = weight_dequant(
+            ctx.weight,
+            ctx.weight_scale,
+            dtype = grad_output.dtype,
+        )
+        grad_X = torch_matmul(grad_output, W_deq)
+        del W_deq
+        if ctx.bias_used:
+            d_bias = grad_output.sum(dim = tuple(range(grad_output.ndim - 1)))
+        else:
+            d_bias = None
+        return grad_X, None, None, d_bias
+
+
+@torch_compile
+def fp8_torch_block_quant_forward(X, weight, weight_scale, bias = None):
+    return FP8BlockQuantLinear.apply(X, weight, weight_scale, bias)
+
+
+# Lean 3-arg autograd Function matching PyPI's exact signature.  Dynamo sees a
+# clean 3-tensor Function with no extra args, no bias/backend None slots, and
+# no ctx.bias_used attribute — identical to what PyPI compiles.  This lets the
+# outer HF `mode='reduce-overhead'` compile absorb the call without creating a
+# new compile boundary for the extra None arguments.
+#
+# This Function is only reached from `module_forward_patch`'s `weight_scale_inv`
+# branch when `fp8_block_quant_linear is fp8_torch_block_quant_forward` — i.e.
+# when the fbgemm block-quant rebind did NOT happen. Generated cache modules
+# clone this Function with backend-local `act_quant` / `fp8_block_matmul`
+# callables before tracing. Direct public calls keep context-local correctness
+# through the stable module-level dispatchers below.
+class FP8BlockQuantLinearLean(torch.autograd.Function):
     @staticmethod
     def forward(ctx, X, weight, weight_scale):
         m, n = weight.shape
@@ -364,7 +620,9 @@ class FP8BlockQuantLinear(torch.autograd.Function):
         if not weight.is_contiguous():
             weight = weight.contiguous()
 
-        # Quantize input and run FP8 matmul
+        # Generated cache modules replace `act_quant` / `fp8_block_matmul`
+        # with concrete runtime-local functions before tracing. Direct public
+        # calls route through context-local dispatchers for correctness.
         qinput, scale = act_quant(X, block_size[1])
         output = fp8_block_matmul(
             qinput,
@@ -380,15 +638,71 @@ class FP8BlockQuantLinear(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        W_deq = weight_dequant(ctx.weight, ctx.weight_scale)
+        W_deq = weight_dequant(
+            ctx.weight,
+            ctx.weight_scale,
+            dtype = grad_output.dtype,
+        )
         grad_X = torch_matmul(grad_output, W_deq)
         del W_deq
         return grad_X, None, None
 
 
 @torch_compile
-def fp8_torch_block_quant_forward(X, weight, weight_scale):
-    return FP8BlockQuantLinear.apply(X, weight, weight_scale)
+def _fp8_torch_block_quant_forward_lean(X, weight, weight_scale):
+    return FP8BlockQuantLinearLean.apply(X, weight, weight_scale)
+
+
+_triton_fp8_block_matmul_hot = (
+    torchao_block_matmul
+    if torchao_blockwise_gemm is not None
+    else w8a8_block_fp8_matmul_triton
+)
+
+
+class FP8BlockQuantLinearLeanTriton(torch.autograd.Function):
+    forward = staticmethod(
+        _clone_function_with_globals(
+            FP8BlockQuantLinearLean.forward,
+            {
+                "act_quant": _triton_act_quant,
+                "fp8_block_matmul": _triton_fp8_block_matmul_hot,
+            },
+        )
+    )
+    backward = staticmethod(
+        _clone_function_with_globals(
+            FP8BlockQuantLinearLean.backward,
+            {"weight_dequant": _triton_weight_dequant_block},
+        )
+    )
+
+
+@torch_compile
+def _fp8_torch_block_quant_forward_lean_triton(X, weight, weight_scale):
+    return FP8BlockQuantLinearLeanTriton.apply(X, weight, weight_scale)
+
+
+@torch_compile
+def _fp8_linear_triton_hot(X, weight, weight_scale, bias = None):
+    # Keep `matmul_lora` on the same simple compiled shape as GitHub main for
+    # the common no-bias block-FP8 path. Bias remains supported, but the
+    # bias-free Qwen/DeepSeek FP8 path must not pay the generic registry
+    # dispatcher cost.
+    if weight_scale.numel() == 1 or (
+        weight_scale.ndim == 2 and weight_scale.shape[1] > 1
+    ):
+        if bias is None:
+            return _fp8_torch_block_quant_forward_lean_triton(
+                X,
+                weight,
+                weight_scale,
+            )
+        return fp8_torch_block_quant_forward(X, weight, weight_scale, bias = bias)
+    if not _HAS_FBGEMM_ROWWISE:
+        _warn_fp8_rowwise_eager_fallback_once()
+        return _fp8_linear_eager(X, weight, weight_scale, bias)
+    return fbgemm_fp8_linear(X, weight, weight_scale, bias)
 
 
 class FbgemmFp8Linear_matmul(torch.autograd.Function):
@@ -424,7 +738,8 @@ class FbgemmFp8Linear_matmul(torch.autograd.Function):
             output = torch.ops.fbgemm.f8f8bf16_rowwise(
                 x_quantized, weight, x_scale, weight_scale_float32, use_fast_accum = True
             )
-            output = output + bias if bias is not None else output
+            if bias is not None:
+                output = output + bias.to(output.dtype)
             # Hacky for now, we have the output to the device of x
             output = output.to(x.device, x.dtype)
             output = output.reshape(output_shape)
@@ -432,12 +747,18 @@ class FbgemmFp8Linear_matmul(torch.autograd.Function):
         elif (
             weight.shape[0] != weight_scale.shape[0]
             and weight.shape[1] == weight_scale.shape[0]
-        ) or (weight.shape[0] // 8 != 0 or weight.shape[1] // 8 != 0):
+        ) or (weight.shape[0] % 8 != 0 or weight.shape[1] % 8 != 0):
             # Either the weight/scale is transposed or its shape is not divisible by 8. Both cases, dequantizing is the preferred way.
             # The transpose case is generally noticed in backward pass when we do dY@W instead of @W.T as we do for forward.
             # The shape case, I noticed to happen in MLP of Qwen 2.5 VL 7B where the gate proj is of shape (3420, 1280) and 3420/8=427.5
 
-            W_deq = weight_dequant(weight, weight_scale).T
+            # Inner call drops `backend=` — `_resolved_weight_dequant_block`
+            # handles backend selection via the static-binding hot path.
+            W_deq = weight_dequant(
+                weight,
+                weight_scale,
+                dtype = x.dtype,
+            ).T
             output = torch_matmul(x, W_deq)
             del W_deq
         else:
@@ -447,14 +768,23 @@ class FbgemmFp8Linear_matmul(torch.autograd.Function):
 
         ctx.weight = weight
         ctx.weight_scale = weight_scale
+        ctx.bias_used = bias is not None
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        W_deq = weight_dequant(ctx.weight, ctx.weight_scale)
+        W_deq = weight_dequant(
+            ctx.weight,
+            ctx.weight_scale,
+            dtype = grad_output.dtype,
+        )
         grad_X = torch_matmul(grad_output, W_deq)
         del W_deq
-        return grad_X, None, None, None, None
+        if ctx.bias_used:
+            d_bias = grad_output.sum(dim = tuple(range(grad_output.ndim - 1)))
+        else:
+            d_bias = None
+        return grad_X, None, None, d_bias, None
 
 
 @torch_compile
@@ -494,7 +824,8 @@ class FP8_fbgemm_block_linear(torch.autograd.Function):
         output = torch.ops.fbgemm.f8f8bf16_blockwise(
             xq, weight.contiguous(), xs, weight_scale.contiguous(), bs_m, bs_n, bs_k
         )
-        output = output + bias if bias is not None else output
+        if bias is not None:
+            output = output + bias.to(output.dtype)
 
         output = output.view(*orig_shape[:-1], -1)
 
@@ -504,14 +835,23 @@ class FP8_fbgemm_block_linear(torch.autograd.Function):
         ctx.weight = weight
         ctx.weight_scale = weight_scale
         ctx.block_size = [bs_m, bs_n, bs_k]
+        ctx.bias_used = bias is not None
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        W_deq = weight_dequant(ctx.weight, ctx.weight_scale)
+        W_deq = weight_dequant(
+            ctx.weight,
+            ctx.weight_scale,
+            dtype = grad_output.dtype,
+        )
         grad_X = torch_matmul(grad_output, W_deq)
         del W_deq
-        return grad_X, None, None, None, None
+        if ctx.bias_used:
+            d_bias = grad_output.sum(dim = tuple(range(grad_output.ndim - 1)))
+        else:
+            d_bias = None
+        return grad_X, None, None, d_bias, None
 
 
 @torch_compile
@@ -567,6 +907,77 @@ def test_has_fbgemm():
     return has_fbgemm
 
 
+def _fp8_linear_eager(X, weight, weight_scale, bias = None):
+    if weight_scale.numel() == 1:
+        W_deq = weight.to(X.dtype) * weight_scale.view(1, 1).to(X.dtype)
+    elif weight_scale.ndim == 2 and weight_scale.shape[1] == 1:
+        if weight.shape[0] == weight_scale.shape[0]:
+            W_deq = weight.to(X.dtype) * weight_scale.to(X.dtype)
+        elif weight.shape[1] == weight_scale.shape[0]:
+            W_deq = weight.t().to(X.dtype) * weight_scale.to(X.dtype)
+            W_deq = W_deq.t()
+        else:
+            raise ValueError(f"Incompatible shapes {weight.shape = }, {weight_scale.shape = }")
+    else:
+        W_deq = _weight_dequant_block_eager(weight, weight_scale, dtype = X.dtype)
+    output = torch_matmul(X, W_deq.t())
+    if bias is not None:
+        output = output + bias
+    return output
+
+
+@torch.compiler.disable
+def _fp8_linear_training_autograd(X, weight, weight_scale, bias = None):
+    # NVIDIA_REVIEW: `matmul_lora` uses `fp8_linear` while training. Keeping
+    # that path on the raw autograd.Function avoids Dynamo dropping the
+    # block-FP8 dX on compiled Triton wrappers, and keeps cutile/triton
+    # gradients on the same implementation.
+    return FP8BlockQuantLinear.apply(X, weight, weight_scale, bias)
+
+
+def _fp8_linear_runtime(X, weight, weight_scale, bias = None):
+    if torch.is_grad_enabled() and X.requires_grad:
+        return _fp8_linear_training_autograd(X, weight, weight_scale, bias)
+    return _fp8_linear_static(X, weight, weight_scale, bias)
+
+
+def _has_rowwise_fbgemm_ops() -> bool:
+    """Return True iff ``torch.ops.fbgemm.f8f8bf16_rowwise`` is available.
+
+    Independent from the blockwise FBGEMM probe (``UNSLOTH_HAS_FBGEMM``):
+    that one tests a CUTLASS kernel which may fail on consumer GPUs even
+    when FBGEMM is otherwise installed. The rowwise op is a different
+    entry point that can be present (or absent) independently. Without
+    this guard, ``fp8_linear``'s row-wise branch on a non-eager backend
+    (e.g. cutile) would call ``fbgemm_fp8_linear`` and crash with
+    ``AttributeError`` at first invocation when fbgemm_gpu isn't installed.
+    """
+    try:
+        return hasattr(torch.ops.fbgemm, "f8f8bf16_rowwise")
+    except (AttributeError, RuntimeError):
+        return False
+
+
+_HAS_FBGEMM_ROWWISE = _has_rowwise_fbgemm_ops()
+
+# One-shot warn flag for row-wise FP8 → eager fallback. The hot path of
+# row-wise FP8 is FBGEMM-only (no triton/cutile equivalent registered);
+# without fbgemm_gpu it silently runs at eager speed, which is the user's
+# real surprise. Warn once at first hit so logs show why perf is flat.
+_warned_fp8_rowwise_eager_fallback = False
+
+
+def _warn_fp8_rowwise_eager_fallback_once() -> None:
+    global _warned_fp8_rowwise_eager_fallback
+    if _warned_fp8_rowwise_eager_fallback:
+        return
+    _warned_fp8_rowwise_eager_fallback = True
+    logger.warning(
+        "Unsloth: Row-wise FP8 detected but `fbgemm_gpu` is not installed. "
+        "Falling back to eager (slower). For best row-wise FP8 performance, "
+        "install fbgemm_gpu."
+    )
+
 fp8_block_quant_linear = fp8_torch_block_quant_forward
 if "UNSLOTH_HAS_FBGEMM" not in os.environ:
     os.environ["UNSLOTH_HAS_FBGEMM"] = "0"
@@ -596,29 +1007,271 @@ except:
     pass
 
 
+_KNOWN_LOCAL_BACKENDS = ("triton", "eager", "cutile")
+
+
+# Block-FP8 backend metadata for the current context. Generated cache modules
+# bind concrete FP8 callables before tracing; public module-level dispatchers
+# keep context-local correctness for direct calls and tests.
+try:
+    _BAKED_BLOCK_FP8_BACKEND = get_kernel_backend("unsloth.w8a8_block_fp8_matmul")
+except Exception:
+    _BAKED_BLOCK_FP8_BACKEND = None
+
+
+# Context-local aliases for public FP8 dispatchers. `_resolved_*` and
+# `*_default` are retained as current-context metadata for tests/debugging,
+# but public dispatch behavior reads `_FP8_ALIAS_BINDINGS`, not process-global
+# function rebinding.
+_resolved_act_quant = None
+_resolved_fp8_block_matmul = None
+_resolved_weight_dequant_block = None
+_act_quant_default = _act_quant_eager
+_fp8_block_matmul_default = _w8a8_block_fp8_matmul_eager
+_weight_dequant_block_default = _weight_dequant_block_eager
+_FP8_ALIAS_BINDINGS = ContextVar("unsloth_fp8_alias_bindings", default = None)
+
+
+def _fallback_fp8_alias_bindings():
+    return {
+        "act_quant": _act_quant_eager,
+        "fp8_block_matmul": _w8a8_block_fp8_matmul_eager,
+        "weight_dequant_block": _weight_dequant_block_eager,
+        "block_fp8_backend": None,
+    }
+
+
+def _get_fp8_alias_bindings():
+    bindings = _FP8_ALIAS_BINDINGS.get()
+    if bindings is None:
+        try:
+            _rebind_fp8_aliases()
+            bindings = _FP8_ALIAS_BINDINGS.get()
+        except Exception:
+            bindings = None
+    return bindings or _fallback_fp8_alias_bindings()
+
+
+def _patch_fp8_hot_imports() -> None:
+    import sys
+
+    utils_mod = sys.modules.get("unsloth.kernels.utils")
+    if utils_mod is not None:
+        utils_mod.weight_dequant = weight_dequant
+        if "fp8_linear" in globals():
+            utils_mod.fp8_linear = _get_fp8_linear_for_utils()
+
+
+def _get_fp8_linear_for_utils():
+    if _BAKED_BLOCK_FP8_BACKEND == "triton":
+        return _fp8_linear_triton_hot
+    return fp8_linear
+
+
+def _rebind_fp8_aliases(backend = None) -> None:
+    """Resolve dispatcher aliases from the registry. Called at module load
+    and as a hook from `set_kernel_backend` / `kernel_backend_context` /
+    `register_kernel_backend` / `ensure_backend_loaded`.
+
+    Three aliases:
+      * `_resolved_act_quant` — backed by `unsloth.act_quant` registry entry.
+      * `_resolved_fp8_block_matmul` — backed by `unsloth.w8a8_block_fp8_matmul`.
+        For the triton resolution, embeds the torchao-vs-raw-triton
+        preference (matches the original branch at L487-504).
+      * `_resolved_weight_dequant_block` — backed by `unsloth.weight_dequant`.
+
+    Also refreshes `_BAKED_BLOCK_FP8_BACKEND` so direct `fp8_linear` calls
+    stay consistent with the dispatcher aliases.
+
+    Bindings are stored in a ContextVar so `kernel_backend_context(...)`
+    remains thread/async-context local instead of rewriting process-global
+    `act_quant` / `fp8_block_matmul` / `weight_dequant_block` symbols.
+    """
+    global _resolved_act_quant, _resolved_fp8_block_matmul
+    global _resolved_weight_dequant_block, _BAKED_BLOCK_FP8_BACKEND
+    global _act_quant_default, _fp8_block_matmul_default, _weight_dequant_block_default
+
+    try:
+        _resolved_act_quant = get_kernel_impl("unsloth.act_quant")
+    except Exception:
+        _resolved_act_quant = None
+    _act_quant_default = _resolved_act_quant or _act_quant_eager
+
+    try:
+        impl = get_kernel_impl("unsloth.w8a8_block_fp8_matmul")
+        # Triton-specific perf preference: torchao's blockwise GEMM is
+        # ~3x faster than the raw triton kernel when available. Embed it
+        # in the static binding so the dispatcher hot path stays a single
+        # call without an extra runtime branch.
+        if impl is w8a8_block_fp8_matmul_triton and torchao_blockwise_gemm is not None:
+            impl = torchao_block_matmul
+        _resolved_fp8_block_matmul = impl
+    except Exception:
+        _resolved_fp8_block_matmul = None
+    _fp8_block_matmul_default = _resolved_fp8_block_matmul or _w8a8_block_fp8_matmul_eager
+
+    try:
+        _resolved_weight_dequant_block = get_kernel_impl("unsloth.weight_dequant")
+    except Exception:
+        _resolved_weight_dequant_block = None
+    _weight_dequant_block_default = (
+        _resolved_weight_dequant_block or _weight_dequant_block_eager
+    )
+    # Keep the baked block-FP8 backend constant in sync with the static aliases.
+    try:
+        _BAKED_BLOCK_FP8_BACKEND = get_kernel_backend(
+            "unsloth.w8a8_block_fp8_matmul",
+        )
+    except Exception:
+        _BAKED_BLOCK_FP8_BACKEND = None
+    _FP8_ALIAS_BINDINGS.set(
+        {
+            "act_quant": _act_quant_default,
+            "fp8_block_matmul": _fp8_block_matmul_default,
+            "weight_dequant_block": _weight_dequant_block_default,
+            "block_fp8_backend": _BAKED_BLOCK_FP8_BACKEND,
+        }
+    )
+    _patch_fp8_hot_imports()
+
+
+# Initial bind. Wrapped in try/except so module load never fails when no
+# backend has registered yet — the dispatcher entry points then use local eager
+# fallbacks until the registry can resolve a backend for the current context.
+try:
+    _rebind_fp8_aliases()
+except Exception:
+    pass
+
+
+# Register hook so `set_kernel_backend(...)` and `kernel_backend_context(...)`
+# transitions refresh the current context's aliases without callers needing to
+# re-import.
+try:
+    register_global_backend_change_hook(_rebind_fp8_aliases)
+except Exception:
+    pass
+
+
 @torch_compile
-def fp8_linear(X, weight, weight_scale, bias = None):
+def _fp8_linear_static(X, weight, weight_scale, bias = None):
+    # NVIDIA_REVIEW: no per-call backend kwarg and no backend branch here for
+    # generated-cache modules. They bind concrete runtime-local FP8 callables
+    # before tracing; direct public calls use the context-local wrappers.
     # Per-tensor quantization: single scalar scale for entire weight
     # Block quantized FP8: 2D scale tensor with multiple columns
     if weight_scale.numel() == 1 or (
         weight_scale.ndim == 2 and weight_scale.shape[1] > 1
     ):
-        out = fp8_block_quant_linear(X, weight, weight_scale)
+        if bias is None:
+            # Match PyPI's hot no-bias call shape exactly. Passing
+            # `bias=None` as a kwarg creates a different Dynamo call shape.
+            out = fp8_block_quant_linear(X, weight, weight_scale)
+        else:
+            out = fp8_block_quant_linear(X, weight, weight_scale, bias = bias)
     # Row/channel quantized FP8: 2D scale with shape (n, 1)
     else:
-        out = fbgemm_fp8_linear(X, weight, weight_scale, bias)
+        # Fall to eager when rowwise FBGEMM ops aren't available.
+        # Without the second condition, fbgemm_fp8_linear would crash with
+        # AttributeError on torch.ops.fbgemm.f8f8bf16_rowwise.
+        if not _HAS_FBGEMM_ROWWISE:
+            # Only warn when the user wanted non-eager perf and we silently
+            # downgraded due to a missing optional dep. If the user picked
+            # eager themselves, they got what they asked for.
+            _warn_fp8_rowwise_eager_fallback_once()
+            out = _fp8_linear_eager(X, weight, weight_scale, bias)
+        else:
+            out = fbgemm_fp8_linear(
+                X,
+                weight,
+                weight_scale,
+                bias,
+            )
     return out
 
 
-def module_forward_patch(forward_function, scale_attr = "weight_scale"):
+def fp8_linear(X, weight, weight_scale, bias = None):
+    bindings = _get_fp8_alias_bindings()
+    if bindings["block_fp8_backend"] == "eager":
+        return _fp8_linear_eager(X, weight, weight_scale, bias)
+    return _fp8_linear_runtime(X, weight, weight_scale, bias)
+
+
+_rebind_fp8_aliases()
+
+
+def module_forward_patch(scale_attr = "weight_scale"):
+    # Resolve the implementation shape once. Generated-cache modules bind
+    # backend-specific lower-level kernels before tracing; direct public calls
+    # use context-local dispatchers.
+
+    if scale_attr == "weight_scale_inv":
+        # FP8Linear → block quantization. When the resolved pointer is the
+        # plain Torch path (no FBGEMM block probe), call the lean 3-arg
+        # @torch_compile wrapper directly so the call-site shape matches PyPI
+        # exactly: `patched_forward → _fp8_torch_block_quant_forward_lean →
+        # FP8BlockQuantLinearLean.apply`. No intermediate Python adapter, no
+        # extra arg slots. Bias is intentionally NOT threaded into this hot
+        # path: PyPI's `module_forward_patch` also ignores `self.bias`, and
+        # FP8 dense layers in the supported model families (Qwen3-FP8,
+        # DeepSeek-FP8) are bias-free. The 5-arg `fp8_block_quant_linear` /
+        # `fp8_linear` paths still support bias for callers that go through
+        # them directly (LoRA path, the FP8 bias tests).
+        if fp8_block_quant_linear is fp8_torch_block_quant_forward:
+            # Match PyPI's exact call shape: patched_forward → @torch_compile
+            # wrapper → autograd.Function.apply.  PyPI inlines the inner
+            # @torch_compile into HF generate's outer compile cleanly (single
+            # compile_id=0, no graph-break boundary), so this should too.
+            _wrapper = _fp8_torch_block_quant_forward_lean
+            def patched_forward(self, X):
+                return _wrapper(X, self.weight, getattr(self, scale_attr))
+            return patched_forward
+        _impl = fp8_block_quant_linear
+    else:
+        # FbgemmFp8Linear → rowwise quantization. Falls back to eager when
+        # fbgemm_gpu rowwise ops are missing (matches the original
+        # fp8_linear branch logic).
+        if _HAS_FBGEMM_ROWWISE:
+            _impl = fbgemm_fp8_linear
+        else:
+            def _impl(X, weight, weight_scale, bias = None):
+                _warn_fp8_rowwise_eager_fallback_once()
+                return _fp8_linear_eager(X, weight, weight_scale, bias)
+
     def patched_forward(self, X):
-        return forward_function(X, self.weight, getattr(self, scale_attr))
+        return _impl(
+            X,
+            self.weight,
+            getattr(self, scale_attr),
+            getattr(self, "bias", None),
+        )
 
     return patched_forward
 
 
-# Patch the forward functions of the layers (for compiled models)
+# Patch the forward functions of the layers (for compiled models). Route through
+# fp8_linear() so the runtime backend selection (and bias) are both honored.
 if FbgemmFp8Linear is not None:
-    FbgemmFp8Linear.forward = module_forward_patch(fbgemm_fp8_linear, "weight_scale")
+    FbgemmFp8Linear.forward = module_forward_patch("weight_scale")
 if FP8Linear is not None:
-    FP8Linear.forward = module_forward_patch(fp8_block_quant_linear, "weight_scale_inv")
+    # On the block-FP8 hot path, use the EXACT pypi pattern: a 2-line patched
+    # forward that closes over `_fp8_torch_block_quant_forward_lean` (a
+    # @torch_compile-decorated 3-arg passthrough).  Skip workspace's
+    # dispatcher-aware module_forward_patch entirely for this hot path —
+    # profiler-confirmed parity with pypi requires this exact call shape so
+    # dynamo inlines the inner compile into HF generate's outer compile.
+    if fp8_block_quant_linear is fp8_torch_block_quant_forward:
+        def _patched_block_fp8(self, X):
+            bias = getattr(self, "bias", None)
+            if bias is None:
+                if _BAKED_BLOCK_FP8_BACKEND == "triton":
+                    return _fp8_torch_block_quant_forward_lean_triton(
+                        X, self.weight, self.weight_scale_inv
+                    )
+                return _fp8_torch_block_quant_forward_lean(
+                    X, self.weight, self.weight_scale_inv
+                )
+            return _fp8_linear_training_autograd(X, self.weight, self.weight_scale_inv, bias)
+        FP8Linear.forward = _patched_block_fp8
+    else:
+        FP8Linear.forward = module_forward_patch("weight_scale_inv")

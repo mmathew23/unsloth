@@ -19,7 +19,9 @@ def permute(X: torch.Tensor, gather_indices: torch.Tensor, topk: int):
         [total_tokens, hidden_dim]
     """
     assert gather_indices.ndim == 1
-    X = X.view(-1, X.shape[-1])
+    gather_indices = gather_indices.to(dtype = torch.int64)
+    # reshape (not view) so non-contiguous activations are accepted.
+    X = X.reshape(-1, X.shape[-1])
     # Shortcut for topk == 1
     if topk == 1:
         return X[gather_indices]
@@ -28,10 +30,11 @@ def permute(X: torch.Tensor, gather_indices: torch.Tensor, topk: int):
 
 
 def unpermute(X: torch.Tensor, gather_indices: torch.Tensor):
-    X = X.view(-1, X.shape[-1]) if X.ndim > 2 else X
+    X = X.reshape(-1, X.shape[-1]) if X.ndim > 2 else X
+    gather_indices = gather_indices.to(dtype = torch.int64)
     unpermuted = torch.empty_like(X)
     unpermuted.index_copy_(0, gather_indices, X)
-    return unpermuted.view_as(X)
+    return unpermuted.reshape_as(X)
 
 
 def calculate_topk(
@@ -92,14 +95,16 @@ def get_routing_indices(
             Indices for unpermuting gathered inputs back to token order, shape ``(bs * seqlen * top_k,)``.
     """
     # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
-    token_counts_by_expert = torch.histc(
-        selected_experts.view(-1),
-        bins = num_experts,
-        min = 0,
-        max = num_experts,
+    token_counts_by_expert = torch.bincount(
+        selected_experts.reshape(-1).to(dtype = torch.int64),
+        minlength = num_experts,
     )
+    # bincount output length = max(selected_expert_id) + 1 when any id exceeds num_experts-1.
+    # Truncate to num_experts so that m_sizes always has exactly num_experts entries and
+    # out-of-range expert ids don't silently corrupt the m_sizes tensor shape.
+    token_counts_by_expert = token_counts_by_expert[:num_experts]
     # token_indices_experts_sorted shape (bs*slen*top_k,)
-    gather_indices = torch.argsort(selected_experts.view(-1), stable = True)
+    gather_indices = torch.argsort(selected_experts.reshape(-1), stable = True)
     if return_scatter_indices:
         scatter_indices = gather_indices.argsort()
         return token_counts_by_expert, gather_indices, scatter_indices
@@ -116,7 +121,7 @@ def torch_grouped_gemm(X, W, m_sizes, transpose = True):
     Returns:
         Y: [M, N] if forward, else [M, K]
     """
-    X = X.view(-1, X.shape[-1])
+    X = X.reshape(-1, X.shape[-1])
     M, K = X.shape
 
     assert m_sizes.ndim == 1

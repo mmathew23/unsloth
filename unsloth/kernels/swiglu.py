@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import triton
-import triton.language as tl
+import sys
 import torch
+import torch.nn.functional as F
+from ._backend_registry import register_kernel_backend
+from ._optional_triton import HAS_TRITON, tl, triton
 from .utils import calculate_settings, torch_gpu_device
 
 # signed int32 max is 2**31-1 so num_elements cannot exceed 2**31
@@ -141,3 +143,108 @@ def swiglu_DWf_DW_dfg_kernel(DW, e, g):
             LONG_INDEXING = 0 if n_elements <= INT32_SAFETY_BUFFER else 1,
         )
     return DW, e, g
+
+
+_triton_swiglu_fg_kernel = swiglu_fg_kernel
+
+
+def _swiglu_fg_eager(e, g):
+    # Mirror the Triton kernel exactly: silu(e) is computed in fp32 then
+    # downcast back to input dtype; the f * g product is then in input dtype.
+    f = F.silu(e.float()).to(g.dtype)
+    return f * g
+
+
+register_kernel_backend("unsloth.swiglu_fg", "eager", _swiglu_fg_eager)
+
+
+_triton_swiglu_DWf_DW_dfg_kernel = swiglu_DWf_DW_dfg_kernel
+
+
+def _swiglu_DWf_DW_dfg_eager(DW, e, g):
+    # Mirror the Triton kernel:
+    #   e upcast to fp32, sigmoid + silu in fp32
+    #   f = silu(e) downcast to input dtype
+    #   h = f * g, df = DW * f, dg = DW * g all in input dtype
+    #   de uses dg upcast-back-to-fp32 for the chain rule, then downcast
+    out_dtype = DW.dtype
+    e_f = e.float()
+    sig = torch.sigmoid(e_f)
+    f = (sig * e_f).to(out_dtype)
+    h = f * g
+    df = DW * f
+    dg = DW * g
+    de = (dg.float() * sig * (1.0 + e_f * (1.0 - sig))).to(out_dtype)
+    return h, df, de
+
+
+register_kernel_backend("unsloth.swiglu_bwd", "eager", _swiglu_DWf_DW_dfg_eager)
+
+
+# Module-level aliases rebound by hook on backend change. None when no
+# implementation is registered for the resolved global backend yet.
+_resolved_swiglu_fg = None
+_resolved_swiglu_bwd = None
+swiglu_fg_kernel_default = None
+swiglu_DWf_DW_dfg_kernel_default = None
+
+
+def _patch_swiglu_hot_imports() -> None:
+    fast_lora_mod = sys.modules.get("unsloth.kernels.fast_lora")
+    if fast_lora_mod is not None:
+        fast_lora_mod.swiglu_fg_kernel = swiglu_fg_kernel_default
+        fast_lora_mod.swiglu_DWf_DW_dfg_kernel = swiglu_DWf_DW_dfg_kernel_default
+
+
+def _rebind_swiglu_aliases(backend = None) -> None:
+    """Hook fired by `_backend_registry` when the global backend changes
+    or when a new backend impl is registered. Looks up the resolved impl
+    for the current global backend and pins it to the module-level aliases.
+    Falls back to `None` so the entry point routes through `dispatch_kernel`,
+    preserving runtime backend switches without a per-call backend kwarg."""
+    global _resolved_swiglu_fg, _resolved_swiglu_bwd
+    global swiglu_fg_kernel_default, swiglu_DWf_DW_dfg_kernel_default
+    try:
+        from ._backend_registry import get_kernel_impl
+        _resolved_swiglu_fg = get_kernel_impl("unsloth.swiglu_fg")
+    except Exception:
+        _resolved_swiglu_fg = None
+    try:
+        from ._backend_registry import get_kernel_impl
+        _resolved_swiglu_bwd = get_kernel_impl("unsloth.swiglu_bwd")
+    except Exception:
+        _resolved_swiglu_bwd = None
+    # NVIDIA_REVIEW: hot LoRA paths use these backend-specific symbols, not the
+    # public backend dispatcher below. This keeps explicit backend selection out
+    # of torch-traced training/generate call shapes.
+    swiglu_fg_kernel_default = _resolved_swiglu_fg or _swiglu_fg_eager
+    swiglu_DWf_DW_dfg_kernel_default = _resolved_swiglu_bwd or _swiglu_DWf_DW_dfg_eager
+    globals()["swiglu_fg_kernel"] = swiglu_fg_kernel_default
+    globals()["swiglu_DWf_DW_dfg_kernel"] = swiglu_DWf_DW_dfg_kernel_default
+    _patch_swiglu_hot_imports()
+
+
+# Initial bind. Wrapped so module load never fails if no backend is loaded yet.
+try:
+    _rebind_swiglu_aliases()
+except Exception:
+    pass
+
+# Register hook so global-backend changes (set_kernel_backend / kernel_backend_context)
+# rebind the aliases.
+try:
+    from ._backend_registry import register_global_backend_change_hook as _register_global_backend_change_hook
+    _register_global_backend_change_hook(_rebind_swiglu_aliases)
+except Exception:
+    pass
+
+
+def swiglu_fg_kernel(e, g):
+    return swiglu_fg_kernel_default(e, g)
+
+
+def swiglu_DWf_DW_dfg_kernel(DW, e, g):
+    return swiglu_DWf_DW_dfg_kernel_default(DW, e, g)
+
+
+_rebind_swiglu_aliases()

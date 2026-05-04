@@ -11,6 +11,28 @@ from .autotuning import (
 )
 
 
+def _select_fp32_input_precision() -> str:
+    """Pick a Triton ``tl.dot`` input_precision for fp32 matmuls.
+
+    - On Ampere or newer (SM >= 8.0) we use ``tf32x3`` -- 3 TF32 dots emulate
+      ~fp32 precision (rel err ~3e-7) at near-TF32 throughput.
+    - On Turing/Volta (SM < 8.0) TF32 doesn't exist as an instruction, so we
+      fall back to the strict ``ieee`` mode.
+    Note: this flag is ignored when both operands are bf16/fp16, so the
+    bf16/fp16 hot path is unaffected on every architecture.
+    """
+    if not torch.cuda.is_available():
+        return "ieee"
+    try:
+        major, _ = torch.cuda.get_device_capability()
+    except Exception:
+        return "ieee"
+    return "tf32x3" if major >= 8 else "ieee"
+
+
+_FP32_INPUT_PRECISION = tl.constexpr(_select_fp32_input_precision())
+
+
 #
 # PERMUTE_X -> permute tokens so that they are ordered by expert
 # PERMUTE_Y -> permute output so that they are ordered by token
@@ -214,7 +236,12 @@ def _grouped_gemm_forward_kernel(
                         w = tl.reshape(w, (BLOCK_SIZE_N, BLOCK_SIZE_K))
 
                     x = x.to(w.dtype)
-                    accumulator += tl.dot(x, w.T)
+                    # On Ampere+: tf32x3 emulation gives ~fp32 precision at
+                    # near-TF32 throughput. On Turing/Volta (no TF32), falls
+                    # back to strict ieee. Either way, fp32 inputs no longer
+                    # silently truncate to 10-bit TF32. The flag is a no-op
+                    # for bf16/fp16 inputs.
+                    accumulator += tl.dot(x, w.T, input_precision=_FP32_INPUT_PRECISION)
 
                     if not USE_TMA_LOAD_X:
                         x_ptrs += BLOCK_SIZE_K

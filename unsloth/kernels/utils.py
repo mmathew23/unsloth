@@ -12,14 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib
-import triton
 import ctypes
+import functools
+import importlib
+from typing import Optional
+
+from ._optional_triton import HAS_TRITON, tl, triton
 
 MAX_FUSED_SIZE: int = 65536
 next_power_of_2 = triton.next_power_of_2
-import functools
-from typing import Optional
 
 from ..device_type import (
     is_hip,
@@ -29,8 +30,6 @@ from ..device_type import (
     DEVICE_COUNT,
     ALLOW_PREQUANTIZED_MODELS,
 )
-from .fp8 import weight_dequant, fp8_linear
-import functools
 
 # torch.cuda.amp.custom_fwd is deprecated >= 2.4
 import torch
@@ -55,11 +54,30 @@ if DEVICE_TYPE == "xpu":
     torch_amp_custom_bwd = torch.amp.custom_bwd(device_type = "xpu")
 
 
-# tl.math.tanh now is libdevice.tanh
-import triton
-import triton.language as tl
+def _bind_fp8_symbols():
+    # NVIDIA_REVIEW: keep the lazy import to avoid the utils <-> fp8 import
+    # cycle, but rebind after the first lookup so FP8 hot paths do not pay an
+    # extra Python wrapper + import check on every generate token.
+    from .fp8 import weight_dequant as _weight_dequant
+    from .fp8 import _get_fp8_linear_for_utils
 
-if Version(triton.__version__) >= Version("3.0.0"):
+    _fp8_linear = _get_fp8_linear_for_utils()
+    globals()["weight_dequant"] = _weight_dequant
+    globals()["fp8_linear"] = _fp8_linear
+    return _weight_dequant, _fp8_linear
+
+
+def weight_dequant(*args, **kwargs):
+    _weight_dequant, _ = _bind_fp8_symbols()
+    return _weight_dequant(*args, **kwargs)
+
+
+def fp8_linear(*args, **kwargs):
+    _, _fp8_linear = _bind_fp8_symbols()
+    return _fp8_linear(*args, **kwargs)
+
+
+if HAS_TRITON and Version(triton.__version__) >= Version("3.0.0"):
     if DEVICE_TYPE == "xpu":
         triton_tanh = tl.extra.intel.libdevice.tanh
     else:
@@ -78,6 +96,8 @@ else:
 
 @functools.lru_cache(1)
 def is_cdna():
+    if not HAS_TRITON:
+        return False
     return is_hip() and triton.runtime.driver.active.get_current_target().arch in (
         "gfx940",
         "gfx941",
@@ -89,6 +109,8 @@ def is_cdna():
 @functools.lru_cache(1)
 def is_rdna():
     """Detect ROCm-supported RDNA consumer/workstation GPUs (RDNA2, RDNA3, RDNA3.5, RDNA4)."""
+    if not HAS_TRITON:
+        return False
     return is_hip() and triton.runtime.driver.active.get_current_target().arch in (
         # RDNA2 (Navi 21-24)
         "gfx1030",
@@ -377,7 +399,12 @@ def _maybe_fake_quantize_activations(
 if DEVICE_TYPE == "xpu" and HAS_XPU_STREAM:
 
     @torch.inference_mode
-    def fast_dequantize(W, quant_state = None, out = None, use_global_buffer = False):
+    def fast_dequantize(
+        W,
+        quant_state = None,
+        out = None,
+        use_global_buffer = False,
+    ):
         # TODO: After adding XPU BNB support, check this function
         if isinstance(W, Float8Tensor):
             return W.dequantize()
@@ -486,7 +513,12 @@ if DEVICE_TYPE == "xpu" and HAS_XPU_STREAM:
 elif DEVICE_TYPE in ("cuda", "hip") and HAS_CUDA_STREAM:
 
     @torch.inference_mode
-    def fast_dequantize(W, quant_state = None, out = None, use_global_buffer = False):
+    def fast_dequantize(
+        W,
+        quant_state = None,
+        out = None,
+        use_global_buffer = False,
+    ):
         if isinstance(W, Float8Tensor):
             return W.dequantize()
         if quant_state is None:
@@ -598,7 +630,12 @@ elif DEVICE_TYPE in ("cuda", "hip") and HAS_CUDA_STREAM:
 else:
 
     @torch.inference_mode
-    def fast_dequantize(W, quant_state = None, out = None, use_global_buffer = False):
+    def fast_dequantize(
+        W,
+        quant_state = None,
+        out = None,
+        use_global_buffer = False,
+    ):
         if isinstance(W, Float8Tensor):
             return W.dequantize()
         if quant_state is None:
@@ -982,6 +1019,13 @@ else:
 
 
 def fast_linear_forward(proj, X, temp_lora = None, out = None):
+    # Signature matches PyPI exactly — no `backend=` kwarg.  Dynamo's bytecode
+    # tracing creates a separate compile_id for kwarg-bearing call shapes when
+    # this function is reached from inside HF generate's outer compile.  All
+    # downstream callees (fp8_linear, fast_dequantize, matmul_lora) resolve
+    # the backend from the registry / module-level baked constants instead of
+    # threading it through the kwarg, which would force Dynamo to guard on
+    # the kwarg value per call.
     W, W_quant, lora_A, lora_B, lora_S, bias = get_lora_parameters_bias(proj)
     bsz, q_len, in_dim = X.shape
     if q_len != 1:
@@ -994,7 +1038,11 @@ def fast_linear_forward(proj, X, temp_lora = None, out = None):
     elif bsz == 1 and q_len == 1:
         out = fast_gemv(X, W, W_quant, out = out)
     else:
-        W = fast_dequantize(W.t(), W_quant, use_global_buffer = True)
+        W = fast_dequantize(
+            W.t(),
+            W_quant,
+            use_global_buffer = True,
+        )
         out = torch_matmul(X, W, out = out)
 
     # Add in LoRA weights

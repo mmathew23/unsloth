@@ -432,11 +432,14 @@ def run_export_process(
             import triton  # noqa: F401
 
             logger.info("Triton available — torch.compile enabled")
-        except ImportError:
+        except Exception as exc:
+            os.environ["UNSLOTH_TORCH_COMPILE_BACKEND"] = "dynamo_disable"
             os.environ["TORCHDYNAMO_DISABLE"] = "1"
             logger.warning(
-                "Triton not found on Windows — torch.compile disabled. "
-                'Install for better performance: pip install "triton-windows<3.7"'
+                "Triton not found on Windows — disabling TorchDynamo. "
+                'For best performance install Triton: pip install "triton-windows<3.7" '
+                "(import failed: %s)",
+                exc,
             )
 
     # ── 2. Import ML libraries (fresh in this clean process) ──

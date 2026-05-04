@@ -13,13 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import triton
-import triton.language as tl
 import torch
+import torch.nn.functional as F
+from ._backend_registry import register_kernel_backend
+from ._optional_triton import HAS_TRITON, tl, triton
 from .utils import calculate_settings, torch_gpu_device
-from unsloth_zoo.patching_utils import (
-    patch_layernorm,
-)
 
 
 @triton.jit
@@ -113,7 +111,7 @@ class Fast_Layernorm(torch.autograd.Function):
     def forward(ctx, X, W, b, eps):
         shape = X.shape
         dim = shape[-1]
-        X = X.view(-1, dim)
+        X = X.reshape(-1, dim)
         n_rows, n_cols = X.shape
         BLOCK_SIZE, num_warps = calculate_settings(n_cols)
         device = X.device
@@ -140,13 +138,13 @@ class Fast_Layernorm(torch.autograd.Function):
         ctx.BLOCK_SIZE = BLOCK_SIZE
         ctx.num_warps = num_warps
         ctx.save_for_backward(X, W, b, r, mu)
-        return Y.view(*shape)
+        return Y.reshape(*shape)
 
     @staticmethod
     def backward(ctx, dY):
         shape = dY.shape
         dim = shape[-1]
-        dY = dY.view(-1, dim)
+        dY = dY.reshape(-1, dim)
         X, W, b, r, mu = ctx.saved_tensors
         n_rows, n_cols = dY.shape
 
@@ -165,7 +163,7 @@ class Fast_Layernorm(torch.autograd.Function):
                 BLOCK_SIZE = ctx.BLOCK_SIZE,
                 num_warps = ctx.num_warps,
             )
-        dX = dY.view(*shape)
+        dX = dY.reshape(*shape)
         return dX, None, None, None, None
 
 
@@ -180,6 +178,92 @@ def fast_layernorm(layernorm, X):
     )
     out = Fast_Layernorm.apply(X, W, bias, eps)
     return out
+
+
+def _fast_layernorm_triton(X, W, b, eps):
+    return Fast_Layernorm.apply(X, W, b, eps)
+
+
+def _fast_layernorm_eager(X, W, b, eps):
+    return F.layer_norm(X, W.shape, W, b, eps)
+
+
+register_kernel_backend("unsloth.layernorm", "eager", _fast_layernorm_eager)
+
+
+# Module-level alias rebound by hook on backend change. None when no
+# implementation is registered for the resolved global backend yet.
+_resolved_fast_layernorm = None
+fast_layernorm_default = None
+
+
+def _make_fast_layernorm_default(impl):
+    def _fast_layernorm_default(layernorm, X):
+        assert layernorm.elementwise_affine is True
+        W = layernorm.weight
+        bias = layernorm.bias
+        eps = (
+            layernorm.variance_epsilon
+            if hasattr(layernorm, "variance_epsilon")
+            else layernorm.eps
+        )
+        return impl(X, W, bias, eps)
+    return _fast_layernorm_default
+
+
+def _rebind_layernorm_aliases(backend = None) -> None:
+    """Hook fired by `_backend_registry` when the global backend changes
+    or when a new backend impl is registered. Looks up the resolved impl
+    for the current global backend and pins it to the module-level alias.
+    Falls back to `None` so the entry point calls eager directly. Backend
+    selection happens via registry state/rebinding, not per-call kwargs."""
+    global _resolved_fast_layernorm, fast_layernorm_default
+    try:
+        from ._backend_registry import get_kernel_impl
+        _resolved_fast_layernorm = get_kernel_impl("unsloth.layernorm")
+    except Exception:
+        _resolved_fast_layernorm = None
+    # NVIDIA_REVIEW: bind the exported callable to a concrete backend adapter.
+    # The call path must not branch on backend or enter a dispatcher.
+    fast_layernorm_default = _make_fast_layernorm_default(
+        _resolved_fast_layernorm or _fast_layernorm_eager
+    )
+    globals()["fast_layernorm"] = fast_layernorm_default
+
+
+# Initial bind. Wrapped so module load never fails if no backend is loaded yet.
+try:
+    _rebind_layernorm_aliases()
+except Exception:
+    pass
+
+# Register hook so global-backend changes (set_kernel_backend / kernel_backend_context)
+# rebind the alias.
+try:
+    from ._backend_registry import register_global_backend_change_hook as _register_global_backend_change_hook
+    _register_global_backend_change_hook(_rebind_layernorm_aliases)
+except Exception:
+    pass
+
+
+def fast_layernorm(layernorm, X):
+    return fast_layernorm_default(layernorm, X)
+
+
+_rebind_layernorm_aliases()
+
+
+def patch_layernorm():
+    try:
+        from ._backend_registry import get_kernel_backend
+
+        if get_kernel_backend("unsloth.layernorm") == "eager":
+            return
+    except Exception:
+        pass
+    from unsloth_zoo.patching_utils import patch_layernorm as _patch_layernorm
+
+    return _patch_layernorm()
 
 
 def test_layernorm(

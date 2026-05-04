@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import triton
-import triton.language as tl
+import sys
 import torch
+from ._backend_registry import register_kernel_backend
+from ._optional_triton import HAS_TRITON, tl, triton
 from .utils import calculate_settings, torch_gpu_device
 
 
@@ -247,12 +248,109 @@ def fast_rms_layernorm(layernorm, X: torch.Tensor, gemma: bool = False):
     return out
 
 
+def _fast_rms_layernorm_triton(
+    X: torch.Tensor,
+    W: torch.Tensor,
+    eps: float,
+    gemma: bool = False,
+):
+    return Fast_RMS_Layernorm.apply(X, W, eps, gemma)
+
+
+def _fast_rms_layernorm_eager(
+    X: torch.Tensor,
+    W: torch.Tensor,
+    eps: float,
+    gemma: bool = False,
+):
+    X_float = X.float()
+    W_float = W.float()
+    inv_var = torch.rsqrt(X_float.square().mean(dim = -1, keepdim = True) + eps)
+    output = X_float * inv_var
+    output = output * (W_float + 1.0 if gemma else W_float)
+    return output.to(dtype = X.dtype)
+
+
+register_kernel_backend(
+    "unsloth.rms_layernorm",
+    "eager",
+    _fast_rms_layernorm_eager,
+)
+
+
+_resolved_fast_rms_layernorm = None
+fast_rms_layernorm_default = None
+
+
+def _make_fast_rms_layernorm_default(impl):
+    @torch.compiler.disable
+    def _fast_rms_layernorm_default(layernorm, X: torch.Tensor, gemma: bool = False):
+        W: torch.Tensor = layernorm.weight
+        eps: float = (
+            layernorm.variance_epsilon
+            if hasattr(layernorm, "variance_epsilon")
+            else layernorm.eps
+        )
+        return impl(X, W, eps, gemma)
+    return _fast_rms_layernorm_default
+
+
+def _patch_rms_layernorm_hot_imports() -> None:
+    for name, module in tuple(sys.modules.items()):
+        if name.startswith("unsloth.models.") and hasattr(module, "fast_rms_layernorm"):
+            module.fast_rms_layernorm = fast_rms_layernorm_default
+
+
+def _rebind_rms_layernorm_aliases(backend=None) -> None:
+    """Hook fired by `_backend_registry` when the global backend changes
+    or when a new backend impl is registered. Re-resolves `_resolved_*`
+    aliases for this module from the registry. Falls back to eager. Backend
+    selection happens via registry state/rebinding, not per-call kwargs."""
+    global _resolved_fast_rms_layernorm, fast_rms_layernorm_default
+    try:
+        from ._backend_registry import get_kernel_impl
+        _resolved_fast_rms_layernorm = get_kernel_impl("unsloth.rms_layernorm")
+    except Exception:
+        _resolved_fast_rms_layernorm = None
+    # NVIDIA_REVIEW: model hot paths import `fast_rms_layernorm_default`,
+    # which closes over the resolved backend implementation and does not enter
+    # the explicit-backend dispatcher used by the public API below.
+    impl = _resolved_fast_rms_layernorm or _fast_rms_layernorm_eager
+    fast_rms_layernorm_default = _make_fast_rms_layernorm_default(impl)
+    globals()["fast_rms_layernorm"] = fast_rms_layernorm_default
+    _patch_rms_layernorm_hot_imports()
+
+
+# Initial bind.
+try:
+    _rebind_rms_layernorm_aliases()
+except Exception:
+    pass
+
+try:
+    from ._backend_registry import register_global_backend_change_hook as _register_global_backend_change_hook
+    _register_global_backend_change_hook(_rebind_rms_layernorm_aliases)
+except Exception:
+    pass
+
+
+def fast_rms_layernorm(
+    layernorm,
+    X: torch.Tensor,
+    gemma: bool = False,
+):
+    return fast_rms_layernorm_default(layernorm, X, gemma)
+
+
+_rebind_rms_layernorm_aliases()
+
+
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
 
 
 class Unsloth_LlamaRMSNorm(LlamaRMSNorm):
     def forward(self, X):
-        return fast_rms_layernorm(self, X, gemma = False)
+        return fast_rms_layernorm_default(self, X, gemma = False)
 
 
 try:
@@ -268,6 +366,13 @@ except:
 
 
 def patch_rms_layernorm():
+    try:
+        from ._backend_registry import get_kernel_backend
+
+        if get_kernel_backend("unsloth.rms_layernorm") == "eager":
+            return
+    except Exception:
+        pass
     import transformers.models.llama.modeling_llama
 
     transformers.models.llama.modeling_llama.LlamaRMSNorm = Unsloth_LlamaRMSNorm

@@ -13,10 +13,11 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-import triton
-import triton.language as tl
+import sys
 import torch
 from ..device_type import DEVICE_COUNT
+from ._backend_registry import register_kernel_backend
+from ._optional_triton import HAS_TRITON, tl, triton
 from .utils import calculate_settings, torch_gpu_device, torch_device_stream
 
 
@@ -191,6 +192,8 @@ class Fast_RoPE_Embedding(torch.autograd.Function):
         n_heads: int
         head_dim: int
         batch, seq_len, n_heads, head_dim = Q.shape
+        # The non-indexed call site (fast_rope_embedding) always hands us a
+        # fresh `.contiguous()` clone, so in-place rotation here is safe.
         Q = Q.reshape(batch * seq_len, n_heads * head_dim)
         n_rows: int
         n_cols: int
@@ -241,7 +244,10 @@ class Fast_RoPE_Embedding(torch.autograd.Function):
         n_heads: int
         head_dim: int
         batch, seq_len, n_heads, head_dim = dY.shape
+        # In-place rotation on the gradient buffer; autograd owns it.
         dY = dY.reshape(batch * seq_len, n_heads * head_dim)
+        if not dY.is_contiguous():
+            dY = dY.contiguous()
         n_rows: int
         n_cols: int
         n_rows, n_cols = dY.shape
@@ -297,9 +303,218 @@ def fast_rope_embedding(
         K_out = Fast_RoPE_Embedding.apply(
             K.transpose(1, 2).contiguous(), cos, sin
         ).transpose(1, 2)
-    if DEVICE_COUNT > 1:
+    if DEVICE_COUNT > 1 and Q.device.type == "cuda":
         torch_device_stream(Q.device).synchronize()
     return Q_out, K_out
+
+
+_triton_fast_rope_embedding = fast_rope_embedding
+
+
+def _prepare_rope_cache(cos, sin, head_dim, batch, seq_len, rope_embedding_indices, device):
+    cos = cos.squeeze().to(device = device)
+    sin = sin.squeeze().to(device = device)
+    half_head_dim = head_dim // 2
+    if cos.shape[-1] == head_dim:
+        cos = cos[..., :half_head_dim]
+        sin = sin[..., :half_head_dim]
+    elif cos.shape[-1] != half_head_dim:
+        raise ValueError(
+            f"RoPE cache has incompatible last dimension {cos.shape[-1]} for head_dim={head_dim}"
+        )
+
+    if rope_embedding_indices is None:
+        return (
+            cos[:seq_len].unsqueeze(0).unsqueeze(0),
+            sin[:seq_len].unsqueeze(0).unsqueeze(0),
+        )
+
+    rope_embedding_indices = rope_embedding_indices.reshape(batch, seq_len).to(
+        device = device,
+        dtype = torch.long,
+    )
+    cos = cos.index_select(0, rope_embedding_indices.reshape(-1)).view(
+        batch, seq_len, half_head_dim
+    )
+    sin = sin.index_select(0, rope_embedding_indices.reshape(-1)).view(
+        batch, seq_len, half_head_dim
+    )
+    return cos.unsqueeze(1), sin.unsqueeze(1)
+
+
+def _apply_rope_eager(X, cos, sin):
+    head_dim = X.shape[-1]
+    half_head_dim = head_dim // 2
+    X0 = X[..., :half_head_dim]
+    X1 = X[..., half_head_dim : 2 * half_head_dim]
+    compute_dtype = torch.promote_types(X.dtype, cos.dtype)
+    X0 = X0.to(dtype = compute_dtype)
+    X1 = X1.to(dtype = compute_dtype)
+    cos = cos.to(dtype = compute_dtype)
+    sin = sin.to(dtype = compute_dtype)
+    rotated_0 = X0 * cos - X1 * sin
+    rotated_1 = X1 * cos + X0 * sin
+    output = torch.cat(
+        (
+            rotated_0.to(dtype = X.dtype),
+            rotated_1.to(dtype = X.dtype),
+            X[..., 2 * half_head_dim :],
+        ),
+        dim = -1,
+    )
+    return output
+
+
+def _fast_rope_embedding_eager(
+    Q,
+    K,
+    cos,
+    sin,
+    rope_embedding_indices = None,
+):
+    batch, _, seq_len, head_dim = Q.shape
+    cos, sin = _prepare_rope_cache(
+        cos,
+        sin,
+        head_dim,
+        batch,
+        seq_len,
+        rope_embedding_indices,
+        Q.device,
+    )
+    return (
+        _apply_rope_eager(Q, cos, sin),
+        _apply_rope_eager(K, cos, sin),
+    )
+
+
+register_kernel_backend(
+    "unsloth.rope_embedding_qk",
+    "eager",
+    _fast_rope_embedding_eager,
+)
+
+
+def _rope_embedding_eager(Q, cos, sin):
+    """Single-Q rope, eager fallback.
+
+    Matches the shape convention of ``Fast_RoPE_Embedding.apply`` and the
+    CuTile single-Q registration: Q is ``(batch, seq, n_heads, head_dim)``.
+    cos/sin are reduced to half-head-dim and broadcast against Q's seq and
+    head-dim axes (``_apply_rope_eager`` only consumes the first half).
+    """
+    head_dim = Q.shape[-1]
+    half = head_dim // 2
+    cos_b = cos.squeeze()
+    sin_b = sin.squeeze()
+    if cos_b.shape[-1] == head_dim:
+        cos_b = cos_b[..., :half]
+        sin_b = sin_b[..., :half]
+    if Q.ndim == 4 and cos_b.ndim == 2:
+        # (seq, half) -> (1, seq, 1, half) to broadcast against (b, s, h, d)
+        cos_b = cos_b.unsqueeze(0).unsqueeze(2)
+        sin_b = sin_b.unsqueeze(0).unsqueeze(2)
+    return _apply_rope_eager(Q, cos_b, sin_b)
+
+
+register_kernel_backend(
+    "unsloth.rope_embedding",
+    "eager",
+    _rope_embedding_eager,
+)
+
+
+_resolved_fast_rope_embedding = None
+_resolved_rope_embedding = None
+fast_rope_embedding_default = None
+rope_embedding_default = None
+
+
+def _make_fast_rope_embedding_default(impl):
+    @torch.compiler.disable
+    def _fast_rope_embedding_default(Q, K, cos, sin, rope_embedding_indices = None):
+        Q_out, K_out = impl(Q, K, cos, sin, rope_embedding_indices)
+        if DEVICE_COUNT > 1 and Q.device.type == "cuda":
+            torch_device_stream(Q.device).synchronize()
+        return Q_out, K_out
+    return _fast_rope_embedding_default
+
+
+def _patch_rope_embedding_hot_imports() -> None:
+    for name, module in tuple(sys.modules.items()):
+        if name.startswith("unsloth.models."):
+            if hasattr(module, "fast_rope_embedding"):
+                module.fast_rope_embedding = fast_rope_embedding_default
+            if hasattr(module, "rope_embedding"):
+                module.rope_embedding = rope_embedding_default
+
+
+def _rebind_rope_embedding_aliases(backend=None) -> None:
+    """Hook fired by `_backend_registry` when the global backend changes
+    or when a new backend impl is registered. Re-resolves `_resolved_*`
+    aliases for this module from the registry. Falls back to `None` so
+    the entry point calls eager directly. Backend selection happens via
+    registry state/rebinding, not per-call kwargs."""
+    global _resolved_fast_rope_embedding, _resolved_rope_embedding
+    global fast_rope_embedding_default, rope_embedding_default
+    try:
+        from ._backend_registry import get_kernel_impl
+        _resolved_fast_rope_embedding = get_kernel_impl("unsloth.rope_embedding_qk")
+    except Exception:
+        _resolved_fast_rope_embedding = None
+    try:
+        from ._backend_registry import get_kernel_impl
+        _resolved_rope_embedding = get_kernel_impl("unsloth.rope_embedding")
+    except Exception:
+        _resolved_rope_embedding = None
+    # NVIDIA_REVIEW: model hot paths receive direct backend symbols. The public
+    # functions below remain explicit-backend entry points but are not exported
+    # through `unsloth.kernels` for traced model execution.
+    fast_impl = _resolved_fast_rope_embedding or _fast_rope_embedding_eager
+    rope_impl = _resolved_rope_embedding or _rope_embedding_eager
+    fast_rope_embedding_default = _make_fast_rope_embedding_default(fast_impl)
+    rope_embedding_default = rope_impl
+    globals()["fast_rope_embedding"] = fast_rope_embedding_default
+    globals()["rope_embedding"] = rope_embedding_default
+    _patch_rope_embedding_hot_imports()
+
+
+# Initial bind.
+try:
+    _rebind_rope_embedding_aliases()
+except Exception:
+    pass
+
+try:
+    from ._backend_registry import register_global_backend_change_hook as _register_global_backend_change_hook
+    _register_global_backend_change_hook(_rebind_rope_embedding_aliases)
+except Exception:
+    pass
+
+
+@torch.compiler.disable
+def fast_rope_embedding(
+    Q,
+    K,
+    cos,
+    sin,
+    rope_embedding_indices = None,
+):
+    return fast_rope_embedding_default(Q, K, cos, sin, rope_embedding_indices)
+
+
+@torch.compiler.disable
+def rope_embedding(Q, cos, sin):
+    """Single-Q rotary position embedding through the pluggable backend.
+
+    Q is ``(batch, seq_len, n_heads, head_dim)``. cos/sin are the rotary
+    factors (any shape that broadcasts against Q's last two dims after
+    ``.squeeze()``). Backend selection is controlled through registry state.
+    """
+    return rope_embedding_default(Q, cos, sin)
+
+
+_rebind_rope_embedding_aliases()
 
 
 class Fast_RoPE_Embedding_QK(torch.autograd.Function):
@@ -311,7 +526,11 @@ class Fast_RoPE_Embedding_QK(torch.autograd.Function):
         batch, n_heads_Q, seq_len, head_dim = Q.shape
         _, n_heads_K, _, _ = K.shape
 
-        # Inplace rotary embedding is generally fine
+        # In-place rotation when contiguous; clone otherwise. NOTE: the Triton
+        # kernel writes through raw pointers, so PyTorch's version counter is
+        # not bumped. Callers must not retain a reference to Q/K expecting the
+        # pre-rotation values; the standard q_proj -> rope -> attention flow is
+        # safe because nothing upstream depends on the original Q/K.
         Q_out = Q.clone() if not Q.is_contiguous() else Q
         K_out = K.clone() if not K.is_contiguous() else K
 
@@ -383,9 +602,10 @@ class Fast_RoPE_Embedding_QK(torch.autograd.Function):
             else ctx.cos.new_empty(1, dtype = torch.int32)
         )
 
-        # Inplace rotary embedding is generally fine
-        dQ_out = dQ.clone() if not dQ.is_contiguous() else dQ
-        dK_out = dK.clone() if not dK.is_contiguous() else dK
+        # In-place when contiguous; clone otherwise. The autograd engine owns
+        # the gradient buffer, so in-place rotation is safe here.
+        dQ_out = dQ if dQ.is_contiguous() else dQ.clone()
+        dK_out = dK if dK.is_contiguous() else dK.clone()
 
         Q_batch_stride, Q_head_stride, Q_seq_stride = (
             dQ_out.stride(0),

@@ -75,6 +75,11 @@ from transformers.modeling_attn_mask_utils import (
     _prepare_4d_causal_attention_mask_for_sdpa,
 )
 from ..kernels import *
+from ..kernels.cross_entropy_loss import (
+    fast_cross_entropy_loss_default as fast_cross_entropy_loss,
+)
+from ..kernels.rms_layernorm import fast_rms_layernorm_default as fast_rms_layernorm
+from ..kernels.rope_embedding import fast_rope_embedding_default as fast_rope_embedding
 from ..tokenizer_utils import *
 from .vision import FastBaseModel
 
@@ -116,7 +121,10 @@ try:
 except:
     # Old HF Hub versions <= 0.0.25
     from huggingface_hub.utils._token import get_token
-from triton import __version__ as triton_version
+try:
+    from triton import __version__ as triton_version
+except Exception:
+    triton_version = "not-installed"
 
 HAS_XFORMERS = xformers is not None
 BlockDiagonalCausalMask = (

@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import triton
-import triton.language as tl
+import sys
 import torch
+import torch.nn.functional as F
+from ._backend_registry import register_kernel_backend
+from ._optional_triton import HAS_TRITON, tl, triton
 from .utils import (
     calculate_settings,
     triton_tanh,
@@ -288,3 +290,188 @@ def geglu_approx_backward_kernel(DW, e, g):
             LONG_INDEXING = 0 if n_elements <= INT32_SAFETY_BUFFER else 1,
         )
     return DW, e, g
+
+
+_triton_geglu_exact_forward_kernel = geglu_exact_forward_kernel
+
+
+def _geglu_exact_forward_eager(gate, up):
+    # Mirror Triton: gelu(gate) in fp32, downcast to input dtype, then
+    # multiply by up at input dtype.
+    f = F.gelu(gate.float(), approximate = "none").to(up.dtype)
+    return f * up
+
+
+register_kernel_backend(
+    "unsloth.geglu_exact_forward",
+    "eager",
+    _geglu_exact_forward_eager,
+)
+
+
+_triton_geglu_exact_backward_kernel = geglu_exact_backward_kernel
+
+
+def _geglu_exact_backward_eager(DW, e, g):
+    # Mirror Triton: f computed in fp32 then downcast; h/df/dg in input dtype;
+    # de uses dg.float() for the chain rule, downcast at end.
+    out_dtype = DW.dtype
+    e_f = e.float()
+    f_partial = 0.5 * (torch.erf(0.7071067811865476 * e_f) + 1.0)
+    f = (f_partial * e_f).to(out_dtype)
+    h = f * g
+    df = DW * f
+    dg = DW * g
+    df_de = f_partial + 0.3989422804014327 * e_f * torch.exp(-0.5 * e_f.square())
+    de = (dg.float() * df_de).to(out_dtype)
+    return h, df, de
+
+
+register_kernel_backend(
+    "unsloth.geglu_exact_backward",
+    "eager",
+    _geglu_exact_backward_eager,
+)
+
+
+_triton_geglu_approx_forward_kernel = geglu_approx_forward_kernel
+
+
+def _geglu_approx_forward_eager(gate, up):
+    # Mirror Triton: tanh-gelu in fp32, downcast to input dtype, multiply
+    # by up at input dtype.
+    f = F.gelu(gate.float(), approximate = "tanh").to(up.dtype)
+    return f * up
+
+
+register_kernel_backend(
+    "unsloth.geglu_approx_forward",
+    "eager",
+    _geglu_approx_forward_eager,
+)
+
+
+_triton_geglu_approx_backward_kernel = geglu_approx_backward_kernel
+
+
+def _geglu_approx_backward_eager(DW, e, g):
+    # Mirror Triton: tanh-gelu in fp32, downcast f to input dtype, products
+    # in input dtype, de uses dg.float() for the chain rule.
+    out_dtype = DW.dtype
+    e_f = e.float()
+    s = 0.7978845608028654
+    a = s * e_f
+    b = a * 0.044715 * e_f.square()
+    T = 1.0 + torch.tanh(a + b)
+    T2 = 0.5 * T
+    Q2 = -T2 * (T - 2.0) * (a + 3.0 * b)
+    df_de = T2 + Q2
+    f = (T2 * e_f).to(out_dtype)
+    h = f * g
+    df = DW * f
+    dg = DW * g
+    de = (dg.float() * df_de).to(out_dtype)
+    return h, df, de
+
+
+register_kernel_backend(
+    "unsloth.geglu_approx_backward",
+    "eager",
+    _geglu_approx_backward_eager,
+)
+
+
+# Module-level aliases rebound by hook on backend change. None when no
+# implementation is registered for the resolved global backend yet.
+_resolved_geglu_exact_fg = None
+_resolved_geglu_exact_bwd = None
+_resolved_geglu_approx_fg = None
+_resolved_geglu_approx_bwd = None
+geglu_exact_forward_kernel_default = None
+geglu_exact_backward_kernel_default = None
+geglu_approx_forward_kernel_default = None
+geglu_approx_backward_kernel_default = None
+
+
+def _patch_geglu_hot_imports() -> None:
+    fast_lora_mod = sys.modules.get("unsloth.kernels.fast_lora")
+    if fast_lora_mod is not None:
+        fast_lora_mod.geglu_exact_forward_kernel = geglu_exact_forward_kernel_default
+        fast_lora_mod.geglu_exact_backward_kernel = geglu_exact_backward_kernel_default
+        fast_lora_mod.geglu_approx_forward_kernel = geglu_approx_forward_kernel_default
+        fast_lora_mod.geglu_approx_backward_kernel = geglu_approx_backward_kernel_default
+
+
+def _rebind_geglu_aliases(backend = None) -> None:
+    """Hook fired by `_backend_registry` when the global backend changes
+    or when a new backend impl is registered. Looks up the resolved impl
+    for the current global backend and pins it to the module-level aliases.
+    Falls back to `None` so the entry point routes through `dispatch_kernel`,
+    preserving runtime backend switches without a per-call backend kwarg."""
+    global _resolved_geglu_exact_fg, _resolved_geglu_exact_bwd
+    global _resolved_geglu_approx_fg, _resolved_geglu_approx_bwd
+    global geglu_exact_forward_kernel_default, geglu_exact_backward_kernel_default
+    global geglu_approx_forward_kernel_default, geglu_approx_backward_kernel_default
+    from ._backend_registry import get_kernel_impl
+    try:
+        _resolved_geglu_exact_fg = get_kernel_impl("unsloth.geglu_exact_forward")
+    except Exception:
+        _resolved_geglu_exact_fg = None
+    try:
+        _resolved_geglu_exact_bwd = get_kernel_impl("unsloth.geglu_exact_backward")
+    except Exception:
+        _resolved_geglu_exact_bwd = None
+    try:
+        _resolved_geglu_approx_fg = get_kernel_impl("unsloth.geglu_approx_forward")
+    except Exception:
+        _resolved_geglu_approx_fg = None
+    try:
+        _resolved_geglu_approx_bwd = get_kernel_impl("unsloth.geglu_approx_backward")
+    except Exception:
+        _resolved_geglu_approx_bwd = None
+    # NVIDIA_REVIEW: LoRA hot paths receive these backend-specific symbols
+    # directly. Backend selection happens via registry rebinding, not per-call
+    # `backend=` dispatch.
+    geglu_exact_forward_kernel_default = _resolved_geglu_exact_fg or _geglu_exact_forward_eager
+    geglu_exact_backward_kernel_default = _resolved_geglu_exact_bwd or _geglu_exact_backward_eager
+    geglu_approx_forward_kernel_default = _resolved_geglu_approx_fg or _geglu_approx_forward_eager
+    geglu_approx_backward_kernel_default = _resolved_geglu_approx_bwd or _geglu_approx_backward_eager
+    globals()["geglu_exact_forward_kernel"] = geglu_exact_forward_kernel_default
+    globals()["geglu_exact_backward_kernel"] = geglu_exact_backward_kernel_default
+    globals()["geglu_approx_forward_kernel"] = geglu_approx_forward_kernel_default
+    globals()["geglu_approx_backward_kernel"] = geglu_approx_backward_kernel_default
+    _patch_geglu_hot_imports()
+
+
+# Initial bind. Wrapped so module load never fails if no backend is loaded yet.
+try:
+    _rebind_geglu_aliases()
+except Exception:
+    pass
+
+# Register hook so global-backend changes (set_kernel_backend / kernel_backend_context)
+# rebind the aliases.
+try:
+    from ._backend_registry import register_global_backend_change_hook as _register_global_backend_change_hook
+    _register_global_backend_change_hook(_rebind_geglu_aliases)
+except Exception:
+    pass
+
+
+def geglu_exact_forward_kernel(gate, up):
+    return geglu_exact_forward_kernel_default(gate, up)
+
+
+def geglu_exact_backward_kernel(DW, e, g):
+    return geglu_exact_backward_kernel_default(DW, e, g)
+
+
+def geglu_approx_forward_kernel(gate, up):
+    return geglu_approx_forward_kernel_default(gate, up)
+
+
+def geglu_approx_backward_kernel(DW, e, g):
+    return geglu_approx_backward_kernel_default(DW, e, g)
+
+
+_rebind_geglu_aliases()

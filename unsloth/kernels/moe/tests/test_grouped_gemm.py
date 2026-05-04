@@ -1211,3 +1211,50 @@ def test_grouped_gemm_backward_dW_autotune_autograd(
         use_autograd = True,
         num_autotune_configs = num_autotune_configs,
     )
+
+
+# Regression for the dW None-gather_indices crash on non-permuted MoE backward.
+# grouped_gemm_dX has a guard that synthesises a dummy gather_indices buffer
+# when permute_x/y are both False; grouped_gemm_dW used to lack that guard
+# and would pass None into the Triton kernel, which rejects None as a tensor
+# pointer and hard-crashed any non-permuted MoE backward path.
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "requires CUDA")
+def test_grouped_gemm_dW_none_gather_indices_no_permute_does_not_crash():
+    torch.manual_seed(SEED)
+    device = "cuda"
+    dtype = torch.bfloat16
+    num_experts = 4
+    topk = 2
+    num_tokens = 8
+    K = 32          # hidden / intermediate dim
+    N = 32          # output dim
+    total_tokens = num_tokens * topk
+
+    X = torch.randn(total_tokens, K, device = device, dtype = dtype)
+    W = torch.randn(num_experts, N, K, device = device, dtype = dtype).contiguous()
+    dY = torch.randn(total_tokens, N, device = device, dtype = dtype).contiguous()
+    # Distribute tokens roughly evenly across experts; sum must equal total_tokens.
+    base = total_tokens // num_experts
+    m_sizes = torch.full(
+        (num_experts,), base, device = device, dtype = torch.int32,
+    )
+    m_sizes[-1] += total_tokens - base * num_experts
+
+    # Pre-fix: this raised inside Triton because gather_indices=None was
+    # passed straight into kernel_args. Post-fix: dW has the same dummy-buffer
+    # guard as dX and the call returns a tensor of the expected shape.
+    dW = grouped_gemm_dW(
+        dY = dY,
+        X = X,
+        gather_indices = None,
+        m_sizes = m_sizes,
+        topk = topk,
+        permute_x = False,
+        permute_y = False,
+        autotune = False,
+    )
+    assert dW.shape == (num_experts, N, K), (
+        f"Expected dW shape {(num_experts, N, K)}, got {tuple(dW.shape)}"
+    )
+    assert dW.dtype == dtype
+    assert torch.isfinite(dW).all(), "dW must be finite (NaN-free) for this path."

@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import triton
-import triton.language as tl
+import sys
 import torch
+import torch.nn.functional as F
+from ._backend_registry import register_kernel_backend
+from ._optional_triton import HAS_TRITON, tl, triton
 from .utils import (
     calculate_settings,
     MAX_FUSED_SIZE,
@@ -289,9 +291,6 @@ _cross_entropy_backward = triton.heuristics(
 )(_cross_entropy_backward)
 
 
-MAX_FUSED_SIZE = 65536  # 2**16
-
-
 class Fast_CrossEntropyLoss(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -450,6 +449,113 @@ def fast_cross_entropy_loss(
     if torch.is_tensor(n_items):
         n_items = n_items.to(device)
     return loss.sum() / n_items
+
+
+_triton_fast_cross_entropy_loss = fast_cross_entropy_loss
+
+
+def _fast_cross_entropy_loss_eager(
+    logits,
+    labels,
+    logit_softcapping = 0,
+    logit_scaling = 0,
+    n_items = None,
+):
+    batch, seq_len, vocab_size = logits.shape
+    assert labels.shape == (batch, seq_len)
+    logits = logits.view(batch * seq_len, vocab_size)
+    labels = labels.view(-1)
+
+    # Mirror the Triton path: upcast to fp32 BEFORE scaling/softcapping so
+    # bf16/fp16 inputs don't accumulate rounding error inside tanh.
+    logits = logits.float()
+    if logit_scaling != 0:
+        logits = logits * logit_scaling
+    if logit_softcapping != 0:
+        logits = logit_softcapping * torch.tanh(logits / logit_softcapping)
+
+    loss = F.cross_entropy(
+        logits,
+        labels,
+        ignore_index = -100,
+        reduction = "sum",
+    )
+    if n_items is None:
+        n_items = torch.count_nonzero(labels != -100)
+    if torch.is_tensor(n_items):
+        n_items = n_items.to(loss.device)
+    return loss / n_items
+
+
+register_kernel_backend(
+    "unsloth.cross_entropy_loss",
+    "eager",
+    _fast_cross_entropy_loss_eager,
+)
+
+
+_resolved_fast_cross_entropy_loss = None
+fast_cross_entropy_loss_default = None
+
+
+def _patch_cross_entropy_hot_imports() -> None:
+    for name, module in tuple(sys.modules.items()):
+        if name.startswith("unsloth.models.") and hasattr(module, "fast_cross_entropy_loss"):
+            module.fast_cross_entropy_loss = fast_cross_entropy_loss_default
+
+
+def _rebind_cross_entropy_aliases(backend=None) -> None:
+    """Hook fired by `_backend_registry` when the global backend changes
+    or when a new backend impl is registered. Re-resolves `_resolved_*`
+    aliases for this module from the registry. Falls back to `None` so
+    the entry point calls eager directly. Backend selection happens via
+    registry state/rebinding, not per-call kwargs."""
+    global _resolved_fast_cross_entropy_loss, fast_cross_entropy_loss_default
+    try:
+        from ._backend_registry import get_kernel_impl
+        _resolved_fast_cross_entropy_loss = get_kernel_impl("unsloth.cross_entropy_loss")
+    except Exception:
+        _resolved_fast_cross_entropy_loss = None
+    # NVIDIA_REVIEW: model loss paths use the resolved backend implementation
+    # directly. Backend selection is controlled by registry state, not per-call
+    # `backend=` kwargs.
+    fast_cross_entropy_loss_default = (
+        _resolved_fast_cross_entropy_loss or _fast_cross_entropy_loss_eager
+    )
+    globals()["fast_cross_entropy_loss"] = fast_cross_entropy_loss_default
+    _patch_cross_entropy_hot_imports()
+
+
+# Initial bind.
+try:
+    _rebind_cross_entropy_aliases()
+except Exception:
+    pass
+
+try:
+    from ._backend_registry import register_global_backend_change_hook as _register_global_backend_change_hook
+    _register_global_backend_change_hook(_rebind_cross_entropy_aliases)
+except Exception:
+    pass
+
+
+def fast_cross_entropy_loss(
+    logits,
+    labels,
+    logit_softcapping = 0,
+    logit_scaling = 0,
+    n_items = None,
+):
+    return fast_cross_entropy_loss_default(
+        logits,
+        labels,
+        logit_softcapping,
+        logit_scaling,
+        n_items,
+    )
+
+
+_rebind_cross_entropy_aliases()
 
 
 if (Version(torch.__version__) < Version("2.4.0")) and not hasattr(

@@ -16,6 +16,32 @@ import torch
 from functools import lru_cache
 from transformers.models.llama.modeling_llama import logger
 import os
+import importlib
+
+
+def _is_triton_importable() -> bool:
+    try:
+        importlib.import_module("triton")
+    except Exception:
+        return False
+    return True
+
+def _detect_kernel_compile_backend() -> str:
+    explicit = (
+        os.environ.get("UNSLOTH_TORCH_COMPILE_BACKEND", "")
+        .strip()
+        .lower()
+        .replace("-", "_")
+    )
+    if explicit in {"dynamo_disabled", "torchdynamo_disable"}:
+        explicit = "dynamo_disable"
+    if explicit:
+        return explicit
+    if _is_triton_importable():
+        return "inductor"
+    return "dynamo_disable"
+
+_KERNEL_COMPILE_BACKEND: str = _detect_kernel_compile_backend()
 
 torch_compile_options = {
     "epilogue_fusion": True,
@@ -32,18 +58,23 @@ try:
         create_block_mask as _create_block_mask,
     )
 
-    _flex_attention = torch.compile(
-        _flex_attention, dynamic = True, options = torch_compile_options
-    )
-    HAS_FLEX_ATTENTION = False
+    if _KERNEL_COMPILE_BACKEND == "inductor":
+        _flex_attention = torch.compile(
+            _flex_attention, dynamic=True, options=torch_compile_options,
+        )
+        HAS_FLEX_ATTENTION = True
+    else:
+        # Flex attention needs the inductor/Triton path. Keep the slow fallback
+        # for no-Triton/cutile-only installs that route compile through
+        # dynamo_disable, or explicit non-Inductor backends such as aot_eager.
+        HAS_FLEX_ATTENTION = False
 except:
     HAS_FLEX_ATTENTION = False
 
 
 if not HAS_FLEX_ATTENTION:
     # Logit softcapping
-    @torch.compile(fullgraph = True, dynamic = True, options = torch_compile_options)
-    def slow_attention_softcapping(Q, K, V, causal_mask, self, bsz, q_len):
+    def _slow_attention_softcapping_impl(Q, K, V, causal_mask, self, bsz, q_len):
         n_heads = self.config.num_attention_heads
         head_dim = self.head_dim
         n_kv_heads = self.config.num_key_value_heads
@@ -73,6 +104,19 @@ if not HAS_FLEX_ATTENTION:
         A = A.transpose(1, 2).contiguous()
         A = A.reshape(bsz, q_len, n_heads * head_dim)
         return A
+
+    if _KERNEL_COMPILE_BACKEND == "inductor":
+        slow_attention_softcapping = torch.compile(
+            _slow_attention_softcapping_impl,
+            fullgraph=True, dynamic=True, options=torch_compile_options,
+        )
+    else:
+        from unsloth_zoo.temporary_patches.common import torch_compile
+
+        slow_attention_softcapping = torch_compile(
+            _slow_attention_softcapping_impl,
+            fullgraph=True, dynamic=True, options=torch_compile_options,
+        )
 
     create_flex_attention_causal_mask = None
     create_flex_attention_sliding_window_mask = None

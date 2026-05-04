@@ -71,3 +71,13 @@ def test_fallback_git_urls_are_configurable_for_review_branches(tmp_path):
 
     assert "git+https://github.com/mmathew23/unsloth.git@feat/cutile" in result.stdout
     assert "git+https://github.com/mmathew23/unsloth-zoo.git@feat/cutile" in result.stdout
+
+
+def test_requested_cutile_spec_is_installed_after_zoo_dependencies():
+    source = _script_source()
+
+    zoo_install = source.index('Installing local unsloth-zoo[$ZOO_EXTRA]')
+    cutile_spec_install = source.index('Installing requested cuda-tile spec')
+    unsloth_install = source.index('Installing local unsloth[$UNSLOTH_EXTRA]')
+
+    assert zoo_install < cutile_spec_install < unsloth_install

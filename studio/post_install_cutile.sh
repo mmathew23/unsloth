@@ -250,11 +250,6 @@ fi
 
 PIP=( "$STUDIO_PY" -m pip )
 
-if [ -n "$CUTILE_SPEC" ]; then
-    log "Installing requested cuda-tile spec"
-    run_cmd "${PIP[@]}" install --force-reinstall "$CUTILE_SPEC"
-fi
-
 if [ "$MODE" = "hybrid" ]; then
     ZOO_EXTRA="cutile,triton"
     UNSLOTH_EXTRA="cutile,triton"
@@ -270,6 +265,11 @@ else
     log "Installing unsloth-zoo[$ZOO_EXTRA] from GitHub branch $BRANCH"
     run_cmd "${PIP[@]}" install --force-reinstall \
         "unsloth_zoo[$ZOO_EXTRA] @ git+https://github.com/unslothai/unsloth-zoo.git@$BRANCH"
+fi
+
+if [ -n "$CUTILE_SPEC" ]; then
+    log "Installing requested cuda-tile spec"
+    run_cmd "${PIP[@]}" install --force-reinstall "$CUTILE_SPEC"
 fi
 
 if [ -f "$UNSLOTH_ROOT/pyproject.toml" ]; then

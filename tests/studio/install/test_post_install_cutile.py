@@ -24,3 +24,13 @@ def test_hybrid_launcher_keeps_inductor_and_unsets_dynamo_disable():
     assert 'COMPILE_BACKEND="inductor"' in source
     assert "unset TORCHDYNAMO_DISABLE" in source
     assert "--mode cutile-only|hybrid" in source
+
+
+def test_requested_cutile_spec_is_installed_after_zoo_dependencies():
+    source = _script_source()
+
+    zoo_install = source.index('Installing local unsloth-zoo[$ZOO_EXTRA]')
+    cutile_spec_install = source.index('Installing requested cuda-tile spec')
+    unsloth_install = source.index('Installing local unsloth[$UNSLOTH_EXTRA]')
+
+    assert zoo_install < cutile_spec_install < unsloth_install

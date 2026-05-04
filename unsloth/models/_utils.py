@@ -241,6 +241,7 @@ _FLEX_EXCLUDED_MODELS = ("gpt_oss", "mllama", "nemotron_h", "modernbert")
 _EAGER_ONLY_PREFIXES = ("gemma3n",)
 _FLASH_ATTENTION_MAX_HEAD_DIM = 256
 _FLASH_ATTENTION_DISABLED_WARNED = set()
+_FLEX_ATTENTION_DISABLED_WARNED = set()
 
 
 def _is_flex_excluded(model_type):
@@ -353,6 +354,68 @@ def _is_flash_attention_requested(attn_implementation):
     return isinstance(attn_implementation, str) and attn_implementation.startswith(
         "flash_attention"
     )
+
+
+def _is_flex_attention_requested(attn_implementation):
+    return attn_implementation == "flex_attention"
+
+
+def _flex_attention_disable_reason(model_class, config, model_type):
+    if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0":
+        return "UNSLOTH_ENABLE_FLEX_ATTENTION=0"
+    if _is_flex_excluded(model_type):
+        return f"{model_type} is excluded from flex_attention"
+    if model_class is None or not getattr(model_class, "_supports_flex_attn", False):
+        return "model class does not advertise flex_attention support"
+    attention_dropout = _config_get(config, "attention_dropout", 0) or 0
+    if attention_dropout != 0:
+        return "attention_dropout is non-zero"
+    if UNSLOTH_COMPILE_BACKEND != "inductor":
+        return "flex_attention requires the inductor (Triton) compile backend"
+    try:
+        from transformers.utils.import_utils import is_torch_flex_attn_available
+
+        if not is_torch_flex_attn_available():
+            return "torch flex_attention is not available"
+    except Exception as exc:
+        return f"torch flex_attention availability check failed: {exc!r}"
+    return None
+
+
+def _disable_flex_attention_if_needed(
+    config,
+    model_class,
+    attn_implementation = None,
+    supports_sdpa = False,
+    model_type = "",
+):
+    requested_attn_implementation = attn_implementation
+    if requested_attn_implementation is None:
+        requested_attn_implementation = _config_get(
+            config, "_attn_implementation", None
+        )
+    if requested_attn_implementation is None:
+        requested_attn_implementation = _config_get(config, "attn_implementation", None)
+    if not _is_flex_attention_requested(requested_attn_implementation):
+        return attn_implementation
+
+    disable_reason = _flex_attention_disable_reason(model_class, config, model_type)
+    if disable_reason is None:
+        return _set_attn_impl(config, "flex_attention")
+
+    fallback_attn_implementation = "sdpa" if supports_sdpa else "eager"
+    warning_key = (
+        _config_get(config, "model_type", model_type),
+        fallback_attn_implementation,
+        disable_reason,
+    )
+    if warning_key not in _FLEX_ATTENTION_DISABLED_WARNED:
+        _FLEX_ATTENTION_DISABLED_WARNED.add(warning_key)
+        print(
+            f"Unsloth: `flex_attention` is not available because {disable_reason} - "
+            f"defaulting to `{fallback_attn_implementation}`."
+        )
+    return _set_attn_impl(config, fallback_attn_implementation)
 
 
 def _disable_flash_attention_if_needed(
@@ -486,24 +549,8 @@ def resolve_attention_implementation(
             attn_impl = _set_attn_impl(config, "sdpa")
         else:
             attn_impl = "eager"
-            if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") != "0":
-                try:
-                    from transformers.utils.import_utils import (
-                        is_torch_flex_attn_available,
-                    )
-
-                    if (
-                        is_torch_flex_attn_available()
-                        and getattr(model_class, "_supports_flex_attn", False)
-                        and not _is_flex_excluded(model_type)
-                    ):
-                        attention_dropout = (
-                            _config_get(config, "attention_dropout", 0) or 0
-                        )
-                        if attention_dropout == 0:
-                            attn_impl = _set_attn_impl(config, "flex_attention")
-                except Exception:
-                    pass
+            if _flex_attention_disable_reason(model_class, config, model_type) is None:
+                attn_impl = _set_attn_impl(config, "flex_attention")
             if attn_impl == "eager":
                 attn_impl = _set_attn_impl(config, "eager")
 
@@ -515,6 +562,14 @@ def resolve_attention_implementation(
             requested_attn_implementation,
             supports_sdpa = supports_sdpa,
             disable_reason = disable_reason,
+        )
+    elif _is_flex_attention_requested(requested_attn_implementation):
+        final_attn_impl = _disable_flex_attention_if_needed(
+            config,
+            model_class,
+            requested_attn_implementation,
+            supports_sdpa = supports_sdpa,
+            model_type = model_type,
         )
     else:
         final_attn_impl = requested_attn_implementation

@@ -33,11 +33,13 @@ def _detect_kernel_compile_backend() -> str:
         .lower()
         .replace("-", "_")
     )
+    if explicit in {"dynamo_disabled", "torchdynamo_disable"}:
+        explicit = "dynamo_disable"
     if explicit:
         return explicit
     if _is_triton_importable():
         return "inductor"
-    return "aot_eager"
+    return "dynamo_disable"
 
 _KERNEL_COMPILE_BACKEND: str = _detect_kernel_compile_backend()
 
@@ -63,7 +65,8 @@ try:
         HAS_FLEX_ATTENTION = True
     else:
         # Flex attention needs the inductor/Triton path. Keep the slow fallback
-        # for no-Triton/cutile-only installs that route compile through aot_eager.
+        # for no-Triton/cutile-only installs that route compile through
+        # dynamo_disable, or explicit non-Inductor backends such as aot_eager.
         HAS_FLEX_ATTENTION = False
 except:
     HAS_FLEX_ATTENTION = False

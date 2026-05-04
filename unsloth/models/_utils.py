@@ -1542,7 +1542,7 @@ def torch_compile_kwargs(*args, **kwargs):
     }
     if UNSLOTH_COMPILE_BACKEND == "inductor":
         result["options"] = torch_compile_options
-    else:
+    elif UNSLOTH_COMPILE_BACKEND != "dynamo_disable":
         result["backend"] = UNSLOTH_COMPILE_BACKEND
     return result
 

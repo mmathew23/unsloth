@@ -35,6 +35,19 @@ class CompileBackendSettingsTests(unittest.TestCase):
         self.assertEqual(compile_kwargs["fullgraph"], False)
         self.assertNotIn("options", compile_kwargs)
 
+    def test_accelerate_dynamo_disable_kwargs_do_not_request_compile_backend(self):
+        previous_backend = self._utils.UNSLOTH_COMPILE_BACKEND
+        try:
+            self._utils.UNSLOTH_COMPILE_BACKEND = "dynamo_disable"
+            compile_kwargs = self._utils.torch_compile_kwargs()
+        finally:
+            self._utils.UNSLOTH_COMPILE_BACKEND = previous_backend
+
+        self.assertEqual(compile_kwargs["dynamic"], True)
+        self.assertEqual(compile_kwargs["fullgraph"], False)
+        self.assertNotIn("backend", compile_kwargs)
+        self.assertNotIn("options", compile_kwargs)
+
     def test_kernel_flex_compile_backend_env_is_normalized(self):
         import unsloth.kernels.flex_attention as flex_attention
 
@@ -43,6 +56,9 @@ class CompileBackendSettingsTests(unittest.TestCase):
 
         with patch.dict("os.environ", {"UNSLOTH_TORCH_COMPILE_BACKEND": "aot-eager"}):
             self.assertEqual(flex_attention._detect_kernel_compile_backend(), "aot_eager")
+
+        with patch.dict("os.environ", {"UNSLOTH_TORCH_COMPILE_BACKEND": "dynamo-disabled"}):
+            self.assertEqual(flex_attention._detect_kernel_compile_backend(), "dynamo_disable")
 
 
 if __name__ == "__main__":

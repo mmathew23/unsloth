@@ -433,10 +433,10 @@ def run_export_process(
 
             logger.info("Triton available — torch.compile enabled")
         except Exception as exc:
-            os.environ["UNSLOTH_TORCH_COMPILE_BACKEND"] = "aot_eager"
-            os.environ.pop("TORCHDYNAMO_DISABLE", None)
+            os.environ["UNSLOTH_TORCH_COMPILE_BACKEND"] = "dynamo_disable"
+            os.environ["TORCHDYNAMO_DISABLE"] = "1"
             logger.warning(
-                "Triton not found on Windows — falling back to torch.compile aot_eager backend. "
+                "Triton not found on Windows — disabling TorchDynamo. "
                 'For best performance install Triton: pip install "triton-windows<3.7" '
                 "(import failed: %s)",
                 exc,

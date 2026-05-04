@@ -37,7 +37,8 @@ Options:
   --mode cutile-only|hybrid
       cutile-only: install CuTile support, uninstall Triton, launch with
                    UNSLOTH_KERNEL_BACKEND=cutile and
-                   UNSLOTH_TORCH_COMPILE_BACKEND=aot_eager.
+                   UNSLOTH_TORCH_COMPILE_BACKEND=dynamo_disable and
+                   TORCHDYNAMO_DISABLE=1.
       hybrid:      install CuTile + Triton support, keep Triton, launch with
                    UNSLOTH_KERNEL_BACKEND=cutile and
                    UNSLOTH_TORCH_COMPILE_BACKEND=inductor.
@@ -75,6 +76,9 @@ Options:
   --allow-triton
       Do not fail verification if Triton remains importable in cutile-only mode.
       Useful only for debugging partial environments.
+
+  To force the older no-Triton torch.compile route, edit the generated launcher
+  to use UNSLOTH_TORCH_COMPILE_BACKEND=aot_eager and unset TORCHDYNAMO_DISABLE.
 
   --dry-run
       Print commands without executing.
@@ -286,7 +290,7 @@ log "Writing launcher: $LAUNCHER_PATH"
 if [ "$DRY_RUN" = "0" ]; then
     mkdir -p "$(dirname "$LAUNCHER_PATH")"
     if [ "$MODE" = "cutile-only" ]; then
-        COMPILE_BACKEND="aot_eager"
+        COMPILE_BACKEND="dynamo_disable"
     else
         COMPILE_BACKEND="inductor"
     fi
@@ -301,7 +305,11 @@ if [ "$DRY_RUN" = "0" ]; then
             printf '%s\n' 'unset UNSLOTH_KERNEL_BACKEND_STRICT'
         fi
         printf '%s\n' 'unset UNSLOTH_COMPILE_DISABLE'
-        printf '%s\n' 'unset TORCHDYNAMO_DISABLE'
+        if [ "$MODE" = "cutile-only" ]; then
+            printf '%s\n' 'export TORCHDYNAMO_DISABLE=1'
+        else
+            printf '%s\n' 'unset TORCHDYNAMO_DISABLE'
+        fi
         printf 'exec %s studio "$@"\n' "$(printf '%s' "$STUDIO_UNSLOTH" | sed "s/'/'\\\\''/g; s/.*/'&'/")"
     } > "$LAUNCHER_PATH"
     chmod +x "$LAUNCHER_PATH"

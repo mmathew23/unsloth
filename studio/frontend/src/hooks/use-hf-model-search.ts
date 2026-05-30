@@ -35,6 +35,7 @@ const EXCLUDED_TAGS_MLX = new Set([
   "gptq",
   "awq",
   "exl2",
+  "bitsandbytes",
   "onnx",
   "openvino",
   "coreml",
@@ -102,6 +103,9 @@ function makeMapModel(excludeGguf: boolean, excludedTags: Set<string>) {
     };
     const isEmbedding = m.tags?.some((t) => EMBEDDING_TAGS.has(t));
     if (!isEmbedding && m.tags?.some((t) => excludedTags.has(t))) {
+      return null;
+    }
+    if (/-bnb-\d+bit/i.test(m.name)) {
       return null;
     }
     const isGguf =

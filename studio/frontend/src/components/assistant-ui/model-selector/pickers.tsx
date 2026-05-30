@@ -118,6 +118,7 @@ function ModelRow({
   vramEst,
   gpuGb,
   tooltipText,
+  badgeLabel,
 }: {
   label: string;
   meta?: string;
@@ -127,6 +128,7 @@ function ModelRow({
   vramEst?: number;
   gpuGb?: number;
   tooltipText?: ReactNode;
+  badgeLabel?: string;
 }) {
   const exceeds = vramStatus === "exceeds";
   const showVramTooltip =
@@ -159,7 +161,7 @@ function ModelRow({
       </span>
       <span className="ml-auto flex items-center gap-1.5 shrink-0">
         {vramStatus === "exceeds" && (
-          <span className="text-[9px] font-medium !text-red-700 !bg-red-50 dark:!text-red-400 dark:!bg-red-950 px-1.5 py-0.5 rounded">OOM</span>
+          <span className="text-[9px] font-medium !text-red-700 !bg-red-50 dark:!text-red-400 dark:!bg-red-950 px-1.5 py-0.5 rounded">{badgeLabel ?? "OOM"}</span>
         )}
         {vramStatus === "tight" && (
           <span className="text-[9px] font-medium !text-amber-400">TIGHT</span>
@@ -709,7 +711,8 @@ export function HubModelPicker({
     const all = dedupe([...models.map((model) => model.id), value ?? ""])
       .filter((id) => !downloadedSet.has(id.toLowerCase()))
       .filter((id) => !chatOnly || isKnownGgufRepo(id))
-      .filter((id) => !/-FP8[-.]|FP8-Dynamic/i.test(id));
+      .filter((id) => !/-FP8[-.]|FP8-Dynamic/i.test(id))
+      .filter((id) => !/-bnb-\d+bit/i.test(id));
     // Sort: GGUFs first, then hub models
     const gguf: string[] = [];
     const hub: string[] = [];
@@ -781,7 +784,8 @@ export function HubModelPicker({
       .map((result) => result.id)
       .filter((id) => !recommendedSet.has(id))
       .filter((id) => !chatOnly || isKnownGgufRepo(id))
-      .filter((id) => !/-FP8[-.]|FP8-Dynamic/i.test(id));
+      .filter((id) => !/-FP8[-.]|FP8-Dynamic/i.test(id))
+      .filter((id) => !/-bnb-\d+bit/i.test(id));
   }, [recommendedSet, results, showHfSection, chatOnly, isKnownGgufRepo]);
 
   const metricsById = useMemo(
@@ -959,21 +963,26 @@ export function HubModelPicker({
                 </div>
               ))}
               {!downloadedCollapsed && !chatOnly &&
-                cachedModels.map((c) => (
+                cachedModels.map((c) => {
+                  const isBnb = /-bnb-\d+bit/i.test(c.repo_id);
+                  return (
                   <div key={c.repo_id} className="flex items-center gap-0.5">
                     <div className="min-w-0 flex-1">
                       <ModelRow
                         label={c.repo_id}
                         meta={formatBytes(c.size_bytes)}
                         selected={value === c.repo_id}
-                        onClick={() =>
+                        onClick={() => {
+                          if (isBnb) return;
                           onSelect(c.repo_id, {
                             source: "hub",
                             isLora: false,
                             isDownloaded: true,
-                          })
-                        }
-                        vramStatus={null}
+                          });
+                        }}
+                        tooltipText={isBnb ? "This model uses bitsandbytes quantization and is not compatible with Apple Silicon" : undefined}
+                        vramStatus={isBnb ? "exceeds" : null}
+                        badgeLabel={isBnb ? "INCOMPAT" : undefined}
                       />
                     </div>
                     <ModelDeleteAction
@@ -993,7 +1002,7 @@ export function HubModelPicker({
                       onDeleted={refreshCachedLists}
                     />
                   </div>
-                ))}
+                ); })}
             </>
           ) : null}
 

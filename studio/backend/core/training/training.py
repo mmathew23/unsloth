@@ -611,8 +611,36 @@ class TrainingBackend:
                 except (TypeError, ValueError):
                     logger.debug("Could not convert loss to float: %s", _raw_loss)
                     _safe_loss = None
-                if _safe_loss is not None and not math.isfinite(_safe_loss):
-                    _safe_loss = None
+                _loss_is_nonfinite = (
+                    _safe_loss is not None and not math.isfinite(_safe_loss)
+                )
+                if _loss_is_nonfinite:
+                    _safe_loss = None  # keep response JSON-safe
+                    if not getattr(
+                        self._progress, "_nonfinite_loss_reported", False
+                    ):
+                        self._progress._nonfinite_loss_reported = True
+                        _nonfinite_step = event.get("step", "?")
+                        _err_msg = (
+                            f"Training produced non-finite loss (NaN/Inf) at "
+                            f"step {_nonfinite_step}. The saved adapter is "
+                            f"corrupted and should not be used. Common causes: "
+                            f"learning rate too high, dtype overflow, or model "
+                            f"architecture incompatibility (e.g., vision LoRA "
+                            f"on some VLMs)."
+                        )
+                        logger.error(
+                            "Training produced non-finite loss at step %s; "
+                            "marking run as failed.",
+                            _nonfinite_step,
+                        )
+                        self._progress.error = _err_msg
+                        self._progress.is_training = False
+                        self._should_stop = True
+                    # Once a non-finite loss has been reported, do not continue
+                    # processing this progress event — downstream code unconditionally
+                    # sets is_training=True and would clobber the failed state.
+                    return
                 try:
                     _safe_lr = float(_raw_lr) if _raw_lr is not None else None
                 except (TypeError, ValueError):
